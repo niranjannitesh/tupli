@@ -157,6 +157,15 @@ impl Workspace {
         if self.is_read_only(cx) {
             return Some("This connection is read-only.".into());
         }
+        // An engine that has no cell editing has no read-only state to explain
+        // either. Everything below this line reasons about *why this table*
+        // cannot be written to, which on ClickHouse or Redis would be a banner
+        // over every tab saying the same thing about the engine — and one that
+        // reached for Postgres words to say it, because that is what the
+        // reasons below are made of.
+        if !self.capabilities(cx).editable_rows {
+            return None;
+        }
         // The server's answer outranks ours: a table whose rows we know how to
         // address is still not editable if this role was never granted it.
         if let Some(denied) = self.write_denied(self.pane().editing_relation.as_ref(), cx) {

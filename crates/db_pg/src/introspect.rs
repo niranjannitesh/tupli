@@ -229,6 +229,9 @@ async fn load_relations(client: &tokio_postgres::Client) -> DbResult<Vec<Relatio
             columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            // Postgres has nothing to print: there is no `pg_get_tabledef` and
+            // never has been, which is why `sqlgen::ddl` exists.
+            create_statement: None,
             estimated_rows: row.get::<_, Option<i64>>(3).unwrap_or(0),
             size_bytes: row.get::<_, Option<i64>>(4).unwrap_or(0),
             checks: Vec::new(),

@@ -599,6 +599,7 @@ mod tests {
             checks: Vec::new(),
             triggers: Vec::new(),
             definition: None,
+            create_statement: None,
             estimated_rows: rows,
             size_bytes: 0,
             comment: None,

@@ -225,6 +225,14 @@ pub struct Relation {
     /// For a view or a materialised view, the `SELECT` behind it as the server
     /// prints it. `None` for anything with rows of its own.
     pub definition: Option<Arc<str>>,
+    /// The whole `CREATE`, verbatim, for an engine that will print one.
+    ///
+    /// Postgres will not — there is no `pg_get_tabledef`, which is why the DDL
+    /// tab reconstructs a table from the catalog. ClickHouse keeps the
+    /// statement it was created with in `system.tables`, and that text beats
+    /// anything this app could assemble: it carries the engine, the sorting
+    /// key, the TTLs and the settings, in the dialect that made them.
+    pub create_statement: Option<Arc<str>>,
     /// The planner's row estimate. Exact counts cost a sequential scan, so the
     /// sidebar shows this and the grid shows the real count once it has one.
     ///
@@ -513,6 +521,7 @@ mod tests {
             checks: Vec::new(),
             triggers: Vec::new(),
             definition: None,
+            create_statement: None,
             estimated_rows: 0,
             size_bytes: 0,
             comment: None,

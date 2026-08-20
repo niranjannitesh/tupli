@@ -212,12 +212,14 @@ fn kind_for(capture: &str, text: &str) -> Option<TokenKind> {
         // The grammar has one `literal` node for quoted text and for numbers,
         // and tells them apart with a `#match?` predicate written in Lua
         // patterns, which the Rust bindings compile as a regex and which
-        // therefore never fires. Ask the text instead.
-        "string" | "number" | "float" => match text.starts_with(|c: char| c.is_ascii_digit())
-            || (text.len() > 1 && text.starts_with(['+', '-', '.']))
-        {
-            true => TokenKind::Number,
-            false => TokenKind::String,
+        // therefore never fires. Ask the text instead — and the same node also
+        // covers `"id"`, which is a delimited identifier in every engine here
+        // and not a string in any of them.
+        "string" | "number" | "float" => match text.chars().next() {
+            Some('"') => TokenKind::Identifier,
+            Some(c) if c.is_ascii_digit() => TokenKind::Number,
+            Some('+' | '-' | '.') if text.len() > 1 => TokenKind::Number,
+            _ => TokenKind::String,
         },
         "comment" => TokenKind::Comment,
         "operator" => TokenKind::Operator,
@@ -348,5 +350,17 @@ mod tests {
             assert!(sql.is_char_boundary(range.start));
             assert!(sql.is_char_boundary(range.end));
         }
+    }
+
+    /// `"x"` is a name, not a value. The grammar files it under the same
+    /// `literal` node as `'x'`, so without this a `create table` full of
+    /// quoted columns reads as a wall of string.
+    #[test]
+    fn a_double_quoted_name_is_an_identifier_and_not_a_string() {
+        assert_eq!(
+            kinds_of(r#"select "id" from t"#, r#""id""#),
+            [TokenKind::Identifier]
+        );
+        assert_eq!(kinds_of("select 'id' from t", "'id'"), [TokenKind::String]);
     }
 }

@@ -149,6 +149,10 @@ pub async fn snapshot(
         }
 
         let kind = relation_kind(&engine);
+        // The statement the table was made with, which is the DDL tab's answer
+        // for every relation here — a `MergeTree` is its engine, its sorting
+        // key and its settings far more than it is its column list.
+        let create_statement = optional(set, row, 4);
         let definition = match kind.is_view() {
             // `as_select` is empty for a view created before ClickHouse
             // recorded it separately; the whole `create table` statement is
@@ -173,6 +177,7 @@ pub async fn snapshot(
                 checks: Vec::new(),
                 triggers: Vec::new(),
                 definition,
+                create_statement,
                 // `total_rows` is null for every engine that does not keep a
                 // count — `Merge`, `Distributed`, most table functions — and
                 // the query above turns that into the -1 that means unknown.
@@ -218,7 +223,10 @@ pub async fn snapshot(
 /// The sorting key as an index, or `None` when the table has no order —
 /// `Memory`, `Log`, and every view.
 fn primary_key(expression: &str) -> Option<IndexDef> {
-    let columns = split_top_level(expression);
+    let columns: Vec<Arc<str>> = split_top_level(expression)
+        .into_iter()
+        .map(|part| unquote(&part))
+        .collect();
     if columns.is_empty() {
         return None;
     }
@@ -232,6 +240,29 @@ fn primary_key(expression: &str) -> Option<IndexDef> {
         method: "sparse".into(),
         predicate: None,
     })
+}
+
+/// A backtick-quoted identifier, as itself.
+///
+/// `system.tables.primary_key` prints the key the way ClickHouse would parse
+/// it back, so anything needing quotes arrives wearing backticks — and a column
+/// literally called `$user_id` needs them. The quotes have to come off before
+/// the name can be matched against a result set's own column names, which is
+/// what decides whether a grid knows how to address a row.
+///
+/// Only a part that is *entirely* one quoted identifier: `toStartOfDay(t)` is
+/// an expression and stays whole.
+fn unquote(part: &str) -> Arc<str> {
+    let inner = match part.strip_prefix('`').and_then(|p| p.strip_suffix('`')) {
+        Some(inner) => inner,
+        None => return part.into(),
+    };
+    match inner.contains('`') {
+        // A doubled or escaped backtick inside means the outer pair was not
+        // the whole of it; leaving it alone is worse than guessing wrong.
+        true => part.into(),
+        false => inner.into(),
+    }
 }
 
 /// Split a key expression on the commas that separate its parts.
@@ -349,6 +380,19 @@ mod tests {
         // The one thing a reader must not conclude from `is_primary`.
         assert!(!key.is_unique);
         assert_eq!(key.columns.len(), 2);
+    }
+
+    #[test]
+    fn a_key_column_that_needed_quoting_is_named_without_them() {
+        // What a column called `$user_id` looks like coming out of `system`.
+        let key = primary_key("`$user_id`, `$timestamp`").expect("a sorting key");
+        assert_eq!(
+            key.columns,
+            vec![Arc::<str>::from("$user_id"), "$timestamp".into()]
+        );
+        // An expression is not an identifier and keeps every character it has.
+        let key = primary_key("toStartOfDay(`t`)").expect("a sorting key");
+        assert_eq!(key.columns, vec![Arc::<str>::from("toStartOfDay(`t`)")]);
     }
 
     #[test]

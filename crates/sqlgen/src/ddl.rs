@@ -21,6 +21,11 @@
 //! Anything that *is* here is the server's own text: check expressions and
 //! trigger definitions are printed by `pg_get_constraintdef` and
 //! `pg_get_triggerdef`, never reconstructed.
+//!
+//! All of which applies to Postgres, because Postgres has no statement to ask
+//! for. An engine that does — ClickHouse keeps one in `system.tables` — is
+//! quoted verbatim and none of the above runs: a rendering is what you fall
+//! back to when the server will not print the thing itself.
 
 use std::fmt::Write as _;
 
@@ -33,6 +38,13 @@ pub(crate) const INDENT: &str = "    ";
 
 /// The whole object: its `CREATE`, its indexes, its comments, its triggers.
 pub fn relation(relation: &Relation) -> String {
+    // An engine that keeps the statement it was created with has already said
+    // this better than the reconstruction below can: in its own dialect, with
+    // its own quoting, and carrying the clauses this app has no field for.
+    if let Some(statement) = &relation.create_statement {
+        let statement = statement.trim_end().trim_end_matches(';');
+        return format!("{statement};\n");
+    }
     let mut out = match relation.kind {
         RelationKind::View | RelationKind::MaterializedView => view(relation),
         _ => table(relation),
@@ -368,11 +380,29 @@ mod tests {
             checks: Vec::new(),
             triggers: Vec::new(),
             definition: None,
+            create_statement: None,
             estimated_rows: 0,
             size_bytes: 0,
             comment: None,
             detail_loaded: true,
         }
+    }
+
+    #[test]
+    fn a_server_that_prints_its_own_create_is_quoted_and_not_second_guessed() {
+        // ClickHouse's, with the two clauses this app has no field for and the
+        // backticks a rendering from the catalog would have got wrong.
+        let mut t = table(vec![column("id", "String", false)]);
+        t.create_statement = Some(
+            "CREATE TABLE analytics.hits\n(\n    `$id` String\n)\n             ENGINE = MergeTree\nORDER BY `$id`"
+                .into(),
+        );
+        let ddl = relation(&t);
+        assert!(ddl.starts_with("CREATE TABLE analytics.hits"), "{ddl}");
+        assert!(ddl.contains("ENGINE = MergeTree"), "{ddl}");
+        // Nothing reconstructed alongside it: one statement, ended once.
+        assert_eq!(ddl.matches("CREATE TABLE").count(), 1, "{ddl}");
+        assert!(ddl.ends_with("ORDER BY `$id`;\n"), "{ddl}");
     }
 
     #[test]
