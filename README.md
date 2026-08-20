@@ -4,14 +4,19 @@
 
 # Tupli
 
-**A native macOS client for Postgres, written in Rust on [GPUI](https://www.gpui.rs).**
+**A native macOS database client, written in Rust on [GPUI](https://www.gpui.rs).**
+
+Postgres is the engine it is built for. Redis and ClickHouse come through the same driver
+boundary, and exist partly to prove the boundary is real.
 
 Opens instantly. Scrolls a million rows without dropping a frame. Never blocks on the database.
 
 ![status: alpha](https://img.shields.io/badge/status-alpha-e8a33d?style=flat-square)
 ![platform: macOS](https://img.shields.io/badge/platform-macOS%2013%2B-6f7782?style=flat-square)
-![built with: Rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square)
-![engine: PostgreSQL](https://img.shields.io/badge/postgres-9.6%20%E2%80%93%2017-336791?style=flat-square)
+![built with: Rust](https://img.shields.io/badge/rust-1.97%2B-b7410e?style=flat-square)
+![engine: PostgreSQL](https://img.shields.io/badge/postgres-12%20%E2%80%93%2017-336791?style=flat-square)
+![engine: Redis](https://img.shields.io/badge/redis-read--only-d82c20?style=flat-square)
+![engine: ClickHouse](https://img.shields.io/badge/clickhouse-native%20protocol-ffcc01?style=flat-square)
 ![licence: MIT](https://img.shields.io/badge/licence-MIT-4c9a5f?style=flat-square)
 
 <picture>
@@ -28,7 +33,7 @@ Opens instantly. Scrolls a million rows without dropping a frame. Never blocks o
 >
 > Tupli is being built in the open and is **not ready to be anyone's daily driver**. There
 > is no release build, no signed download, no update channel and no upgrade path for the
-> local store — it is `cargo build` or nothing. Things move, break and get renamed.
+> local store — it is `scripts/run.sh` or nothing. Things move, break and get renamed.
 >
 > It reads and writes real databases. Point it at something you can afford to be wrong
 > about until it has more mileage on it.
@@ -50,7 +55,8 @@ and nothing else.
 **Connections** — saved connections in a local SQLite store, passwords in the macOS
 Keychain (never in the database), `postgres://` URL paste-to-fill, SSL modes, connection
 test with server version and latency, colour tag per connection that tints the whole
-window.
+window. New Connection is a window of its own, like Settings, rather than a dialog over
+the work.
 
 **Browsing** — schema tree over multiple databases, schemas, tables, views, materialized
 views; virtualized grid with frozen gutter, resizable columns, NULL and type-aware
@@ -61,50 +67,85 @@ updates and deletes staged and applied in one transaction on **Commit**, with th
 SQL shown before it runs. Tables without a primary or unique key are read-only, and the
 inspector says so.
 
+**Import and export** — read a delimited file into a table with the delimiter sniffed,
+columns matched by name and a preview headed by the *target*'s column names; a ragged file
+is refused by line number rather than padded into the wrong columns. Out again as TSV,
+CSV, JSON, Markdown or `insert` statements — the whole result, the selection, or what a
+filter left. Both run through the same transaction and the same read-only guard as an edit.
+
 **Row and table inspector** — every column of the selected row with its type, expandable
 for long values and pretty-printed JSON, one-click copy, Set NULL, and follow-the-foreign-key
-to the referenced row. The Table tab carries the size, row estimate, owner, primary key
-and whether the relation is writable at all.
+to the referenced row. A `bytea` or a Redis blob can be run through a decoder chain —
+`base64 → gzip → MessagePack`, PHP `serialize()`, or a hex dump that never fails — with
+every step named, because the useful half of a wrong guess is knowing which step to change.
+The Table tab carries the size, row estimate, owner, primary key and whether the relation
+is writable at all.
 
 **SQL** — tree-sitter-backed editor with syntax highlighting, completion for schemas,
 tables and columns, statement-under-cursor detection, formatting, run (`⌘↵`) or run-all
 (`⌘⇧↵`), cancellation (`⌘.`), messages and timing per statement.
 
-**Structure & DDL** — column, index, constraint and trigger lists; generated `CREATE`
+**Structure & DDL** — column, index, constraint and trigger lists; a structure editor that
+stages changes and shows the `alter table` before it sends it; generated `CREATE`
 statements for any object.
 
-**The rest of the shell** — split panes, tabs in the titlebar, command palette (`⌘K`),
+**Roles & privileges** — the roles a connection can see, their memberships and attributes,
+and a per-relation privileges tab: which grantee holds which privilege, with `PUBLIC`
+called out as the one worth noticing.
+
+**The rest of the shell** — split panes, tabs with a context menu (close others, left,
+right, unchanged; pin a tab and every bulk close steps over it), command palette (`⌘K`),
 object jump (`⌘P`), query history, saved queries, settings window, and full light/dark
 theming that reloads live.
 
+## Engines
+
+The app depends on `drivers` and `db`, never on an engine crate. What the UI branches on is
+a flag on `Capabilities` — `editable_rows`, `transactions`, `schemas`, `roles` — so the
+question is never "is this Redis?" but "can these rows be edited?".
+
+| | |
+|---|---|
+| **PostgreSQL** 12 – 17 | The one it is built for. Wire protocol spoken directly, pooled, with introspection, cancellation and a real transaction around every commit. |
+| **Redis** | Read-only, over RESP. A keyspace is *sampled* with `SCAN` rather than inventoried, and everything that reports on it says how much it looked at instead of pretending to a total. Hashes, lists, sets, sorted sets and streams all draw in the same grid. |
+| **ClickHouse** | The native protocol on 9000, not the HTTP interface: a columnar block arrives laid out the way the grid wants it, so fifty thousand rows never become rows and back. Nothing generated, nothing wrapped. |
+
 ## Not there yet
 
-SSH tunnelling · import and export (CSV, SQL, JSON) · structure *editing* (the design
-sheet is scaffolded, not wired) · connection folders and a proper connection manager
-window · Redis as a second engine ([the driver is written](crates/db_redis), the UI is
-not) · anything that is not Postgres or macOS.
+SSH tunnelling · more than one connection open at a time (the sidebar shows the active one)
+· writing to Redis · ClickHouse beyond reading well · a signed release, an update channel,
+or any upgrade path for the local store · anything that is not macOS.
 
 ## Build it
 
-Rust 1.90 or newer, Xcode command line tools, macOS 13+.
+Rust 1.97 or newer, Xcode command line tools, macOS 13+.
 
 ```sh
 git clone git@github.com:anuvaya/tupli.git
 cd tupli
-cargo run -p tupli
+scripts/dev-identity.sh   # once — see below
+scripts/run.sh
 ```
 
 The first build compiles GPUI from source and takes a while. Subsequent ones do not.
 
-To get a real `.app` — with an icon, a Dock presence and a name Spotlight can find:
+`scripts/run.sh` rather than `cargo run`, because macOS reads an application's icon, its
+name in the menu bar and its Keychain identity from the bundle and not from the executable:
+a bare binary is a different, nameless application every time. The script builds, bundles,
+replaces any running instance and opens the result.
 
-```sh
-scripts/bundle.sh --channel development --open
-```
+`scripts/dev-identity.sh` creates a local self-signed code-signing certificate, once. Without
+it every build is ad-hoc signed, which means a new code identity, which means the Keychain
+asks for permission again on every launch. It is trusted only in your own keychain and means
+nothing on any other machine.
 
 Channels are separate applications, not one application wearing three icons: development,
 preview and production each get their own name, bundle identifier and ribboned icon, so
 you can run the one you are hacking on next to the one you rely on.
+
+```sh
+scripts/bundle.sh --channel preview --open
+```
 
 ## Where it keeps things
 
@@ -119,7 +160,8 @@ Deleting the first one resets the app. Passwords are never written to it.
 ## Themes
 
 Themes are Zed theme JSON, so a theme written for Zed mostly works here. Bundled:
-**Fleet** (Light, Dark, Dark Purple), **One**, **Ayu**, **Gruvbox** — see
+**Fleet** (Light, Dark, Dark Purple), **One** (Dark, Light), **Ayu** (Dark, Light, Mirage)
+and **Gruvbox** (Dark and Light, each in three contrasts) — see
 [`assets/themes`](assets/themes). Both appearances are first-class; the whole chrome
 recolours live, without a restart.
 
@@ -129,36 +171,40 @@ recolours live, without a restart.
 |---|---|---|---|
 | `⌘K` | command palette | `⌘↵` | run statement |
 | `⌘P` | jump to object | `⌘⇧↵` | run everything |
-| `⌘T` | new tab | `⌘.` | cancel |
-| `⌘N` | new connection | `⌘R` | refresh results |
-| `⌘1` `⌘2` `⌘3` | sidebar / results / inspector | `⌘⇧R` | refresh schema |
-| `⌘D` `⌘⇧D` | split right / down | `⌥⇧F` | format SQL |
-| `⌘,` | settings | `F6` | follow foreign key |
+| `⌘⇧P` | commands only | `⌘.` | cancel |
+| `⌘T` | new tab | `⌘R` | refresh results |
+| `⌘W` `⌥⌘W` | close tab / close others | `⌘⇧R` | refresh schema |
+| `⌘N` | new connection | `⌥⇧F` | format SQL |
+| `⌘S` `⌘⇧S` | save query / save as | `F6` | follow foreign key |
+| `⌘⇧I` `⌘⇧E` | import / export rows | `⌘C` `⌘⇧C` | copy / copy with headers |
+| `⌘1` `⌘2` `⌘3` | sidebar / results / inspector | `⌘D` `⌘⇧D` | split right / down |
+| `⌘,` | settings | | |
 
 ## Layout
 
 ```
 crates/
-  db          engine-agnostic types: connections, schemas, columns, values, errors
-  db_pg       the Postgres driver — pooling, introspection, type decoding
-  db_redis    the second engine, written to prove the boundary is real
-  sqlgen      SQL generation: DML from grid edits, DDL from structure
-  grid        the virtualized result grid, as a standalone element
-  editor      the SQL editor: rope, tree-sitter, completion
-  ui          design system — theme, buttons, tabs, menus, sheets, icons
-  store       SQLite + Keychain: connections, history, saved queries
-  tupli       the application: window, panes, sidebar, inspector, commands
+  db             engine-agnostic types: connections, schemas, columns, values, errors
+  db_pg          the Postgres driver — pooling, introspection, type decoding
+  db_redis       Redis over RESP, read-only, sampled rather than inventoried
+  db_clickhouse  ClickHouse's native protocol, hand-written, columnar end to end
+  drivers        the registry; the only crate that knows the engines by name
+  sqlgen         SQL the app writes rather than the user: DML from grid edits, DDL
+  grid           the virtualized result grid, as a standalone element
+  editor         the SQL editor: rope, tree-sitter, completion
+  ui             design system — theme, buttons, tabs, menus, sheets, icons
+  store          SQLite + Keychain: connections, history, saved queries
+  tupli          the application: window, panes, sidebar, inspector, commands
 ```
 
-`db` holds the shared vocabulary — rows, values, schemas — and everything above the
-drivers is written against it rather than against Postgres. The last mile is not done:
-`db_pg` still shows up by name in a couple of places in the app layer, and a `Driver`
-trait to dispatch through is the next structural piece of work.
+`db` holds the shared vocabulary — rows, values, schemas, `Driver`, `Capabilities` — and
+everything above the drivers is written against it. Adding an engine is a variant on
+`db::Engine` and an arm in `drivers`; the app layer does not learn its name.
 
 ## Developing
 
 ```sh
-cargo test --workspace
+cargo test --workspace          # 595 tests
 cargo build --workspace --examples
 ```
 
@@ -166,13 +212,17 @@ There is a headless renderer for reviewing UI changes without a window — it re
 appearances offscreen to PNG at 2×:
 
 ```sh
-TUPLI_CONNECT="host=127.0.0.1 dbname=example user=postgres" \
+TUPLI_CONNECT="engine=postgres host=127.0.0.1 db=example user=postgres sslmode=disable" \
 TUPLI_OPEN=public.users \
 cargo run -p tupli --example screenshot -- /tmp/shot
 ```
 
 Most of the interesting state is reachable through `TUPLI_*` environment variables for
-exactly this reason — see `crates/tupli/examples/screenshot.rs`.
+exactly this reason — the sidebar tab, the results tab, a staged edit, an open menu, a
+sheet, a split, the settings window — see `crates/tupli/examples/screenshot.rs`.
+
+House rules, such as they are, are in [`CLAUDE.md`](CLAUDE.md): comments say *why*, tests
+are named as sentences, and the tree is deliberately not `rustfmt --all` clean.
 
 ## Credits
 

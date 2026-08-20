@@ -17,16 +17,17 @@ identity every time, which means the Keychain asks for permission again.
 
 ## Layout
 
-    crates/db          the data model, the `Driver` trait, `Capabilities`
-    crates/db_pg       Postgres, over the wire protocol
-    crates/db_redis    Redis, over RESP
-    crates/drivers     the registry; the only crate that knows the engines by name
-    crates/sqlgen      SQL the app writes rather than the user
-    crates/grid        the virtualised table
-    crates/ui          buttons, menus, theme
-    crates/editor      the SQL editor
-    crates/store       SQLite for settings and history, Keychain for passwords
-    crates/tupli       the application
+    crates/db             the data model, the `Driver` trait, `Capabilities`
+    crates/db_pg          Postgres, over the wire protocol
+    crates/db_redis       Redis, over RESP
+    crates/db_clickhouse  ClickHouse, over its native protocol
+    crates/drivers        the registry; the only crate that knows the engines by name
+    crates/sqlgen         SQL the app writes rather than the user
+    crates/grid           the virtualised table
+    crates/ui             buttons, menus, theme
+    crates/editor         the SQL editor
+    crates/store          SQLite for settings and history, Keychain for passwords
+    crates/tupli          the application
 
 The app depends on `drivers` and `db`, never on an engine crate. Anything the
 UI needs to branch on is a flag on `Capabilities`, so the question is never
