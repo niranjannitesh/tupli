@@ -75,16 +75,40 @@ CNF
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout "$work/key.pem" -out "$work/cert.pem" -config "$work/openssl.cnf" \
   >/dev/null 2>&1
-openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" \
-  -out "$work/identity.p12" -passout pass: -legacy >/dev/null 2>&1 \
-  || openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" \
-       -out "$work/identity.p12" -passout pass: >/dev/null 2>&1
-
-# `-T /usr/bin/codesign` is the whole point of importing rather than adding:
-# it puts codesign on the private key's own access list, so signing does not
-# prompt either.
-security import "$work/identity.p12" -k "$keychain" -P "" \
-  -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+# A throwaway password rather than none, and SHA-1 rather than the default
+# MAC. OpenSSL 3 writes a bundle the Security framework will not open — it
+# fails as "MAC verification failed during PKCS12 import (wrong password?)"
+# whichever password is used, including the right one — and an empty password
+# is a second thing the two encode differently. The password lives for the
+# length of this script inside a directory only this user can read.
+#
+# The variants are tried in turn because the working combination depends on
+# which openssl is first on PATH: Homebrew's 3.x needs both flags, the
+# LibreSSL at /usr/bin/openssl has neither and already writes what Apple
+# wants. Nothing here can tell a bad bundle from a good one except by handing
+# it to `security import`, so that is the test.
+password=$(openssl rand -hex 16)
+imported=0
+for flags in "-legacy -macalg sha1" "-macalg sha1" ""; do
+  # shellcheck disable=SC2086
+  openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" \
+    -out "$work/identity.p12" -passout "pass:$password" $flags >/dev/null 2>&1 \
+    || continue
+  # `-T /usr/bin/codesign` is the whole point of importing rather than adding:
+  # it puts codesign on the private key's own access list, so signing does not
+  # prompt either.
+  if security import "$work/identity.p12" -k "$keychain" -P "$password" \
+       -T /usr/bin/codesign -T /usr/bin/security >/dev/null 2>&1; then
+    imported=1
+    break
+  fi
+done
+if [ "$imported" = 0 ]; then
+  echo "dev-identity: the keychain would not accept the identity" >&2
+  security import "$work/identity.p12" -k "$keychain" -P "$password" \
+    -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+  exit 1
+fi
 
 # Without a trust setting codesign refuses the certificate as untrusted for the
 # purpose. `-p codeSign` grants it for that purpose and nothing else, and `-k`
