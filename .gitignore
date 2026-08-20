@@ -8,3 +8,4 @@
 # Internal working documents. They stay on disk; they do not go to the remote.
 /docs/PLAN.md
 /docs/ICON_INTEGRATION.md
+/docs/TODO.md
