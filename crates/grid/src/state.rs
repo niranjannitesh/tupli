@@ -106,6 +106,14 @@ pub enum GridEvent {
     /// Something was staged, reverted, or undone. The container redraws its
     /// commit bar; the grid does not know there is one.
     ChangesEdited,
+    /// A right click landed on a cell. The grid has already moved the cursor
+    /// there if it had to, so the container only has to put a menu at `at` —
+    /// which is in window coordinates, because that is where a menu lives.
+    ContextMenu {
+        at: Point<Pixels>,
+        row: usize,
+        col: usize,
+    },
 }
 
 /// Which column the grid is sorted by, and which way.

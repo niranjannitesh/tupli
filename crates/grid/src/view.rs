@@ -13,6 +13,7 @@ use gpui::{
 use ui::ActiveTheme;
 
 use crate::element::GridElement;
+use crate::export::Format;
 use crate::state::Grid;
 
 impl Render for Grid {
@@ -158,6 +159,15 @@ impl Grid {
             "home" => self.go_to_row(0, shift, cx),
             "end" => self.go_to_row(rows.saturating_sub(1), shift, cx),
             "a" if jump => self.select_all(cx),
+
+            // ---- clipboard ------------------------------------------------
+            //
+            // Tab-separated, because the overwhelmingly common destination for
+            // a copied selection is a spreadsheet, and tabs are the one format
+            // it pastes into columns without an import dialog. ⇧ adds the
+            // column names for when the rows are landing somewhere empty; the
+            // other formats are named explicitly from the context menu.
+            "c" if jump => self.copy_selection(Format::Tsv { headers: shift }, cx),
 
             // ---- editing --------------------------------------------------
             //

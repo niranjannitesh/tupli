@@ -19,10 +19,9 @@ use std::sync::Arc;
 use db::ResultSet;
 use gpui::{
     black, fill, point, px, relative, size, App, Bounds, ContentMask, Corners, CursorStyle,
-    DispatchPhase, Element, ElementId, Entity, Font,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    Style, TextAlign, TextRun, Window,
+    DispatchPhase, Element, ElementId, Entity, Font, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollWheelEvent, Style, TextAlign, TextRun, Window,
 };
 use sqlgen::{PendingChanges, RowRef};
 use ui::ActiveTheme;
@@ -502,7 +501,6 @@ impl Element for GridElement {
                     c.border,
                 ));
             }
-
         });
 
         // ---- frozen gutter: row ordinals ---------------------------------
@@ -796,6 +794,45 @@ impl GridElement {
                 if !matches!(region, Region::Empty) && !grid.read(cx).is_editing() {
                     window.focus(&handle, cx);
                 }
+            });
+        }
+
+        // Right press: aim the menu, but do not steal a selection.
+        //
+        // A right click inside the current selection means "these rows"; one
+        // outside it means "that row", and picking it up first is what every
+        // file manager and every spreadsheet does. Either way the grid only
+        // says where the click was — the menu itself belongs to whatever
+        // container knows which of the row operations make sense here.
+        {
+            let hitbox = hitbox.clone();
+            let grid = grid.clone();
+            let f = f.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || e.button != MouseButton::Right
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                let (row, col) = match f.region(e.position) {
+                    Region::Cell(row, col) => (row, col),
+                    Region::Gutter(row) => (row, 0),
+                    _ => return,
+                };
+                let handle = grid.read(cx).focus().clone();
+                grid.update(cx, |grid, cx| {
+                    if !grid.selected_rows().contains(&row) {
+                        grid.set_cursor(row, col, false, cx);
+                    }
+                    cx.emit(GridEvent::ContextMenu {
+                        at: e.position,
+                        row,
+                        col,
+                    });
+                });
+                window.focus(&handle, cx);
+                cx.stop_propagation();
             });
         }
 
@@ -1107,8 +1144,7 @@ fn measure_columns(grid: &mut Grid, window: &mut Window, cx: &App) {
         }
         // Plus the strip the sort arrow is always given: without it the name
         // is measured to a width it is then truncated out of.
-        let header =
-            header_advance * column.meta.name.chars().count() as f32 + SORT_ARROW_WIDTH;
+        let header = header_advance * column.meta.name.chars().count() as f32 + SORT_ARROW_WIDTH;
         let widest = header.max(advance * samples[i] as f32);
         grid.columns[i].width = px((f32::from(widest) + Grid::CELL_PADDING * 2.)
             .clamp(Grid::MIN_COLUMN_WIDTH, Grid::MAX_COLUMN_WIDTH));

@@ -2,6 +2,7 @@
 //! screenshot renderer, tests — can build the same window.
 
 pub mod center;
+pub mod clipboard;
 pub mod complete;
 pub mod connection_sheet;
 pub mod editing;

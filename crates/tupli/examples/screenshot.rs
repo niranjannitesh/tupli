@@ -312,6 +312,26 @@ fn main() {
             cx.run_until_parked();
         }
 
+        // `TUPLI_MENU=row` selects a few rows and opens the grid's context menu
+        // over them. Driven through the workspace rather than through a
+        // synthetic right click, because a mouse event in an offscreen window
+        // has nowhere to land.
+        if std::env::var("TUPLI_MENU").as_deref() == Ok("row") {
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        let grid = workspace.pane().grid.clone();
+                        grid.update(cx, |grid, cx| {
+                            grid.set_cursor(2, 1, false, cx);
+                            grid.set_cursor(4, 1, true, cx);
+                        });
+                        workspace.open_row_menu(gpui::point(px(520.), px(560.)), 4, 1, cx);
+                    })
+                    .expect("open the row menu")
+            });
+            cx.run_until_parked();
+        }
+
         // `TUPLI_COMMIT=1` sends the staged changes and waits for the server,
         // which is how the write path is exercised end to end without a hand
         // on the keyboard. Destructive by design — point it at a scratch

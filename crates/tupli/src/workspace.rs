@@ -275,6 +275,8 @@ pub struct Workspace {
     // ---- objects ---------------------------------------------------------
     /// The context menu, while it is open.
     pub(crate) menu: Option<crate::objects::ObjectMenu>,
+    /// The grid's own context menu, while it is open.
+    pub(crate) row_menu: Option<crate::clipboard::RowMenu>,
     /// Where the titlebar's database switcher was clicked, while its menu is
     /// up. A point rather than a bool: the menu opens under the chevron.
     pub(crate) database_menu: Option<Point<Pixels>>,
@@ -344,6 +346,10 @@ fn build_pane(
             this.apply_sort(cx);
         }
         GridEvent::Activated { .. } => {}
+        GridEvent::ContextMenu { at, row, col } => {
+            this.active_pane = id;
+            this.open_row_menu(*at, *row, *col, cx);
+        }
         // Staged, not saved. The toolbar's counts and the tab's dirty dot both
         // read the grid, so all this has to do is ask for a frame.
         GridEvent::ChangesEdited => {
@@ -912,6 +918,7 @@ impl Workspace {
             pending_refresh: false,
 
             menu: None,
+            row_menu: None,
             database_menu: None,
             filter_menu: None,
             object_sheet: None,
@@ -2707,7 +2714,8 @@ impl Workspace {
     /// keystroke nobody knows about is not a feature. `None` is the answer for
     /// every cell that is not a key with a value in it, which is most of them.
     pub(crate) fn reference_target(&self, column: usize, cx: &App) -> Option<db::RelationRef> {
-        self.reference_in_column(column, cx).map(|(target, _)| target)
+        self.reference_in_column(column, cx)
+            .map(|(target, _)| target)
     }
 
     /// The table and `where` clause a field of the selected row refers to.
@@ -4560,6 +4568,7 @@ impl Render for Workspace {
             // The menu paints over even the sheets, because it is the only
             // thing here that is anchored to a point the user just clicked.
             .children(self.render_object_menu(cx))
+            .children(self.render_row_menu(cx))
             .children(self.render_database_menu(cx))
             .children(self.render_filter_menu(cx))
     }

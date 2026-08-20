@@ -9,8 +9,10 @@
 
 pub mod bench;
 mod element;
+mod export;
 mod state;
 mod view;
 
 pub use element::GridElement;
+pub use export::{Format, Sheet};
 pub use state::{CellRect, ColumnLayout, Density, Grid, GridEvent, Sort};
