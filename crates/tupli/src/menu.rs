@@ -46,6 +46,7 @@ actions!(
         CloseTab,
         Save,
         SaveAs,
+        ExportRows,
         Run,
         RunAll,
         Cancel,
@@ -96,6 +97,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("cmd-shift-s", SaveAs, None),
+        KeyBinding::new("cmd-shift-e", ExportRows, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         // Query. ⌘↵ runs the statement under the cursor and ⇧⌘↵ the whole
         // script, which is the split every SQL client has settled on.
@@ -124,18 +126,18 @@ pub fn init(cx: &mut App) {
     ]);
 
     cx.set_menus(vec![
-        Menu::new("tupli").items(vec![
-            MenuItem::action("About tupli", About),
+        Menu::new("Tupli").items(vec![
+            MenuItem::action("About Tupli", About),
             MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide tupli", Hide),
+            MenuItem::action("Hide Tupli", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
-            MenuItem::action("Quit tupli", Quit),
+            MenuItem::action("Quit Tupli", Quit),
         ]),
         Menu::new("File").items(vec![
             MenuItem::action("New Query Tab", NewTab),
@@ -144,6 +146,7 @@ pub fn init(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Save Query", Save),
             MenuItem::action("Save Query As…", SaveAs),
+            MenuItem::action("Export Rows…", ExportRows),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
         ]),

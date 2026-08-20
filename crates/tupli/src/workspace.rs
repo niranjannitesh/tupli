@@ -181,6 +181,8 @@ pub struct Workspace {
     pending_history: Option<i64>,
     /// The name-this-query sheet, while it is up.
     pub save_sheet: Option<Entity<SaveQuerySheet>>,
+    /// The export sheet, while it is up.
+    pub(crate) export_sheet: Option<Entity<crate::export::ExportSheet>>,
     /// The command palette, while it is up.
     pub palette: Option<Entity<Palette>>,
     /// What the consoles complete against. Handed to every console editor as
@@ -927,6 +929,7 @@ impl Workspace {
             session: None,
             pending_history: None,
             save_sheet: None,
+            export_sheet: None,
             palette: None,
             catalog,
             settings,
@@ -1914,6 +1917,7 @@ impl Workspace {
             Command::Cancel => self.cancel(cx),
             Command::Save => self.save_query(cx),
             Command::SaveAs => self.save_query_as(cx),
+            Command::ExportRows => self.open_export(cx),
             Command::CommitChanges => self.preview_commit(cx),
             Command::DiscardChanges => self.discard_changes(cx),
             Command::AddRow => self.add_row(cx),
@@ -1986,6 +1990,7 @@ impl Workspace {
             return;
         }
         if self.save_sheet.is_some()
+            || self.export_sheet.is_some()
             || self.object_sheet.is_some()
             || self.structure_preview.is_some()
         {
@@ -2044,6 +2049,7 @@ impl Workspace {
             m::CloseTab => Command::CloseTab,
             m::Save => Command::Save,
             m::SaveAs => Command::SaveAs,
+            m::ExportRows => Command::ExportRows,
             m::Run => Command::Run,
             m::RunAll => Command::RunAll,
             m::Cancel => Command::Cancel,
@@ -2103,6 +2109,7 @@ impl Workspace {
     fn accepts_commands(&self) -> bool {
         self.palette.is_none()
             && self.save_sheet.is_none()
+            && self.export_sheet.is_none()
             && self.object_sheet.is_none()
             && self.structure_preview.is_none()
     }
@@ -4893,6 +4900,7 @@ impl Render for Workspace {
             // The sheets are last so they paint over everything, including the
             // drag shield.
             .children(self.save_sheet.clone())
+            .children(self.export_sheet.clone())
             .children(self.palette.clone())
             .children(self.render_commit_preview(cx))
             .children(self.object_sheet.clone())

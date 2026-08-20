@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod complete;
 pub mod connection_window;
 pub mod editing;
+pub mod export;
 pub mod filter;
 pub mod inspector;
 pub mod json;

@@ -1,9 +1,10 @@
-//! Turning selected rows into text for the clipboard.
+//! Turning rows into text — for the clipboard, and for a file.
 //!
-//! Four formats, because the same rows leave this app for four different
-//! places: a spreadsheet, a file, a script, and a pull request. Tab-separated
-//! is what a spreadsheet pastes cleanly, so it is what ⌘C gives; the rest are
-//! asked for by name from the grid's context menu.
+//! Five formats, because the same rows leave this app for five different
+//! places: a spreadsheet, a file, a document, a pull request, and another
+//! server. Tab-separated is what a spreadsheet pastes cleanly, so it is what
+//! ⌘C gives; the rest are asked for by name from the grid's context menu or
+//! from the export sheet.
 //!
 //! Everything here works from the text the grid is already showing — the same
 //! staged-value-wins rule the paint loop uses — so what lands on the clipboard
@@ -19,6 +20,7 @@
 
 use std::fmt::Write as _;
 
+use db::schema::{quote_ident, quote_literal};
 use db::ValueKind;
 
 /// What the clipboard gets.
@@ -36,6 +38,25 @@ pub enum Format {
     Json,
     /// A GitHub-flavoured table, for pasting into a review or an issue.
     Markdown,
+    /// `insert` statements, for moving rows to another server.
+    ///
+    /// Which table they name is a fact about the rows and not about the
+    /// format, so it is on the [`Sheet`] — see [`Sheet::of`].
+    Sql,
+}
+
+impl Format {
+    /// What a file of this should be called, which is also how the export
+    /// sheet labels it.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Tsv { .. } => "tsv",
+            Format::Csv => "csv",
+            Format::Json => "json",
+            Format::Markdown => "md",
+            Format::Sql => "sql",
+        }
+    }
 }
 
 /// Rows resolved to their display text, which is all any of the formats need.
@@ -48,6 +69,14 @@ pub struct Sheet {
     kinds: Vec<ValueKind>,
     /// Row-major, `None` for null. Always `headers.len()` per row.
     cells: Vec<Option<String>>,
+    /// Where the rows came from, for the formats that have to name it. A
+    /// placeholder rather than an `Option`, because the alternative is
+    /// refusing to write `insert` statements for the result of a join — and
+    /// an `insert into table` somebody edits is more useful than nothing.
+    table: String,
+    /// Whether an `insert` here may claim a generated key. Off by default,
+    /// because it is a clause only some servers accept.
+    overriding: bool,
 }
 
 impl Sheet {
@@ -57,7 +86,27 @@ impl Sheet {
             headers,
             kinds,
             cells: Vec::new(),
+            table: "table".to_string(),
+            overriding: false,
         }
+    }
+
+    /// Name the table these rows came from, already quoted for the server.
+    pub fn of(mut self, table: impl Into<String>) -> Self {
+        self.table = table.into();
+        self
+    }
+
+    /// Write `overriding system value` into the `insert`.
+    ///
+    /// A table's `id` is usually `generated always as identity`, and Postgres
+    /// refuses a literal for one unless the statement says so. An export that
+    /// left the clause out would produce a file that reads correctly and then
+    /// fails on every batch — the exact failure this whole format exists to
+    /// avoid. See [`db::Capabilities::identity_overrides`] for who accepts it.
+    pub fn overriding(mut self, yes: bool) -> Self {
+        self.overriding = yes;
+        self
     }
 
     pub fn push_row(&mut self, row: impl IntoIterator<Item = Option<String>>) {
@@ -71,6 +120,14 @@ impl Sheet {
 
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty() || self.headers.is_empty()
+    }
+
+    /// How many rows it holds, which is what the caller reports afterwards.
+    pub fn len(&self) -> usize {
+        match self.headers.is_empty() {
+            true => 0,
+            false => self.cells.len() / self.headers.len(),
+        }
     }
 
     fn width(&self) -> usize {
@@ -87,7 +144,42 @@ impl Sheet {
             Format::Csv => self.delimited(',', true),
             Format::Json => self.json(),
             Format::Markdown => self.markdown(),
+            Format::Sql => self.sql(),
         }
+    }
+
+    /// One `insert` per batch of rows rather than one per row: a file of ten
+    /// thousand single-row inserts is ten thousand round trips when somebody
+    /// pipes it into psql, and the batched form is the same statement to read.
+    fn sql(&self) -> String {
+        const BATCH: usize = 100;
+        let columns: Vec<String> = self.headers.iter().map(|h| quote_ident(h)).collect();
+        let mut out = String::with_capacity(self.cells.len() * 12);
+        let rows: Vec<&[Option<String>]> = self.rows().collect();
+        for batch in rows.chunks(BATCH) {
+            let _ = writeln!(
+                out,
+                "insert into {} ({}){} values",
+                self.table,
+                columns.join(", "),
+                match self.overriding {
+                    true => " overriding system value",
+                    false => "",
+                }
+            );
+            for (ix, row) in batch.iter().enumerate() {
+                out.push_str("  (");
+                for (col, cell) in row.iter().enumerate() {
+                    if col > 0 {
+                        out.push_str(", ");
+                    }
+                    push_sql_literal(&mut out, cell.as_deref(), self.kinds[col]);
+                }
+                out.push(')');
+                out.push_str(if ix + 1 == batch.len() { ";\n" } else { ",\n" });
+            }
+        }
+        out
     }
 
     /// Tab- and comma-separated differ only in the delimiter and in whether the
@@ -238,6 +330,39 @@ fn push_json_value(out: &mut String, text: Option<&str>, kind: ValueKind) {
     }
 }
 
+/// A cell as a SQL literal, typed by the column it came from.
+///
+/// Quoting is the safe default and not a fallback: Postgres coerces an
+/// unadorned string literal to whatever the column is, so `'1e10'` into a
+/// `numeric` is the same row as `1e10`. Numbers and booleans are written bare
+/// only because a file somebody reads is worth the trouble.
+fn push_sql_literal(out: &mut String, text: Option<&str>, kind: ValueKind) {
+    let Some(text) = text else {
+        out.push_str("NULL");
+        return;
+    };
+    match kind {
+        ValueKind::Bool if text == "true" || text == "false" => out.push_str(text),
+        k if k.is_numeric() && is_plain_number(text) => out.push_str(text),
+        // Already `\x…` — see `Grid::export_cell`, which is where a `bytea`
+        // gets its full value back.
+        ValueKind::Bytes if text.starts_with("\\x") => {
+            let _ = write!(out, "'{text}'::bytea");
+        }
+        _ => out.push_str(&quote_literal(text)),
+    }
+}
+
+/// Digits, one optional point, one optional sign. Deliberately narrower than
+/// what Postgres accepts: everything it turns down is merely quoted, and
+/// `NaN`, `Infinity` and `1e10` all have to be.
+fn is_plain_number(text: &str) -> bool {
+    let body = text.strip_prefix('-').unwrap_or(text);
+    !body.is_empty()
+        && body.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && body.chars().filter(|c| *c == '.').count() <= 1
+}
+
 /// Whether `text` is a JSON number, by the grammar rather than by parsing: what
 /// gets written is `text` itself, so the only question is whether it is legal.
 fn is_json_number(text: &str) -> bool {
@@ -354,14 +479,36 @@ fn unique(headers: &[String]) -> Vec<String> {
     out
 }
 
+/// Which rows an export is about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rows {
+    /// What the selection covers, or the cursor's row when nothing is
+    /// selected. The ⌘C rule.
+    Selected,
+    /// Everything the pane has. Everything it *has*: a browsed table is one
+    /// page of itself, and this cannot reach past what was fetched — which is
+    /// why the export sheet says the count out loud.
+    All,
+}
+
 impl crate::state::Grid {
     /// The selected rows as text, or `None` when nothing is selected.
-    ///
-    /// Hidden columns are left out: this copies what is on screen, and a column
-    /// somebody hid is not. Column order is the result's own — pinning moves a
-    /// column to the left of the window, not of the data.
     pub fn copy_text(&self, format: Format) -> Option<String> {
-        let rows = self.selected_rows();
+        let sheet = self.sheet(Rows::Selected)?;
+        (!sheet.is_empty()).then(|| sheet.render(format))
+    }
+
+    /// The rows resolved to their display text, ready to be rendered in any
+    /// format. `None` when there are none to take.
+    ///
+    /// Hidden columns are left out: this exports what is on screen, and a
+    /// column somebody hid is not. Column order is the result's own — pinning
+    /// moves a column to the left of the window, not of the data.
+    pub fn sheet(&self, which: Rows) -> Option<Sheet> {
+        let rows: Vec<usize> = match which {
+            Rows::Selected => self.selected_rows(),
+            Rows::All => (0..self.row_count()).collect(),
+        };
         if rows.is_empty() {
             return None;
         }
@@ -381,7 +528,7 @@ impl crate::state::Grid {
         for row in rows {
             sheet.push_row(visible.iter().map(|col| self.export_cell(row, *col)));
         }
-        (!sheet.is_empty()).then(|| sheet.render(format))
+        Some(sheet)
     }
 
     /// One cell as the clipboard should have it.
@@ -432,6 +579,70 @@ mod tests {
         ]);
         sheet.push_row([Some("2".into()), None, None]);
         sheet
+    }
+
+    #[test]
+    fn a_sql_export_names_the_table_and_batches_the_rows() {
+        let sql = sheet().of("public.users").render(Format::Sql);
+        assert_eq!(
+            sql,
+            concat!(
+                "insert into public.users (id, name, settings) values\n",
+                "  (1, 'Ada', '{\"theme\":\"dark\"}'),\n",
+                "  (2, NULL, NULL);\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_quote_in_a_value_cannot_end_the_literal_it_is_in() {
+        let mut sheet = Sheet::new(vec!["name".into()], vec![ValueKind::Text]);
+        sheet.push_row([Some("O'Hara".into())]);
+        assert!(sheet.render(Format::Sql).contains("('O''Hara')"));
+    }
+
+    #[test]
+    fn a_number_that_is_not_plainly_one_is_quoted_rather_than_guessed_at() {
+        let mut sheet = Sheet::new(
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![ValueKind::Decimal, ValueKind::Float, ValueKind::Float],
+        );
+        let row = ["12.30", "NaN", "1e10"];
+        sheet.push_row(row.map(|v| Some(v.into())));
+        assert!(sheet.render(Format::Sql).contains("(12.30, 'NaN', '1e10')"));
+    }
+
+    #[test]
+    fn a_generated_key_is_claimed_rather_than_left_to_the_server() {
+        // Without the clause every batch of this file is rejected by the one
+        // server the format was written for.
+        let mut sheet = Sheet::new(vec!["id".into()], vec![ValueKind::Int]).overriding(true);
+        sheet.push_row([Some("1".into())]);
+        assert!(sheet
+            .render(Format::Sql)
+            .starts_with("insert into table (id) overriding system value values"));
+    }
+
+    #[test]
+    fn a_server_that_would_not_understand_the_clause_is_not_sent_it() {
+        let mut sheet = Sheet::new(vec!["id".into()], vec![ValueKind::Int]);
+        sheet.push_row([Some("1".into())]);
+        assert!(!sheet.render(Format::Sql).contains("overriding"));
+    }
+
+    #[test]
+    fn every_format_has_a_file_extension_of_its_own() {
+        let all = [
+            Format::Tsv { headers: true },
+            Format::Csv,
+            Format::Json,
+            Format::Markdown,
+            Format::Sql,
+        ];
+        let mut seen: Vec<&str> = all.iter().map(|f| f.extension()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len());
     }
 
     #[test]

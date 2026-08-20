@@ -122,6 +122,18 @@ impl Workspace {
                 )
                 .separator()
                 .item(
+                    // The same formats again, but to a file rather than the
+                    // clipboard, so the ellipsis: this one asks where.
+                    MenuItem::new("Export Rows…")
+                        .icon(IconName::DatabaseExport)
+                        .shortcut("⇧⌘E")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_row_menu(cx);
+                            this.open_export(cx);
+                        })),
+                )
+                .separator()
+                .item(
                     // The three row verbs, all of them staging rather than
                     // writing — which is why Delete is not marked as danger
                     // here the way a `DROP` is. Nothing leaves this window

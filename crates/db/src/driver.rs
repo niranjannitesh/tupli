@@ -154,6 +154,11 @@ pub struct Capabilities {
     /// The server has named roles that objects are granted to, so there is a
     /// list of them to browse and a privileges view on every relation.
     pub roles: bool,
+    /// An `insert` may say `overriding system value`, which is what lets a
+    /// generated key be written back as the value it had. Without it a SQL
+    /// export of any table with an identity column is a file that will not
+    /// load, which is the only thing such a file is for.
+    pub identity_overrides: bool,
 }
 
 impl Capabilities {
@@ -168,6 +173,7 @@ impl Capabilities {
         ddl: true,
         paged_catalog: false,
         roles: true,
+        identity_overrides: true,
     };
 
     /// Redis is the reason this struct exists. It has logical databases and
@@ -185,6 +191,7 @@ impl Capabilities {
         ddl: false,
         paged_catalog: true,
         roles: false,
+        identity_overrides: false,
     };
 
     pub fn is_sql(&self) -> bool {

@@ -14,5 +14,5 @@ mod state;
 mod view;
 
 pub use element::GridElement;
-pub use export::{Format, Sheet};
+pub use export::{Format, Rows, Sheet};
 pub use state::{CellRect, ColumnLayout, Density, Grid, GridEvent, Sort};

@@ -424,6 +424,59 @@ fn main() {
             });
         }
 
+        // `TUPLI_SHEET=export` puts the export sheet up over the browsed rows
+        // with a selection made first, because the row choice is only offered
+        // when there is one. `export-all` skips the selection, which is the
+        // other of the two states the sheet has.
+        let sheet = std::env::var("TUPLI_SHEET");
+        if matches!(sheet.as_deref(), Ok("export") | Ok("export-all")) {
+            let select = sheet.as_deref() == Ok("export");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        if select {
+                            let grid = workspace.pane().grid.clone();
+                            grid.update(cx, |grid, cx| {
+                                grid.set_cursor(1, 0, false, cx);
+                                grid.set_cursor(3, 0, true, cx);
+                            });
+                        }
+                        workspace.open_export(cx);
+                    })
+                    .expect("open the export sheet")
+            });
+        }
+
+        // `TUPLI_EXPORT=<format>:<path>` runs the write the sheet's Export
+        // button would have run, with the save panel skipped — a native panel
+        // has nothing to open onto in an offscreen window, and the file is the
+        // only part of an export worth checking anyway.
+        if let Ok(spec) = std::env::var("TUPLI_EXPORT") {
+            let (format, path) = spec
+                .split_once(':')
+                .expect("TUPLI_EXPORT is <format>:<path>");
+            let format = match format {
+                "csv" => grid::Format::Csv,
+                "tsv" => grid::Format::Tsv { headers: true },
+                "json" => grid::Format::Json,
+                "sql" => grid::Format::Sql,
+                "markdown" => grid::Format::Markdown,
+                other => panic!("no such export format: {other}"),
+            };
+            let path = std::path::PathBuf::from(path);
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        workspace.export_rows_to(path, format, grid::Rows::All, cx)
+                    })
+                    .expect("export the rows")
+            });
+            for _ in 0..10 {
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
         // `TUPLI_SAVE_AS=<name>` runs the save the sheet would have run, so the
         // Queries tab can be captured with something actually in it. It writes
         // to the store under `$HOME`, so point that somewhere scratch.
