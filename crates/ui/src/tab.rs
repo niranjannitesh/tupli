@@ -41,7 +41,9 @@ use crate::{
 };
 
 type Handler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
-
+/// A right click carries its position, because the menu it opens has to appear
+/// where the pointer is rather than where the tab is.
+type MenuHandler = Box<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static>;
 
 #[derive(IntoElement)]
 pub struct Tab {
@@ -59,6 +61,11 @@ pub struct Tab {
     /// Draw a dot instead of the close button — unsaved script, uncommitted rows.
     dirty: bool,
     closable: bool,
+    /// Pinned: the × becomes a pin, and the strip keeps this tab at its head.
+    /// The icon is not a button — unpinning is a menu item, because a control
+    /// that closes the tab in one state and keeps it in the other is a control
+    /// nobody can click without looking first.
+    pinned: bool,
     /// Whether this tab draws its own left / right stretch of the seam. Off at
     /// the outer ends of a strip that is flush against a region divider: the
     /// divider is already that line, and drawing it twice is a two-pixel edge
@@ -68,6 +75,7 @@ pub struct Tab {
     seam_r: bool,
     on_click: Option<Handler>,
     on_close: Option<Handler>,
+    on_secondary: Option<MenuHandler>,
 }
 
 impl Tab {
@@ -82,10 +90,12 @@ impl Tab {
             fill: false,
             dirty: false,
             closable: false,
+            pinned: false,
             seam_l: true,
             seam_r: true,
             on_click: None,
             on_close: None,
+            on_secondary: None,
         }
     }
 
@@ -125,6 +135,11 @@ impl Tab {
         self
     }
 
+    pub fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
     pub fn on_click(mut self, f: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_click = Some(Box::new(f));
         self
@@ -132,6 +147,15 @@ impl Tab {
 
     pub fn on_close(mut self, f: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_close = Some(Box::new(f));
+        self
+    }
+
+    /// Right click, for the strip that has a menu behind its tabs.
+    pub fn on_secondary(
+        mut self,
+        f: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_secondary = Some(Box::new(f));
         self
     }
 }
@@ -142,7 +166,17 @@ impl RenderOnce for Tab {
         let active = self.active;
         let close_id = ElementId::Name(format!("{:?}-close", self.id).into());
 
-        let trailing = if self.dirty {
+        let trailing = if self.pinned {
+            Some(
+                Icon::new(IconName::Pin)
+                    .size(IconSize::XSmall)
+                    .color(match active {
+                        true => IconColor::Muted,
+                        false => IconColor::Subtle,
+                    })
+                    .into_any_element(),
+            )
+        } else if self.dirty {
             Some(
                 div()
                     .flex_none()
@@ -220,6 +254,12 @@ impl RenderOnce for Tab {
             }))
             .when_some(self.on_click, |el, handler| {
                 el.on_click(move |e, window, cx| handler(e, window, cx))
+            })
+            .when_some(self.on_secondary, |el, handler| {
+                el.on_mouse_down(MouseButton::Right, move |e, window, cx| {
+                    cx.stop_propagation();
+                    handler(e, window, cx)
+                })
             })
             .children(self.icon.map(|i| {
                 // A colour the caller chose outranks the active state, because

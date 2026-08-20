@@ -263,6 +263,13 @@ pub struct CenterTab {
     pub title: SharedString,
     pub detail: Option<SharedString>,
     pub dirty: bool,
+    /// Kept at the head of the strip, and left alone by the bulk closes.
+    ///
+    /// A pin is a promise that this tab survives whatever you do to the others,
+    /// which is only worth making because "close the fourteen tables I opened
+    /// looking for this one" is the gesture, and the scratch query is the thing
+    /// that must not go with them.
+    pub pinned: bool,
     /// The relation this tab is browsing, for the tabs that are browsing one.
     /// The filter and the refresh button both need to re-issue the statement
     /// that filled the grid, and re-parsing the title to get there would be a

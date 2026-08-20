@@ -345,6 +345,7 @@ impl Workspace {
                     .icon_color(tone)
                     .active(i == active)
                     .dirty(tab.dirty)
+                    .pinned(tab.pinned)
                     .closable(!tab.dirty)
                     .when_some(detail, |t, d| t.detail(d))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -354,6 +355,9 @@ impl Workspace {
                     .on_close(cx.listener(move |this, _, _, cx| {
                         this.activate_pane(id, cx);
                         this.close_tab(i, cx)
+                    }))
+                    .on_secondary(cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                        this.open_tab_menu(e.position, id, i, cx)
                     }))
             })
             .collect();

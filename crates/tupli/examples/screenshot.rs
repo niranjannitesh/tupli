@@ -148,6 +148,33 @@ fn main() {
             cx.run_until_parked();
         }
 
+        // `TUPLI_TABS=<n>` opens n more query tabs. The tab strip's own
+        // behaviour — the menu below, a pin, the crowding that makes either
+        // worth having — is invisible on a window holding one tab.
+        if let Ok(count) = std::env::var("TUPLI_TABS") {
+            let count: usize = count.parse().expect("TUPLI_TABS is a number of tabs");
+            for _ in 0..count {
+                cx.update(|cx| {
+                    window
+                        .update(cx, |workspace, _window, cx| workspace.new_query_tab(cx))
+                        .expect("open a query tab")
+                });
+            }
+            cx.run_until_parked();
+        }
+
+        // `TUPLI_PIN=<n>` pins that tab, which is the only way to see what a
+        // pinned tab looks like without a hand on the mouse.
+        if let Ok(index) = std::env::var("TUPLI_PIN") {
+            let index: usize = index.parse().expect("TUPLI_PIN is a tab index");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| workspace.toggle_pin(index, cx))
+                    .expect("pin a tab")
+            });
+            cx.run_until_parked();
+        }
+
         // `TUPLI_DOCK=<px>` sets the height of the results dock. A frame taken
         // for a README wants the rows to carry it, and the saved layout has no
         // opinion about that — a fresh profile opens on whatever the default
@@ -336,6 +363,26 @@ fn main() {
         // over them. Driven through the workspace rather than through a
         // synthetic right click, because a mouse event in an offscreen window
         // has nowhere to land.
+        // `TUPLI_MENU=tab:<n>` opens the tab strip's menu on that tab. The
+        // point is the pointer's, and a right click lands inside the tab, so
+        // it is measured from where the strip puts tab n rather than given.
+        if let Some(index) = std::env::var("TUPLI_MENU")
+            .ok()
+            .and_then(|menu| menu.strip_prefix("tab:").map(str::to_string))
+        {
+            let index: usize = index.parse().expect("TUPLI_MENU=tab:<n> takes a tab index");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        let pane = workspace.active_pane;
+                        let at = gpui::point(px(300. + 150. * index as f32), px(96.));
+                        workspace.open_tab_menu(at, pane, index, cx)
+                    })
+                    .expect("open the tab menu")
+            });
+            cx.run_until_parked();
+        }
+
         if std::env::var("TUPLI_MENU").as_deref() == Ok("row") {
             cx.update(|cx| {
                 window

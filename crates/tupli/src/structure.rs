@@ -879,6 +879,7 @@ impl crate::workspace::Workspace {
             title: title.into(),
             detail: detail.map(Into::into),
             dirty: false,
+            pinned: false,
             relation,
             saved_query: None,
             sql: String::new(),

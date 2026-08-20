@@ -677,6 +677,7 @@ mod tests {
             title: title.to_string().into(),
             detail: relation.as_ref().map(|r| r.schema.to_string().into()),
             dirty: false,
+            pinned: false,
             relation,
             key: None,
             saved_query: None,

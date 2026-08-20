@@ -308,6 +308,8 @@ pub struct Workspace {
     pub(crate) menu: Option<crate::objects::ObjectMenu>,
     /// The grid's own context menu, while it is open.
     pub(crate) row_menu: Option<crate::clipboard::RowMenu>,
+    /// The tab strip's menu, while it is up.
+    pub(crate) tab_menu: Option<crate::tabs::TabMenu>,
     /// Where the titlebar's database switcher was clicked, while its menu is
     /// up. A point rather than a bool: the menu opens under the chevron.
     pub(crate) database_menu: Option<Point<Pixels>>,
@@ -587,6 +589,7 @@ impl Workspace {
             title: "Untitled".into(),
             detail: None,
             dirty: false,
+            pinned: false,
             relation: None,
             key: None,
             saved_query: None,
@@ -816,6 +819,7 @@ impl Workspace {
                         title: "mrr_by_plan.sql".into(),
                         detail: None,
                         dirty: true,
+                        pinned: false,
                         relation: None,
                         key: None,
                         saved_query: None,
@@ -834,6 +838,7 @@ impl Workspace {
                         title: "users".into(),
                         detail: Some("public".into()),
                         dirty: false,
+                        pinned: false,
                         relation: None,
                         key: None,
                         saved_query: None,
@@ -966,6 +971,7 @@ impl Workspace {
 
             menu: None,
             row_menu: None,
+            tab_menu: None,
             database_menu: None,
             filter_menu: None,
             object_sheet: None,
@@ -1390,6 +1396,7 @@ impl Workspace {
                     title: name.clone().into(),
                     detail: None,
                     dirty: false,
+                    pinned: false,
                     relation: None,
                     key: None,
                     saved_query: Some(id),
@@ -1461,6 +1468,13 @@ impl Workspace {
     /// tab that is leaving, and there is exactly one moment to take it.
     pub(crate) fn show_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.stash_editor(cx);
+        self.show_tab_stashed(index, cx);
+    }
+
+    /// The half of [`Self::show_tab`] after the stash, for the callers that
+    /// have already taken the console's text — a bulk close has to, before the
+    /// indices it was filed under stop meaning anything.
+    pub(crate) fn show_tab_stashed(&mut self, index: usize, cx: &mut Context<Self>) {
         // What the last run reported belongs to the tab that ran it, so it
         // leaves with that tab. A syntax error from a query tab, left showing
         // in red under a table's rows — with a duration that timed a statement
@@ -1518,7 +1532,7 @@ impl Workspace {
     /// Put what is in the console back into the tab that owns it. Every path
     /// that changes which tab is active goes through here first, or the text
     /// ends up belonging to whichever tab happened to be showing.
-    fn stash_editor(&mut self, cx: &App) {
+    pub(crate) fn stash_editor(&mut self, cx: &App) {
         let text = self.pane().editor.read(cx).text();
         let filter = self.pane().filter.read(cx).text(cx);
         if let Some(tab) = self.pane_mut().active_mut() {
@@ -1555,6 +1569,7 @@ impl Workspace {
             title: "Untitled".into(),
             detail: None,
             dirty: false,
+            pinned: false,
             relation: None,
             key: None,
             saved_query: None,
@@ -1579,34 +1594,59 @@ impl Workspace {
     /// The last pane of all stays and goes empty: the window is still this
     /// connection's window, and the empty state says what fills it.
     pub fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.pane().tabs.len() {
+        self.close_tabs(&[index], cx);
+    }
+
+    /// Close a set of tabs at once, given in the numbering they have now.
+    ///
+    /// One pass rather than a loop over [`Self::close_tab`], because every
+    /// close renumbers the tabs after it and a loop would be closing whatever
+    /// slid into the slot it had just emptied.
+    pub(crate) fn close_tabs(&mut self, doomed: &[usize], cx: &mut Context<Self>) {
+        let len = self.pane().tabs.len();
+        let mut doomed: Vec<usize> = doomed.iter().copied().filter(|i| *i < len).collect();
+        doomed.sort_unstable();
+        doomed.dedup();
+        if doomed.is_empty() {
             return;
         }
-        if self.pane().tabs.len() == 1 && self.panes.len() > 1 {
+        if doomed.len() == len && self.panes.len() > 1 {
             let id = self.active_pane;
             self.close_pane(id, cx);
             return;
         }
-        let was_active = index == self.pane().active_tab;
+        // The console holds the showing tab's script, and this is the last
+        // moment it is filed under an index that still means anything.
         self.stash_editor(cx);
-        self.pane_mut().tabs.remove(index);
-        let (active, left) = (self.pane().active_tab, self.pane().tabs.len());
-        self.pane_mut().active_tab = tab_after_close(active, index, left);
-        if was_active {
-            // Empty when that was the last tab: the console is per pane and
-            // would otherwise still be holding the closed tab's script.
-            let sql = self
-                .pane()
-                .active()
-                .map(|tab| tab.sql.clone())
-                .unwrap_or_default();
-            self.pane()
-                .editor
-                .update(cx, |editor, cx| editor.set_text(&sql, cx));
+        let active = self.pane().active_tab;
+        let survivor = crate::tabs::tab_after_closing(active, &doomed, len);
+        let pane = self.pane_mut();
+        for index in doomed.iter().rev() {
+            pane.tabs.remove(*index);
         }
-        // The rows belonged to the tab that is gone, and the grid is per pane.
-        if left == 0 {
-            self.clear_results(cx);
+        // Renumbered: the survivor was picked in the old numbering, and every
+        // closed tab before it has moved it one place towards the front.
+        pane.active_tab = survivor.map_or(0, |index| {
+            index - doomed.iter().filter(|closed| **closed < index).count()
+        });
+        let showing = pane.active_tab;
+        match survivor == Some(active) {
+            // The tab that was showing is still showing, and nothing about it
+            // has changed: re-reading its rows would be a page of network for
+            // a strip that lost some other tab.
+            true => {}
+            // A different tab is in front now, so it gets the same treatment
+            // clicking it would have given it — its script in the console, its
+            // rows in the grid. Without that the grid keeps the closed tab's
+            // answers under the surviving tab's name.
+            false if !self.pane().tabs.is_empty() => self.show_tab_stashed(showing, cx),
+            // Nothing left. The console is per pane and would otherwise still
+            // be holding the script of a tab that is gone.
+            false => {
+                let editor = self.pane().editor.clone();
+                editor.update(cx, |editor, cx| editor.set_text("", cx));
+                self.clear_results(cx);
+            }
         }
         self.save_session(cx);
         cx.notify();
@@ -1985,6 +2025,19 @@ impl Workspace {
         // with no button on it to close it with.
         if k.key == "escape" && self.menu.is_some() {
             self.close_object_menu(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if k.key == "escape" && self.tab_menu.is_some() {
+            self.close_tab_menu(cx);
+            cx.stop_propagation();
+            return;
+        }
+        // ⌥⌘W, the one ⌥⌘ gesture the window has, and the browsers' binding
+        // for it. Checked before the guard below rather than inside the match,
+        // which is a ⌘-only list by construction.
+        if m.platform && m.alt && !m.control && k.key == "w" {
+            self.close_other_tabs(cx);
             cx.stop_propagation();
             return;
         }
@@ -2708,6 +2761,7 @@ impl Workspace {
                     title,
                     detail: Some(detail),
                     dirty: false,
+                    pinned: false,
                     relation: Some(relation.clone()),
                     key: None,
                     saved_query: None,
@@ -2755,6 +2809,7 @@ impl Workspace {
                     title,
                     detail: Some(detail),
                     dirty: false,
+                    pinned: false,
                     relation: None,
                     key: Some((key, kind)),
                     saved_query: None,
@@ -2802,6 +2857,7 @@ impl Workspace {
             title,
             detail: Some(detail),
             dirty: false,
+            pinned: false,
             relation: Some(relation.clone()),
             key: None,
             saved_query: None,
@@ -4645,20 +4701,6 @@ impl Workspace {
 /// between these numbers are used, so the origin does not matter — what matters
 /// is that two timestamps on the same local day produce the same number, which
 /// is why this is not just `ms / 86_400_000`.
-/// Which tab should be showing once the one at `closed` is gone, given that
-/// `active` was showing and `remaining` tabs are left.
-///
-/// Closing a tab to the left of the active one shifts it down a place; closing
-/// the active last tab falls back onto its new neighbour; closing anything to
-/// the right leaves the active one where it is.
-pub(crate) fn tab_after_close(active: usize, closed: usize, remaining: usize) -> usize {
-    if active > closed || active >= remaining {
-        active.saturating_sub(1)
-    } else {
-        active
-    }
-}
-
 pub(crate) fn day_of(ms: i64) -> i64 {
     let seconds = ms.div_euclid(1000) + local_offset_seconds();
     seconds.div_euclid(86_400)
@@ -4943,6 +4985,7 @@ impl Render for Workspace {
             // thing here that is anchored to a point the user just clicked.
             .children(self.render_object_menu(cx))
             .children(self.render_row_menu(cx))
+            .children(self.render_tab_menu(cx))
             .children(self.render_database_menu(cx))
             .children(self.render_filter_menu(cx))
             .children(self.render_decoder_menu(cx))
@@ -5085,30 +5128,8 @@ pub fn cell_text(column: &db::Column, row: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_of, id_for_save, short_version, suggest_name, tab_after_close};
+    use super::{count_of, id_for_save, short_version, suggest_name};
     use uuid::Uuid;
-
-    #[test]
-    fn closing_a_tab_to_the_left_shifts_the_active_one_down() {
-        assert_eq!(tab_after_close(2, 0, 2), 1);
-    }
-
-    #[test]
-    fn closing_a_tab_to_the_right_leaves_the_active_one_alone() {
-        assert_eq!(tab_after_close(0, 2, 2), 0);
-    }
-
-    #[test]
-    fn closing_the_active_last_tab_falls_back_onto_its_neighbour() {
-        assert_eq!(tab_after_close(2, 2, 2), 1);
-    }
-
-    #[test]
-    fn closing_the_active_tab_in_the_middle_keeps_the_position() {
-        // The tab that was to its right slides into the same slot, which is
-        // what every other editor does.
-        assert_eq!(tab_after_close(1, 1, 2), 1);
-    }
 
     #[test]
     fn a_count_of_one_is_singular() {

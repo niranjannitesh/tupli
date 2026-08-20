@@ -127,6 +127,11 @@ pub struct Tab {
     pub connection: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
+    /// Pinned. Worth a launch's memory: a pin is somebody saying this tab is
+    /// the one they keep, and forgetting it every morning would make the pin a
+    /// gesture for the next ten minutes rather than for the work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 impl State {
@@ -372,6 +377,7 @@ impl Tab {
             filter: Some(tab.filter.clone()).filter(|f| f != &crate::filter::Filter::default()),
             connection,
             database,
+            pinned: tab.pinned,
         }
     }
 
@@ -402,6 +408,7 @@ impl Tab {
             // Nothing is unsaved at launch: the text is right there in the
             // file, so a dot claiming otherwise would be a lie.
             dirty: false,
+            pinned: self.pinned,
             relation,
             saved_query: self.saved_query,
             sql: self.sql.clone(),
@@ -448,6 +455,7 @@ mod tests {
             title: title.into(),
             detail: None,
             dirty: true,
+            pinned: false,
             relation: None,
             key: None,
             saved_query: None,
@@ -478,6 +486,7 @@ mod tests {
             title: "users".into(),
             detail: Some("public".into()),
             dirty: false,
+            pinned: false,
             relation: Some(db::RelationRef::new("public", "users")),
             key: None,
             saved_query: None,

@@ -26,6 +26,7 @@ pub mod settings;
 pub mod settings_window;
 pub mod sidebar;
 pub mod structure;
+pub mod tabs;
 pub mod tint;
 pub mod titlebar;
 pub mod tree;
