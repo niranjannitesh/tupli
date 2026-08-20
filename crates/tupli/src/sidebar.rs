@@ -112,7 +112,10 @@ impl Workspace {
         if self.connections.is_empty() && self.session.is_none() {
             return self.render_connections(cx);
         }
-        let open = self.session.as_ref().map(|session| session.read(cx).config.id);
+        let open = self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).config.id);
         // A session the saved list has never heard of — `TUPLI_CONNECT`, or a
         // connection deleted while it was open. It is still what the window is
         // showing, so it goes at the top rather than nowhere.

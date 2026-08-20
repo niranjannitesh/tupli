@@ -22,7 +22,6 @@ use ui::{
 use editor::{Editor, EditorMode, Input};
 use grid::{Grid, GridEvent};
 
-use crate::connection_sheet::{ConnectionSheet, SheetEvent};
 use crate::mock;
 use crate::palette::{
     Command, ItemKind, Palette, PaletteAction, PaletteEvent, PaletteItem, PaletteMode,
@@ -179,8 +178,6 @@ pub struct Workspace {
     sessions: Vec<Entity<Session>>,
     /// The history row the in-flight statement is being recorded into.
     pending_history: Option<i64>,
-    /// The new/edit connection sheet, while it is up.
-    pub sheet: Option<Entity<ConnectionSheet>>,
     /// The name-this-query sheet, while it is up.
     pub save_sheet: Option<Entity<SaveQuerySheet>>,
     /// The command palette, while it is up.
@@ -259,6 +256,9 @@ pub struct Workspace {
     /// it is a window of its own, and this window only needs to be able to
     /// raise it and to know that it exists.
     settings_window: Option<gpui::WindowHandle<crate::settings_window::SettingsWindow>>,
+    /// The connection window, while it is open. Like Settings: a window of its
+    /// own, and this one only needs to raise it and to know it exists.
+    connection_window: Option<gpui::WindowHandle<crate::connection_window::ConnectionWindow>>,
     /// Set when the theme changed under the window. Nothing observes the theme
     /// global, so every colour cached in every element is stale and the whole
     /// window has to be told — which needs a `Window`, which only `render` has.
@@ -895,13 +895,13 @@ impl Workspace {
             saved,
             session: None,
             pending_history: None,
-            sheet: None,
             save_sheet: None,
             palette: None,
             catalog,
             settings,
             window: None,
             settings_window: None,
+            connection_window: None,
             reopen,
             reopen_database,
             _on_quit: None,
@@ -1937,8 +1937,7 @@ impl Workspace {
             }
             return;
         }
-        if self.sheet.is_some()
-            || self.save_sheet.is_some()
+        if self.save_sheet.is_some()
             || self.object_sheet.is_some()
             || self.structure_preview.is_some()
         {
@@ -2055,7 +2054,6 @@ impl Workspace {
     /// answer.
     fn accepts_commands(&self) -> bool {
         self.palette.is_none()
-            && self.sheet.is_none()
             && self.save_sheet.is_none()
             && self.object_sheet.is_none()
             && self.structure_preview.is_none()
@@ -3114,58 +3112,86 @@ impl Workspace {
         self.pending_focus = Some(handle);
     }
 
+    /// Open the connection window on a blank form.
     pub fn new_connection(&mut self, cx: &mut Context<Self>) {
-        let sheet = cx.new(ConnectionSheet::new);
-        self.show_sheet(sheet, cx);
+        self.open_connection_window(None, cx);
     }
 
+    /// Open the connection window on an existing connection.
     pub fn edit_connection(&mut self, config: db::ConnectionConfig, cx: &mut Context<Self>) {
-        let sheet = cx.new(|cx| ConnectionSheet::editing(config, cx));
-        self.show_sheet(sheet, cx);
+        self.open_connection_window(Some(config), cx);
     }
 
-    fn show_sheet(&mut self, sheet: Entity<ConnectionSheet>, cx: &mut Context<Self>) {
-        cx.subscribe(&sheet, Self::on_sheet_event).detach();
-        // The sheet is modal, so it takes focus outright rather than politely
-        // waiting for a click — at the next paint, which is the first moment
-        // there is a window to hand it to.
-        self.pending_focus = Some(sheet.focus_handle(cx));
-        self.sheet = Some(sheet);
-        cx.notify();
+    /// The connection window, if it is open. For the screenshot harness, which
+    /// has to capture the window rather than the app.
+    pub fn connection_window(
+        &self,
+    ) -> Option<gpui::WindowHandle<crate::connection_window::ConnectionWindow>> {
+        self.connection_window
     }
 
-    fn on_sheet_event(
+    /// One window, like Settings: a second copy of the form could only
+    /// disagree with the first about what is saved.
+    fn open_connection_window(
         &mut self,
-        _sheet: Entity<ConnectionSheet>,
-        event: &SheetEvent,
+        config: Option<db::ConnectionConfig>,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            SheetEvent::Dismissed => {
-                self.sheet = None;
-                cx.notify();
+        if let Some(window) = self.connection_window {
+            let shown = window
+                .update(cx, |view, window, cx| {
+                    view.show(config.clone(), window, cx);
+                    window.activate_window();
+                })
+                .is_ok();
+            if shown {
+                return;
             }
-            SheetEvent::Saved { config, password } => {
-                self.sheet = None;
-                if let Some(store) = self.store.clone() {
-                    if let Err(error) = store.save_connection(config) {
-                        log::error!("could not save the connection: {error:#}");
-                    }
-                    // The secret goes to the Keychain and nowhere else. `None`
-                    // means the field was untouched on an edit.
-                    if let Some(password) = password {
-                        if let Err(error) = store::secrets::set_password(config.id, password) {
-                            log::error!("could not save the password: {error:#}");
-                        }
-                    }
-                    self.connections = store.connections().unwrap_or_default();
-                }
-                // The typed password goes straight to the session as well as to
-                // the Keychain. `None` on an edit that left the field alone,
-                // which is the case where the Keychain is the only answer.
-                self.open_connection_with(config.clone(), password.clone(), cx);
-            }
+            // The handle outlived the window — it was closed while we held it.
+            self.connection_window = None;
         }
+        // Deferred for the same reason Settings is: opening a window renders
+        // its first frame there and then, and that frame reads this workspace,
+        // which is checked out for as long as this method is running.
+        let workspace = cx.weak_entity();
+        cx.defer(move |cx: &mut App| {
+            match crate::connection_window::open(workspace.clone(), config, cx) {
+                Ok(window) => {
+                    let _ = workspace.update(cx, |workspace, _| {
+                        workspace.connection_window = Some(window)
+                    });
+                }
+                Err(error) => log::warn!("could not open the connection window: {error:#}"),
+            }
+        });
+    }
+
+    /// Keep what the connection window collected and open it. The password is
+    /// `None` when the field was left alone on an existing connection, which
+    /// means "keep whatever is in the Keychain" — distinct from `Some("")`,
+    /// which means "there is no password".
+    pub(crate) fn save_connection(
+        &mut self,
+        config: &db::ConnectionConfig,
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(store) = self.store.clone() {
+            if let Err(error) = store.save_connection(config) {
+                log::error!("could not save the connection: {error:#}");
+            }
+            // The secret goes to the Keychain and nowhere else.
+            if let Some(password) = &password {
+                if let Err(error) = store::secrets::set_password(config.id, password) {
+                    log::error!("could not save the password: {error:#}");
+                }
+            }
+            self.connections = store.connections().unwrap_or_default();
+        }
+        // The typed password goes straight to the session as well as to the
+        // Keychain. `None` on an edit that left the field alone, which is the
+        // case where the Keychain is the only answer.
+        self.open_connection_with(config.clone(), password, cx);
     }
 
     pub fn delete_connection(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
@@ -4557,9 +4583,8 @@ impl Render for Workspace {
             )
             .child(self.status_bar(cx))
             .children(self.drag_shield(cx))
-            // The sheet is last so it paints over everything, including the
+            // The sheets are last so they paint over everything, including the
             // drag shield.
-            .children(self.sheet.clone())
             .children(self.save_sheet.clone())
             .children(self.palette.clone())
             .children(self.render_commit_preview(cx))

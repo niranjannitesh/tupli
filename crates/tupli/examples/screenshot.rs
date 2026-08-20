@@ -510,6 +510,37 @@ fn main() {
             }
         }
 
+        // `TUPLI_CONNECTION=new|<name>` opens the connection window and
+        // captures that instead, for the same reason.
+        if let Ok(which) = std::env::var("TUPLI_CONNECTION") {
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        match workspace
+                            .connections
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&which))
+                            .cloned()
+                        {
+                            Some(config) => workspace.edit_connection(config, cx),
+                            None => workspace.new_connection(cx),
+                        }
+                    })
+                    .expect("open the connection window")
+            });
+            cx.run_until_parked();
+            let connection = cx.update(|cx| {
+                window
+                    .read(cx)
+                    .ok()
+                    .and_then(|workspace| workspace.connection_window())
+            });
+            match connection {
+                Some(handle) => target = handle.into(),
+                None => eprintln!("warning: the connection window did not open"),
+            }
+        }
+
         // Assets load through the executor, and the first frame lays out the
         // grid's columns; parking between draws lets both settle before the
         // frame that gets captured.

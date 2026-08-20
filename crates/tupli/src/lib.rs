@@ -4,7 +4,7 @@
 pub mod center;
 pub mod clipboard;
 pub mod complete;
-pub mod connection_sheet;
+pub mod connection_window;
 pub mod editing;
 pub mod filter;
 pub mod inspector;
