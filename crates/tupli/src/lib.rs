@@ -8,6 +8,7 @@ pub mod connection_window;
 pub mod editing;
 pub mod export;
 pub mod filter;
+pub mod import;
 pub mod inspector;
 pub mod json;
 pub mod layout;

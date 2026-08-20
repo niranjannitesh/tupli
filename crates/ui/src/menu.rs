@@ -125,6 +125,14 @@ impl ContextMenu {
         self
     }
 
+    /// Zero or more, which is what an `Option` is: a verb that only some rows
+    /// have is `.items(condition.then(|| …))` rather than a menu built in
+    /// pieces around an `if`.
+    pub fn items(mut self, items: impl IntoIterator<Item = MenuItem>) -> Self {
+        self.entries.extend(items.into_iter().map(Entry::Item));
+        self
+    }
+
     /// A hairline. Two in a row, or one at either end, are dropped when the
     /// menu is built, so a caller can add one after a group that turned out to
     /// be empty without having to think about it.

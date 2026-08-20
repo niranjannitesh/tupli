@@ -183,6 +183,15 @@ pub struct Workspace {
     pub save_sheet: Option<Entity<SaveQuerySheet>>,
     /// The export sheet, while it is up.
     pub(crate) export_sheet: Option<Entity<crate::export::ExportSheet>>,
+    /// The import sheet, while it is up.
+    pub(crate) import_sheet: Option<Entity<crate::import::ImportSheet>>,
+    /// What the transaction now in flight is, when it is an import: how many
+    /// rows and out of which file.
+    ///
+    /// A commit and an import come back through the same door, and the log
+    /// entry is the only record either one leaves. "Committed 6 inserts" under
+    /// a button that said Import is the app describing its own plumbing.
+    pub(crate) import_note: Option<SharedString>,
     /// The command palette, while it is up.
     pub palette: Option<Entity<Palette>>,
     /// What the consoles complete against. Handed to every console editor as
@@ -930,6 +939,8 @@ impl Workspace {
             pending_history: None,
             save_sheet: None,
             export_sheet: None,
+            import_sheet: None,
+            import_note: None,
             palette: None,
             catalog,
             settings,
@@ -1918,6 +1929,7 @@ impl Workspace {
             Command::Save => self.save_query(cx),
             Command::SaveAs => self.save_query_as(cx),
             Command::ExportRows => self.open_export(cx),
+            Command::ImportRows => self.open_import(cx),
             Command::CommitChanges => self.preview_commit(cx),
             Command::DiscardChanges => self.discard_changes(cx),
             Command::AddRow => self.add_row(cx),
@@ -1991,6 +2003,7 @@ impl Workspace {
         }
         if self.save_sheet.is_some()
             || self.export_sheet.is_some()
+            || self.import_sheet.is_some()
             || self.object_sheet.is_some()
             || self.structure_preview.is_some()
         {
@@ -2050,6 +2063,7 @@ impl Workspace {
             m::Save => Command::Save,
             m::SaveAs => Command::SaveAs,
             m::ExportRows => Command::ExportRows,
+            m::ImportRows => Command::ImportRows,
             m::Run => Command::Run,
             m::RunAll => Command::RunAll,
             m::Cancel => Command::Cancel,
@@ -2110,6 +2124,7 @@ impl Workspace {
         self.palette.is_none()
             && self.save_sheet.is_none()
             && self.export_sheet.is_none()
+            && self.import_sheet.is_none()
             && self.object_sheet.is_none()
             && self.structure_preview.is_none()
     }
@@ -3730,17 +3745,22 @@ impl Workspace {
         };
 
         let target = self.active_pane;
+        let note = self.import_note.take();
         self.messages.push(RunMessage {
             at_ms: now_ms(),
-            sql: format!("commit ({summary})").into(),
+            sql: match &note {
+                Some(_) => format!("import ({summary})").into(),
+                None => format!("commit ({summary})").into(),
+            },
             elapsed,
             tone: match &error {
                 Some(_) => MessageTone::Failed,
                 None => MessageTone::Ok,
             },
-            text: match &error {
-                Some(error) => error.full_text().into(),
-                None => format!("Committed {summary}.").into(),
+            text: match (&error, &note) {
+                (Some(error), _) => error.full_text().into(),
+                (None, Some(note)) => format!("Imported {note}.").into(),
+                (None, None) => format!("Committed {summary}.").into(),
             },
             // A commit's own notices go with the statements inside it, and
             // those are not shown one by one. Nothing to attach here.
@@ -4914,6 +4934,7 @@ impl Render for Workspace {
             // drag shield.
             .children(self.save_sheet.clone())
             .children(self.export_sheet.clone())
+            .children(self.import_sheet.clone())
             .children(self.palette.clone())
             .children(self.render_commit_preview(cx))
             .children(self.object_sheet.clone())

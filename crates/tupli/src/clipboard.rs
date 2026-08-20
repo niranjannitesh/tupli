@@ -121,6 +121,18 @@ impl Workspace {
                         })),
                 )
                 .separator()
+                // Only on a tab that is browsing a table: a query result has
+                // no table to put rows into, and the row menu is the one place
+                // a dead verb would look like a broken one.
+                .items(self.can_import(cx).then(|| {
+                    MenuItem::new("Import Rows…")
+                        .icon(IconName::Import)
+                        .shortcut("⇧⌘I")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_row_menu(cx);
+                            this.open_import(cx);
+                        }))
+                }))
                 .item(
                     // The same formats again, but to a file rather than the
                     // clipboard, so the ellipsis: this one asks where.

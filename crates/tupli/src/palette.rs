@@ -119,6 +119,7 @@ pub enum Command {
     Save,
     SaveAs,
     ExportRows,
+    ImportRows,
     CommitChanges,
     DiscardChanges,
     AddRow,
@@ -159,6 +160,7 @@ impl Command {
         Command::Save,
         Command::SaveAs,
         Command::ExportRows,
+        Command::ImportRows,
         Command::CommitChanges,
         Command::DiscardChanges,
         Command::AddRow,
@@ -196,6 +198,7 @@ impl Command {
             Self::Save => "Save Query",
             Self::SaveAs => "Save Query As…",
             Self::ExportRows => "Export Rows…",
+            Self::ImportRows => "Import Rows…",
             Self::CommitChanges => "Save Row Changes…",
             Self::DiscardChanges => "Discard Row Changes",
             Self::AddRow => "Add Row",
@@ -232,6 +235,7 @@ impl Command {
             Self::Cancel => IconName::Ban,
             Self::Save | Self::SaveAs | Self::CommitChanges => IconName::Save,
             Self::ExportRows => IconName::DatabaseExport,
+            Self::ImportRows => IconName::Import,
             Self::DiscardChanges => IconName::Undo,
             Self::AddRow => IconName::Plus,
             Self::DeleteRows => IconName::Minus,
@@ -270,6 +274,7 @@ impl Command {
             Self::Cancel => Some("⌘."),
             Self::Save => Some("⌘S"),
             Self::ExportRows => Some("⇧⌘E"),
+            Self::ImportRows => Some("⇧⌘I"),
             Self::NewTab => Some("⌘T"),
             Self::CloseTab => Some("⌘W"),
             Self::SplitRight => Some("⌘D"),
@@ -1036,7 +1041,7 @@ mod tests {
         }
         assert_eq!(
             Command::ALL.len(),
-            33,
+            34,
             "add the new command to ALL, not just to the enum"
         );
     }

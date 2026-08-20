@@ -685,7 +685,7 @@ impl Grid {
         // An empty field is an empty string, not a null. Nulling a cell is its
         // own gesture (⌘⌫) precisely because the two are different values and
         // the difference is invisible in a text field.
-        let value = parse_cell(kind, &text);
+        let value = Value::parse(kind, &text);
         self.set_cell(editing.row, editing.col, value, cx);
         self.refocus = true;
         cx.notify();
@@ -969,28 +969,6 @@ fn row_ref_in(data: &ResultSet, changes: &PendingChanges, row: usize) -> Option<
     match row.checked_sub(data.row_count()) {
         None => Some(RowRef::Existing(row)),
         Some(nth) => changes.new_rows().nth(nth).map(RowRef::New),
-    }
-}
-
-/// Text typed into a cell, as a value of that column's kind.
-fn parse_cell(kind: ValueKind, text: &str) -> Value {
-    match kind {
-        ValueKind::Bool => match text.trim().to_ascii_lowercase().as_str() {
-            "t" | "true" | "yes" | "on" | "1" => Value::Bool(true),
-            _ => Value::Bool(false),
-        },
-        // Numbers the app cannot hold — a bigint past i64, a numeric with
-        // forty digits — go as text and let the server judge them. Refusing
-        // them here would make columns uneditable that the server can parse.
-        ValueKind::Int => match text.trim().parse::<i64>() {
-            Ok(i) => Value::Int(i),
-            Err(_) => Value::text(kind, text),
-        },
-        ValueKind::Float => match text.trim().parse::<f64>() {
-            Ok(f) => Value::Float(f),
-            Err(_) => Value::text(kind, text),
-        },
-        _ => Value::text(kind, text),
     }
 }
 

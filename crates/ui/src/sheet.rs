@@ -248,7 +248,11 @@ impl FormRow {
     /// Grey text under the control. For explaining a default, not for
     /// restating the label.
     pub fn hint(mut self, hint: impl Into<SharedString>) -> Self {
-        self.hint = Some(hint.into());
+        // An empty hint is no hint. It would take a line under the control and
+        // leave it blank, which is what a caller whose hint depends on the
+        // state ends up passing on the states that have nothing to say.
+        let hint = hint.into();
+        self.hint = (!hint.is_empty()).then_some(hint);
         self
     }
 

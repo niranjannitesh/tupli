@@ -167,7 +167,7 @@ fn column_index(rows: &ResultSet, name: &str) -> Option<usize> {
     rows.columns.iter().position(|c| c.meta.name == name)
 }
 
-fn qualified(relation: &RelationRef) -> String {
+pub(crate) fn qualified(relation: &RelationRef) -> String {
     format!(
         "{}.{}",
         db::schema::quote_ident(&relation.schema),

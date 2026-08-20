@@ -477,6 +477,31 @@ fn main() {
             }
         }
 
+        // `TUPLI_IMPORT=<path>` opens the import sheet on a file, with the open
+        // panel skipped for the same reason `TUPLI_EXPORT` skips the save one.
+        // `TUPLI_IMPORT_RUN` also presses Import, which writes to the server —
+        // so it is a separate flag rather than the same one.
+        if let Ok(path) = std::env::var("TUPLI_IMPORT") {
+            let path = std::path::PathBuf::from(path);
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| workspace.import_file(path, cx))
+                    .expect("open the import sheet")
+            });
+            cx.run_until_parked();
+            if std::env::var("TUPLI_IMPORT_RUN").is_ok() {
+                cx.update(|cx| {
+                    window
+                        .update(cx, |workspace, _window, cx| workspace.confirm_import(cx))
+                        .expect("run the import")
+                });
+                for _ in 0..10 {
+                    cx.run_until_parked();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+
         // `TUPLI_SAVE_AS=<name>` runs the save the sheet would have run, so the
         // Queries tab can be captured with something actually in it. It writes
         // to the store under `$HOME`, so point that somewhere scratch.

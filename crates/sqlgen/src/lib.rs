@@ -10,6 +10,7 @@
 //! Identifier quoting lives in `db::schema` because the introspector needs it
 //! too; this crate is about statements.
 
+pub mod bulk;
 pub mod change;
 pub mod ddl;
 pub mod dml;
@@ -17,6 +18,7 @@ pub mod identity;
 pub mod statement;
 pub mod table;
 
+pub use bulk::inserts;
 pub use change::{Counts, PendingChanges, RowRef};
 pub use dml::{statements, Concurrency, Target};
 pub use identity::{resolve, Identity, NotEditable};

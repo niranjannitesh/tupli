@@ -91,6 +91,36 @@ impl Value {
             text: text.into(),
         }
     }
+
+    /// Text as a value of a column's kind.
+    ///
+    /// Typed into a cell or read out of a file — the same rule either way, so
+    /// that a column takes a value from an import exactly as it would from the
+    /// keyboard.
+    ///
+    /// Only the three kinds the app holds natively are parsed. Everything else
+    /// travels as text and is judged by the server, which is what keeps type
+    /// support from being an infinite backlog: a `numeric` of forty digits, a
+    /// timestamp in a format this app has never seen and a `bigint` past `i64`
+    /// all go out unchanged rather than being refused by a client that knows
+    /// less about the type than the server does.
+    pub fn parse(kind: ValueKind, text: &str) -> Self {
+        match kind {
+            ValueKind::Bool => match text.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "yes" | "on" | "1" => Self::Bool(true),
+                _ => Self::Bool(false),
+            },
+            ValueKind::Int => match text.trim().parse::<i64>() {
+                Ok(i) => Self::Int(i),
+                Err(_) => Self::text(kind, text),
+            },
+            ValueKind::Float => match text.trim().parse::<f64>() {
+                Ok(f) => Self::Float(f),
+                Err(_) => Self::text(kind, text),
+            },
+            _ => Self::text(kind, text),
+        }
+    }
 }
 
 impl fmt::Display for Value {

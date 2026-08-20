@@ -47,6 +47,7 @@ actions!(
         Save,
         SaveAs,
         ExportRows,
+        ImportRows,
         Run,
         RunAll,
         Cancel,
@@ -98,6 +99,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("cmd-shift-s", SaveAs, None),
         KeyBinding::new("cmd-shift-e", ExportRows, None),
+        KeyBinding::new("cmd-shift-i", ImportRows, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         // Query. ⌘↵ runs the statement under the cursor and ⇧⌘↵ the whole
         // script, which is the split every SQL client has settled on.
@@ -146,6 +148,7 @@ pub fn init(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Save Query", Save),
             MenuItem::action("Save Query As…", SaveAs),
+            MenuItem::action("Import Rows…", ImportRows),
             MenuItem::action("Export Rows…", ExportRows),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
