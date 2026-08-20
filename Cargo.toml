@@ -8,6 +8,7 @@ members = [
     "crates/db",
     "crates/db_pg",
     "crates/db_redis",
+    "crates/db_clickhouse",
     "crates/drivers",
     "crates/sqlgen",
     "crates/store",

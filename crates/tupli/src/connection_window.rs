@@ -750,6 +750,9 @@ fn engine_placeholder(engine: Engine) -> (String, String) {
         // Redis numbers its databases from zero, and the user it ships with is
         // literally called `default`.
         Engine::Redis => ("0".into(), "default".into()),
+        // Where a bare table name resolves, rather than a boundary: a
+        // ClickHouse session can read every database on the server.
+        Engine::ClickHouse => ("default".into(), "default".into()),
     }
 }
 
@@ -757,6 +760,7 @@ fn engine_hint(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "Tables, a SQL editor, and editable results.",
         Engine::Redis => "Keys by pattern, and a command line instead of SQL.",
+        Engine::ClickHouse => "Tables and a SQL editor. Results are read-only.",
     }
 }
 

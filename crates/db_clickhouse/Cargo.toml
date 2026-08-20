@@ -1,0 +1,34 @@
+[package]
+name = "db_clickhouse"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+db = { path = "../db" }
+anyhow.workspace = true
+futures.workspace = true
+log.workspace = true
+time.workspace = true
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+] }
+tokio-native-tls = "0.3.1"
+native-tls = "0.2.18"
+# Only the block codec: the `frame` feature is the LZ4 file format, which
+# ClickHouse does not use, and it pulls in a hash crate for nothing. `checked-
+# decode` is what makes a corrupt block an error rather than a panic.
+lz4_flex = { version = "0.11", default-features = false, features = [
+    "std",
+    "safe-encode",
+    "safe-decode",
+    "checked-decode",
+] }
+
+[dev-dependencies]
+env_logger.workspace = true

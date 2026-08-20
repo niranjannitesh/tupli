@@ -1,9 +1,10 @@
 //! Which driver opens a connection.
 //!
-//! The one place that knows both engines by name. It exists so that nothing
+//! The one place that knows the engines by name. It exists so that nothing
 //! above it does: the app depends on this crate and on [`db`], never on
-//! `db_pg` or `db_redis`, which makes "the UI does not know what it is talking
-//! to" a fact the compiler checks rather than a rule people remember.
+//! `db_pg`, `db_redis` or `db_clickhouse`, which makes "the UI does not know
+//! what it is talking to" a fact the compiler checks rather than a rule people
+//! remember.
 //!
 //! Adding an engine is a variant on [`db::Engine`] and an arm here.
 
@@ -27,6 +28,10 @@ pub async fn connect(
         }
         Engine::Redis => {
             Arc::new(db_redis::RedisConnection::connect(config, password).await?) as Arc<dyn Driver>
+        }
+        Engine::ClickHouse => {
+            Arc::new(db_clickhouse::ClickHouseConnection::connect(config, password).await?)
+                as Arc<dyn Driver>
         }
     })
 }

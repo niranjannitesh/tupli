@@ -1566,6 +1566,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "db_clickhouse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "env_logger",
+ "futures",
+ "log",
+ "lz4_flex",
+ "native-tls",
+ "time",
+ "tokio",
+ "tokio-native-tls",
+]
+
+[[package]]
 name = "db_pg"
 version = "0.1.0"
 dependencies = [
@@ -1776,6 +1792,7 @@ name = "drivers"
 version = "0.1.0"
 dependencies = [
  "db",
+ "db_clickhouse",
  "db_pg",
  "db_redis",
 ]
@@ -3648,6 +3665,12 @@ dependencies = [
  "lyon_path",
  "num-traits",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "mac-notification-sys"

@@ -41,10 +41,11 @@ pub enum Engine {
     #[default]
     Postgres,
     Redis,
+    ClickHouse,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 2] = [Self::Postgres, Self::Redis];
+    pub const ALL: [Engine; 3] = [Self::Postgres, Self::Redis, Self::ClickHouse];
 
     /// The stored spelling. Written to SQLite and to `TUPLI_CONNECT`, so it
     /// does not change once a version has shipped with it.
@@ -52,6 +53,7 @@ impl Engine {
         match self {
             Self::Postgres => "postgres",
             Self::Redis => "redis",
+            Self::ClickHouse => "clickhouse",
         }
     }
 
@@ -60,6 +62,7 @@ impl Engine {
         match self {
             Self::Postgres => "PostgreSQL",
             Self::Redis => "Redis",
+            Self::ClickHouse => "ClickHouse",
         }
     }
 
@@ -69,6 +72,7 @@ impl Engine {
         match text.trim().to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Some(Self::Postgres),
             "redis" => Some(Self::Redis),
+            "clickhouse" | "click-house" | "ch" => Some(Self::ClickHouse),
             _ => None,
         }
     }
@@ -77,6 +81,9 @@ impl Engine {
         match self {
             Self::Postgres => 5432,
             Self::Redis => 6379,
+            // The native protocol. 8123 is the HTTP interface, which is a
+            // different thing this app does not speak.
+            Self::ClickHouse => 9000,
         }
     }
 
@@ -93,6 +100,10 @@ impl Engine {
         match self {
             Self::Postgres => crate::SslMode::Require,
             Self::Redis => crate::SslMode::Disable,
+            // ClickHouse is Redis' case exactly: 9000 is plain, TLS is 9440
+            // and has to be turned on, and a TLS client against 9000 hangs
+            // rather than fails.
+            Self::ClickHouse => crate::SslMode::Disable,
         }
     }
 
@@ -103,6 +114,7 @@ impl Engine {
         match self {
             Self::Postgres => Capabilities::POSTGRES,
             Self::Redis => Capabilities::REDIS,
+            Self::ClickHouse => Capabilities::CLICKHOUSE,
         }
     }
 }
@@ -190,6 +202,46 @@ impl Capabilities {
         editable_rows: false,
         ddl: false,
         paged_catalog: true,
+        roles: false,
+        identity_overrides: false,
+    };
+
+    /// ClickHouse is SQL with several of the assumptions underneath this app
+    /// removed, and each `false` below is one of them.
+    ///
+    /// `databases` is false and `schemas` true because a ClickHouse session
+    /// sees every database on the server and can join across them. They behave
+    /// like schemas, so they are drawn as schemas — a database switcher would
+    /// be a switch between things that were never apart.
+    ///
+    /// `transactions` is false because there are none. A multi-statement unit
+    /// that either all lands or none does is not something the engine offers,
+    /// so the grid must not offer to stage edits into one.
+    ///
+    /// `editable_rows` is false because a `MergeTree` primary key is a sort
+    /// order, not an identity: two rows may share one, and an `update` is an
+    /// asynchronous mutation that rewrites parts rather than a row. There is
+    /// nothing to write a cell back *by*.
+    ///
+    /// `paged_catalog` is false because four queries against `system` bring
+    /// back the whole catalog and the tree can be drawn from it at once.
+    ///
+    /// `roles` is false because ClickHouse's are optional and usually unused:
+    /// a server configured from `users.xml` has none, and a list that is empty
+    /// on most servers is a sidebar group that mostly says nothing.
+    ///
+    /// `identity_overrides` is false because there is no identity column to
+    /// override — and the clause is Postgres syntax the parser would reject.
+    pub const CLICKHOUSE: Self = Self {
+        dialect: Dialect::Sql,
+        schemas: true,
+        databases: false,
+        transactions: false,
+        cancel: true,
+        explain: true,
+        editable_rows: false,
+        ddl: true,
+        paged_catalog: false,
         roles: false,
         identity_overrides: false,
     };
