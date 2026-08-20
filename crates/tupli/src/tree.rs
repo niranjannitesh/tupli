@@ -8,7 +8,10 @@
 
 use std::sync::Arc;
 
-use db::{KeyInfo, KeyType, Keyspace, RelationKind, RelationRef, Role, RoleSet, SchemaSnapshot};
+use db::{
+    Capabilities, KeyInfo, KeyType, Keyspace, RelationKind, RelationRef, Role, RoleSet,
+    SchemaSnapshot,
+};
 use gpui::SharedString;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,6 +148,7 @@ pub fn from_snapshot(
     connection: &str,
     snapshot: &SchemaSnapshot,
     roles: Option<&RoleSet>,
+    capabilities: Capabilities,
 ) -> Vec<TreeNode> {
     let mut nodes = Vec::new();
 
@@ -153,94 +157,31 @@ pub fn from_snapshot(
             .meta(short_version(&snapshot.server_version))
             .expandable(),
     );
-    // Every database on the server, not only the one that is open. A Postgres
-    // session sees exactly one database and nothing else on the server, so the
-    // others are names with nothing under them until one is clicked and the
-    // app connects again — which is why only the open one is expandable.
-    for database in databases(snapshot) {
-        let current = database == snapshot.database;
-        let mut node = TreeNode::new(1, NodeKind::Database, database.to_string());
-        if current {
-            node = node
-                .meta(plural(snapshot.schemas.len(), "schema", "schemas"))
-                .expandable();
-        }
-        nodes.push(node);
-        if !current {
-            continue;
-        }
-
-        for schema in &snapshot.schemas {
-            let tables: Vec<_> = schema
-                .relations
-                .iter()
-                .filter(|r| {
-                    matches!(
-                        r.kind,
-                        RelationKind::Table | RelationKind::Partitioned | RelationKind::Foreign
-                    )
-                })
-                .collect();
-            let views: Vec<_> = schema
-                .relations
-                .iter()
-                .filter(|r| r.kind.is_view())
-                .collect();
-
-            nodes.push(
-                TreeNode::new(2, NodeKind::Schema, schema.name.to_string())
-                    .meta(plural(schema.relations.len(), "table", "tables"))
-                    .expandable(),
-            );
-
-            if !tables.is_empty() {
-                nodes.push(
-                    TreeNode::new(3, NodeKind::TableGroup, "tables")
-                        .meta(tables.len().to_string())
-                        .expandable(),
-                );
-                for relation in tables {
-                    nodes.push(
-                        TreeNode::new(4, NodeKind::Table, relation.reference.name.to_string())
-                            .meta(row_estimate(relation.estimated_rows))
-                            .target(&relation.reference),
-                    );
+    match capabilities.databases {
+        // Every database on the server, not only the one that is open. A
+        // Postgres session sees exactly one database and nothing else on the
+        // server, so the others are names with nothing under them until one is
+        // clicked and the app connects again — which is why only the open one
+        // is expandable.
+        true => {
+            for database in databases(snapshot) {
+                let current = database == snapshot.database;
+                let mut node = TreeNode::new(1, NodeKind::Database, database.to_string());
+                if current {
+                    node = node
+                        .meta(plural(snapshot.schemas.len(), "schema", "schemas"))
+                        .expandable();
                 }
-            }
-
-            if !views.is_empty() {
-                nodes.push(
-                    TreeNode::new(3, NodeKind::TableGroup, "views")
-                        .meta(views.len().to_string())
-                        .expandable(),
-                );
-                for relation in views {
-                    let kind = match relation.kind {
-                        RelationKind::MaterializedView => NodeKind::MaterializedView,
-                        _ => NodeKind::View,
-                    };
-                    nodes.push(
-                        TreeNode::new(4, kind, relation.reference.name.to_string())
-                            .target(&relation.reference),
-                    );
-                }
-            }
-
-            if !schema.routines.is_empty() {
-                nodes.push(
-                    TreeNode::new(3, NodeKind::FunctionGroup, "functions")
-                        .meta(schema.routines.len().to_string())
-                        .expandable(),
-                );
-                for routine in &schema.routines {
-                    nodes.push(TreeNode::new(
-                        4,
-                        NodeKind::Function,
-                        routine.name.to_string(),
-                    ));
+                nodes.push(node);
+                if current {
+                    push_schemas(&mut nodes, snapshot, 2);
                 }
             }
         }
+        // ClickHouse calls a schema a database and has nothing above it. The
+        // level would be a row named `analytics` above a list that also
+        // contains `analytics`, opening onto itself.
+        false => push_schemas(&mut nodes, snapshot, 1),
     }
 
     // After every database, because it is about all of them. Only when there
@@ -269,6 +210,88 @@ pub fn from_snapshot(
         node.id = id;
     }
     nodes
+}
+
+/// Every schema in the snapshot, starting at `depth`.
+///
+/// Parameterised because whether there is a database row above them is an
+/// engine's business, not this function's — see [`Capabilities::databases`].
+fn push_schemas(nodes: &mut Vec<TreeNode>, snapshot: &SchemaSnapshot, depth: usize) {
+    for schema in &snapshot.schemas {
+        let tables: Vec<_> = schema
+            .relations
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    RelationKind::Table | RelationKind::Partitioned | RelationKind::Foreign
+                )
+            })
+            .collect();
+        let views: Vec<_> = schema
+            .relations
+            .iter()
+            .filter(|r| r.kind.is_view())
+            .collect();
+
+        nodes.push(
+            TreeNode::new(depth, NodeKind::Schema, schema.name.to_string())
+                .meta(plural(schema.relations.len(), "table", "tables"))
+                .expandable(),
+        );
+
+        if !tables.is_empty() {
+            nodes.push(
+                TreeNode::new(depth + 1, NodeKind::TableGroup, "tables")
+                    .meta(tables.len().to_string())
+                    .expandable(),
+            );
+            for relation in tables {
+                nodes.push(
+                    TreeNode::new(
+                        depth + 2,
+                        NodeKind::Table,
+                        relation.reference.name.to_string(),
+                    )
+                    .meta(row_estimate(relation.estimated_rows))
+                    .target(&relation.reference),
+                );
+            }
+        }
+
+        if !views.is_empty() {
+            nodes.push(
+                TreeNode::new(depth + 1, NodeKind::TableGroup, "views")
+                    .meta(views.len().to_string())
+                    .expandable(),
+            );
+            for relation in views {
+                let kind = match relation.kind {
+                    RelationKind::MaterializedView => NodeKind::MaterializedView,
+                    _ => NodeKind::View,
+                };
+                nodes.push(
+                    TreeNode::new(depth + 2, kind, relation.reference.name.to_string())
+                        .target(&relation.reference),
+                );
+            }
+        }
+
+        if !schema.routines.is_empty() {
+            nodes.push(
+                TreeNode::new(depth + 1, NodeKind::FunctionGroup, "functions")
+                    .meta(schema.routines.len().to_string())
+                    .expandable(),
+            );
+            for routine in &schema.routines {
+                nodes.push(TreeNode::new(
+                    depth + 2,
+                    NodeKind::Function,
+                    routine.name.to_string(),
+                ));
+            }
+        }
+    }
 }
 
 /// A role's line in the sidebar's narrow right-hand column.
@@ -455,12 +478,19 @@ pub fn initially_collapsed(nodes: &[TreeNode]) -> Vec<usize> {
         .iter()
         .filter(|node| node.kind == NodeKind::Schema)
         .count();
+    // Measured rather than assumed: an engine with no database level puts its
+    // schemas a row higher, and a floor counted from the top would leave every
+    // one of them open.
+    let level = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::Schema)
+        .map_or(2, |node| node.depth);
     // …and not if that schema is enormous. A thousand tables listed on arrival
     // is a scroll bar, not a starting point.
-    let objects = nodes.iter().filter(|node| node.depth >= 4).count();
+    let objects = nodes.iter().filter(|node| node.depth >= level + 2).count();
     let floor = match schemas == 1 && objects <= 200 {
-        true => 4,
-        false => 2,
+        true => level + 2,
+        false => level,
     };
     nodes
         .iter()
@@ -607,7 +637,7 @@ mod tests {
 
     #[test]
     fn every_database_on_the_server_is_a_row_and_only_the_open_one_opens() {
-        let nodes = from_snapshot("local", &snapshot(), None);
+        let nodes = from_snapshot("local", &snapshot(), None, Capabilities::POSTGRES);
         let databases: Vec<_> = nodes
             .iter()
             .filter(|node| node.kind == NodeKind::Database)
@@ -631,7 +661,7 @@ mod tests {
 
     #[test]
     fn the_tree_is_flat_and_ids_are_positions() {
-        let nodes = from_snapshot("local", &snapshot(), None);
+        let nodes = from_snapshot("local", &snapshot(), None, Capabilities::POSTGRES);
         assert!(nodes.iter().enumerate().all(|(i, node)| node.id == i));
         assert_eq!(nodes[0].kind, NodeKind::Connection);
         assert_eq!(nodes[0].meta.as_deref(), Some("16.4"));
@@ -640,7 +670,7 @@ mod tests {
 
     #[test]
     fn empty_groups_do_not_appear() {
-        let nodes = from_snapshot("local", &snapshot(), None);
+        let nodes = from_snapshot("local", &snapshot(), None, Capabilities::POSTGRES);
         let names: Vec<_> = nodes.iter().map(|n| n.name.as_ref()).collect();
         assert!(names.contains(&"tables"));
         assert!(names.contains(&"views"));
@@ -651,7 +681,7 @@ mod tests {
 
     #[test]
     fn relations_carry_the_reference_needed_to_open_them() {
-        let nodes = from_snapshot("local", &snapshot(), None);
+        let nodes = from_snapshot("local", &snapshot(), None, Capabilities::POSTGRES);
         let users = nodes.iter().find(|n| n.name == *"users").unwrap();
         let reference = users.target.as_ref().unwrap().relation().unwrap();
         assert_eq!(reference.qualified(), "public.users");
@@ -670,8 +700,25 @@ mod tests {
     }
 
     #[test]
+    fn a_server_whose_schemas_are_its_databases_gets_one_level_not_two() {
+        // ClickHouse's `analytics` is a schema, and drawing it under a database
+        // row of the same name is a row that opens onto itself.
+        let nodes = from_snapshot("local", &snapshot(), None, Capabilities::CLICKHOUSE);
+        assert!(!nodes.iter().any(|node| node.kind == NodeKind::Database));
+        let schema = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Schema)
+            .expect("a schema");
+        assert_eq!(schema.depth, 1);
+        // And the rows under it move up with it rather than leaving a gap.
+        assert!(nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::Table && node.depth == 3));
+    }
+
+    #[test]
     fn schemas_start_closed_but_the_root_does_not() {
-        let nodes = from_snapshot("local", &snapshot(), None);
+        let nodes = from_snapshot("local", &snapshot(), None, Capabilities::POSTGRES);
         let closed = initially_collapsed(&nodes);
         assert!(!closed.contains(&0));
         assert!(!closed.contains(&1));

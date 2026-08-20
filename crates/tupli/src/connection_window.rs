@@ -37,6 +37,12 @@ use crate::workspace::Workspace;
 const WINDOW_SIZE: (f32, f32) = (800., 600.);
 /// The saved-connection list. Fits a name and its endpoint underneath.
 const SIDEBAR_WIDTH: gpui::Pixels = px(216.);
+/// Both footers, pinned rather than grown from their contents.
+///
+/// The two sit side by side with a rule above each, and padding around a
+/// button gives the taller one a higher rule — a seam across the bottom of the
+/// window that reads as a mistake because it is one.
+const FOOTER_HEIGHT: gpui::Pixels = px(44.);
 
 /// Open the connection window, on `config` if there is one and on a blank form
 /// if there is not.
@@ -301,7 +307,9 @@ impl ConnectionWindow {
             .child(Divider::horizontal())
             .child(
                 h_flex()
-                    .p(px(8.))
+                    .h(FOOTER_HEIGHT)
+                    .flex_none()
+                    .px(px(8.))
                     .gap(px(6.))
                     .child(
                         Button::new("new", "New")
@@ -326,8 +334,9 @@ impl ConnectionWindow {
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editing = self.form.read(cx).editing;
         h_flex()
+            .h(FOOTER_HEIGHT)
+            .flex_none()
             .px(px(16.))
-            .py(px(10.))
             .gap(px(8.))
             .justify_between()
             .child(

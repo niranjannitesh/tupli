@@ -2232,6 +2232,16 @@ impl Workspace {
         password: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // A different server is a different place, so it gets a tab of its
+        // own — the same rule `open_database` already follows one level down.
+        // Repointing the tab in front left a Query tab's rows sitting under a
+        // name that never produced them, and took the connection you had been
+        // reading off the screen entirely.
+        let here = self.pane().active().and_then(|tab| tab.session.clone());
+        if here.is_some_and(|session| session.read(cx).config.id != config.id) {
+            self.new_query_tab(cx);
+            self.clear_results(cx);
+        }
         let session = self.session_for(config, password, cx);
         self.bind_active_tab(session, cx);
         self.reload_lists(cx);
@@ -2410,8 +2420,11 @@ impl Workspace {
         };
         let session = session.read(cx);
         let name = session.config.display_name();
+        let capabilities = session.config.capabilities();
         self.tree = match (&session.snapshot, &session.keyspace) {
-            (Some(snapshot), _) => tree::from_snapshot(&name, snapshot, session.roles.as_deref()),
+            (Some(snapshot), _) => {
+                tree::from_snapshot(&name, snapshot, session.roles.as_deref(), capabilities)
+            }
             (None, Some(keyspace)) => tree::from_keyspace(
                 &name,
                 &session.server_version(),

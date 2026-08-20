@@ -122,7 +122,7 @@ impl Workspace {
         let adopted = open.is_some_and(|id| self.connections.iter().any(|c| c.id == id));
         let mut rows = Vec::new();
         if !adopted && self.session.is_some() {
-            rows.extend(self.render_tree(cx));
+            rows.extend(self.render_open(cx));
         }
         let connecting = self
             .session
@@ -130,7 +130,7 @@ impl Workspace {
             .is_some_and(|session| session.read(cx).activity() == Activity::Connecting);
         for (index, config) in self.connections.iter().enumerate() {
             if adopted && Some(config.id) == open {
-                rows.extend(self.render_tree(cx));
+                rows.extend(self.render_open(cx));
             } else {
                 rows.push(self.render_saved_connection(index, config, connecting, cx));
             }
@@ -166,6 +166,39 @@ impl Workspace {
                 }
             }))
             .into_any_element()
+    }
+
+    /// The open connection: its tree, or the row the tree will grow out of.
+    ///
+    /// There is no tree until the snapshot lands, and the open connection's
+    /// saved row has already been given up to make space for it — so for as
+    /// long as the handshake took, the connection you had just clicked was the
+    /// one thing missing from the sidebar. A server that is slow to answer is
+    /// exactly when you are looking.
+    fn render_open(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        // `self.tree`, not the rows it rendered: a filter that matches nothing
+        // is a search with no hits, and answering it with the connection row
+        // would be the sidebar arguing with the box you just typed in.
+        if !self.tree.is_empty() {
+            return self.render_tree(cx);
+        }
+        let Some(session) = self.session.clone() else {
+            return Vec::new();
+        };
+        let (config, state) = {
+            let session = session.read(cx);
+            (session.config.clone(), session.state().label())
+        };
+        let tint = crate::tint::tint(config.color, cx);
+        vec![ListItem::new("connection-opening", config.display_name())
+            .icon(IconName::Plug)
+            .icon_color(match tint {
+                Some(tint) => IconColor::Custom(tint),
+                None => IconColor::Muted,
+            })
+            .meta(state)
+            .selected(true)
+            .into_any_element()]
     }
 
     fn render_tree(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
