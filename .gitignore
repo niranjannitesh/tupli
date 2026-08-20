@@ -1,0 +1,10 @@
+/target
+.DS_Store
+
+# Visual reference: screenshots of other applications, kept locally so the UI
+# can be compared against them. Not ours to redistribute.
+/_ref
+
+# Internal working documents. They stay on disk; they do not go to the remote.
+/docs/PLAN.md
+/docs/ICON_INTEGRATION.md

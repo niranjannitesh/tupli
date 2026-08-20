@@ -1,0 +1,24 @@
+[package]
+name = "grid"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ui = { path = "../ui" }
+db = { path = "../db" }
+sqlgen = { path = "../sqlgen" }
+editor = { path = "../editor" }
+gpui.workspace = true
+anyhow.workspace = true
+smallvec.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+gpui = { workspace = true, features = ["bench"] }
+gpui_platform = { workspace = true, features = ["test-support"] }
+
+[[bench]]
+name = "grid_render"
+harness = false

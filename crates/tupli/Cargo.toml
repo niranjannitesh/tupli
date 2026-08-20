@@ -1,0 +1,51 @@
+[package]
+name = "tupli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "A fast, native, keyboard-driven database client for macOS."
+
+# For `cargo bundle`, which reads static TOML and cannot expand a channel out of
+# the environment — so this block is the production channel and nothing else.
+# Every other channel, and the icon staging the identifier has to agree with,
+# goes through scripts/bundle.sh. See docs/ICON_INTEGRATION.md.
+[package.metadata.bundle]
+name = "Tupli"
+identifier = "com.anuvaya.tupli"
+icon = ["../../assets/app-icon-ribbon/production.icns"]
+category = "public.app-category.developer-tools"
+short_description = "A fast, native database client for macOS."
+
+[lib]
+name = "tupli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tupli"
+path = "src/main.rs"
+
+[dependencies]
+ui = { path = "../ui" }
+db = { path = "../db" }
+editor = { path = "../editor" }
+grid = { path = "../grid" }
+sqlgen = { path = "../sqlgen" }
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui_tokio.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+db_pg = { path = "../db_pg" }
+store = { path = "../store" }
+uuid = { workspace = true, features = ["v4"] }
+time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc = "0.2"
+nucleo-matcher.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }

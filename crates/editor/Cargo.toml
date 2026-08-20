@@ -1,0 +1,19 @@
+[package]
+name = "editor"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ui = { path = "../ui" }
+gpui.workspace = true
+anyhow.workspace = true
+smallvec.workspace = true
+log.workspace = true
+ropey.workspace = true
+tree-sitter.workspace = true
+tree-sitter-sequel.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support", "font-kit"] }
