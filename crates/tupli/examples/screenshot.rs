@@ -312,6 +312,22 @@ fn main() {
             cx.run_until_parked();
         }
 
+        // `TUPLI_FIELD=<n>` opens one of the row inspector's fields, which is
+        // the only way to photograph a laid-out document: collapsed, every
+        // field is four lines at most.
+        if let Ok(field) = std::env::var("TUPLI_FIELD") {
+            let field: usize = field.parse().expect("TUPLI_FIELD is a column index");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        workspace.inspector_tab = tupli::workspace::InspectorTab::Row;
+                        workspace.expand_field(field, cx);
+                    })
+                    .expect("open a field")
+            });
+            cx.run_until_parked();
+        }
+
         // `TUPLI_MENU=row` selects a few rows and opens the grid's context menu
         // over them. Driven through the workspace rather than through a
         // synthetic right click, because a mouse event in an offscreen window

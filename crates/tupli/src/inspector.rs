@@ -9,7 +9,8 @@
 //! every line.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, IntoElement, ParentElement, Window,
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, HighlightStyle, IntoElement,
+    ParentElement, StyledText, Window,
 };
 use ui::{
     h_flex, region, v_flex, ActiveTheme, Button, ButtonSize, Icon, IconColor, IconName, IconSize,
@@ -60,6 +61,7 @@ impl Workspace {
     fn render_row_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let c = cx.colors().clone();
         let ty = cx.typography().clone();
+        let syntax = cx.syntax().clone();
         let data = self.result(cx);
         if data.row_count() == 0 {
             return nothing_selected("No row selected.").into_any_element();
@@ -292,7 +294,15 @@ impl Workspace {
                                         .when(!expanded, |el| {
                                             el.max_h(ty.mono_line_height * 4.).overflow_hidden()
                                         })
-                                        .child(Label::new(v).mono().size(LabelSize::Code).wrap()),
+                                        .child(json_document(&v, &syntax, &ty).unwrap_or_else(
+                                            || {
+                                                Label::new(v)
+                                                    .mono()
+                                                    .size(LabelSize::Code)
+                                                    .wrap()
+                                                    .into_any_element()
+                                            },
+                                        )),
                                 )
                                 // How much of it is below the cut, and the way
                                 // to lift it. Without the note the clip is
@@ -364,7 +374,11 @@ impl Workspace {
                     .px(px(10.))
                     .py(px(4.))
                     .gap(px(2.))
-                    .child(Label::new(relation.reference.name.to_string()).mono().medium())
+                    .child(
+                        Label::new(relation.reference.name.to_string())
+                            .mono()
+                            .medium(),
+                    )
                     .child(
                         Label::new(format!("{} in {}", kind, relation.reference.schema))
                             .size(LabelSize::Small)
@@ -383,7 +397,11 @@ impl Workspace {
             }))
             .child(div().pt(px(8.)).child(SectionHeader::new("size")))
             .child(fact("Rows", row_estimate(relation.estimated_rows), cx))
-            .child(fact("On disk", byte_size(relation.size_bytes.max(0) as usize), cx))
+            .child(fact(
+                "On disk",
+                byte_size(relation.size_bytes.max(0) as usize),
+                cx,
+            ))
             .child(fact("Columns", relation.columns.len().to_string(), cx))
             .child(div().pt(px(8.)).child(SectionHeader::new("keys")))
             .child(fact(
@@ -481,6 +499,54 @@ fn row_estimate(rows: i64) -> String {
 fn overflows(text: &str) -> Option<String> {
     let long = text.len() > 150 || text.lines().count() > 4;
     long.then(|| byte_size(text.len()))
+}
+
+impl Workspace {
+    /// Open one of the row inspector's fields, the way clicking it would.
+    pub fn expand_field(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.expanded_field = Some(ix);
+        cx.notify();
+    }
+}
+
+/// A field's value coloured as JSON, or `None` when it is not a document.
+///
+/// The panel is the only place this happens. In the grid a cell is one line of
+/// a table and its colour already means something — staged, deleted, null — and
+/// a second colour system running through the same 24px row would be reading
+/// two things at once. Here there is one value, laid out, with the room to be
+/// read: keys apart from their values is most of what reading an object is.
+///
+/// Built from byte ranges over the text as shown, so the collapsed single line
+/// and the expanded document are coloured by the same code.
+fn json_document(text: &str, syntax: &ui::SyntaxTheme, ty: &ui::Typography) -> Option<AnyElement> {
+    let spans = crate::json::spans(text)?;
+    let highlights = spans.into_iter().map(|(range, token)| {
+        let color = match token {
+            crate::json::Token::Key => syntax.identifier,
+            crate::json::Token::String => syntax.string,
+            crate::json::Token::Number => syntax.number,
+            crate::json::Token::Literal => syntax.keyword,
+            crate::json::Token::Punctuation => syntax.punctuation,
+        };
+        (
+            range,
+            HighlightStyle {
+                color: Some(color),
+                ..Default::default()
+            },
+        )
+    });
+    Some(
+        // `StyledText` paints in the ambient style, so the face is set here —
+        // the same lookup `Label::mono().size(Code)` would have made.
+        div()
+            .font(ty.mono_font())
+            .text_size(ty.mono_size)
+            .line_height(ty.mono_line_height)
+            .child(StyledText::new(text.to_string()).with_highlights(highlights))
+            .into_any_element(),
+    )
 }
 
 /// `4.2 KB`, in whichever unit keeps it to a couple of digits.
