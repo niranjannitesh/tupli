@@ -2404,7 +2404,7 @@ impl Workspace {
         let session = session.read(cx);
         let name = session.config.display_name();
         self.tree = match (&session.snapshot, &session.keyspace) {
-            (Some(snapshot), _) => tree::from_snapshot(&name, snapshot),
+            (Some(snapshot), _) => tree::from_snapshot(&name, snapshot, session.roles.as_deref()),
             (None, Some(keyspace)) => tree::from_keyspace(
                 &name,
                 &session.server_version(),
@@ -3462,6 +3462,16 @@ impl Workspace {
     ) {
         match event {
             SessionEvent::StateChanged => cx.notify(),
+            // The privileges pane redraws, and so does the grid: what the
+            // connected role may do here is one of the reasons it is read-only.
+            SessionEvent::PrivilegesChanged => {
+                if self.session.as_ref() == Some(&session) {
+                    for id in self.panes.iter().map(|pane| pane.id).collect::<Vec<_>>() {
+                        self.refresh_editability(id, cx);
+                    }
+                }
+                cx.notify();
+            }
             SessionEvent::SchemaChanged => {
                 log::debug!(
                     "a catalog arrived for {}; the window is on {:?}",
@@ -3982,7 +3992,8 @@ impl Workspace {
     /// `TUPLI_CONNECT` takes the same keyword string the integration tests do,
     /// `TUPLI_OPEN` a `schema.table` to browse once the catalog arrives, and
     /// `TUPLI_SIDEBAR` one of `database`, `queries`, `history`,
-    /// `TUPLI_RESULTS_TAB` one of `data`, `structure`, `ddl`, `messages`,
+    /// `TUPLI_RESULTS_TAB` one of `data`, `structure`, `ddl`, `privileges`,
+    /// `messages`,
     /// `TUPLI_INSPECTOR` one of `cell`, `row`, `TUPLI_CELL` a `row,column` for
     /// the cursor to land on once rows arrive, `TUPLI_MENU` a `schema.table` to
     /// open the object menu on, `TUPLI_SHEET` one of `rename`, `truncate`,
@@ -4018,6 +4029,7 @@ impl Workspace {
                 "data" => self.pane_mut().results_tab = ResultsTab::Data,
                 "structure" => self.pane_mut().results_tab = ResultsTab::Structure,
                 "ddl" => self.pane_mut().results_tab = ResultsTab::Ddl,
+                "privileges" => self.pane_mut().results_tab = ResultsTab::Privileges,
                 "messages" => self.pane_mut().results_tab = ResultsTab::Messages,
                 other => log::warn!("TUPLI_RESULTS_TAB={other:?} is not a tab"),
             }

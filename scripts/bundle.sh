@@ -21,6 +21,8 @@
 #   TUPLI_CHANNEL        same as --channel; the flag wins
 #   TUPLI_BUNDLE_PREFIX  reverse-DNS namespace (default: com.anuvaya)
 #   TUPLI_APP_NAME       override the channel's display name
+#   TUPLI_SIGN_IDENTITY  code-signing identity (default: Tupli Development,
+#                        created by scripts/dev-identity.sh; falls back to ad hoc)
 
 set -euo pipefail
 
@@ -38,7 +40,7 @@ while [ $# -gt 0 ]; do
     --release) profile=release; shift ;;
     --no-sign) sign=0; shift ;;
     --open) open_after=1; shift ;;
-    -h|--help) sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bundle: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -133,12 +135,28 @@ PLIST
 printf 'APPL????' > "$app/Contents/PkgInfo"
 
 if [ "$sign" = 1 ]; then
-  # Ad-hoc, which is not distribution signing: it is what lets a locally built
-  # bundle launch without Gatekeeper arguing, and what gives the Keychain a
-  # code identity to hang an item's ACL on. A real release is signed with a
-  # Developer ID and notarized, after this script has finished.
-  codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 \
-    || echo "bundle: warning: ad-hoc signing failed; the bundle is unsigned" >&2
+  # Not distribution signing: it is what lets a locally built bundle launch
+  # without Gatekeeper arguing, and what gives the Keychain a code identity to
+  # hang an item's ACL on. A real release is signed with a Developer ID and
+  # notarized, after this script has finished.
+  #
+  # The local certificate is preferred over ad-hoc because an ad-hoc signature
+  # is a hash of the binary: it changes with every build, so the Keychain sees
+  # a new application each time and asks again for permission it was already
+  # given. `scripts/dev-identity.sh` creates the certificate; without it this
+  # falls back rather than failing, since signing at all matters more than
+  # signing stably.
+  identity=${TUPLI_SIGN_IDENTITY:-Tupli Development}
+  if ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "$identity"; then
+    identity="-"
+    [ "$channel" = production ] || echo "bundle: note: no local signing identity;" \
+      "signing ad hoc. Run scripts/dev-identity.sh to stop the Keychain prompts." >&2
+  fi
+  # `--identifier` so the signature claims the bundle id even when signing ad
+  # hoc, which is what a Keychain ACL is written against.
+  codesign --force --sign "$identity" --identifier "$identifier" \
+    --timestamp=none "$app" >/dev/null 2>&1 \
+    || echo "bundle: warning: signing failed; the bundle is unsigned" >&2
 fi
 
 # Verify what was actually produced rather than what was intended.

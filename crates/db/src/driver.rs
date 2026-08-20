@@ -17,6 +17,8 @@ use futures::future::BoxFuture;
 
 use crate::error::{DbError, DbResult, Notice};
 use crate::keyspace::{Cursor, KeyFacts, KeyListing, KeyPage, KeyQuery, KeyType, Keyspace};
+use crate::roles::{Grants, RoleSet};
+use crate::schema::RelationRef;
 use crate::schema::SchemaSnapshot;
 use crate::value::Value;
 use crate::ResultSet;
@@ -149,6 +151,9 @@ pub struct Capabilities {
     /// arriving inside [`Catalog`]. What makes the app draw a key browser
     /// rather than a schema tree.
     pub paged_catalog: bool,
+    /// The server has named roles that objects are granted to, so there is a
+    /// list of them to browse and a privileges view on every relation.
+    pub roles: bool,
 }
 
 impl Capabilities {
@@ -162,6 +167,7 @@ impl Capabilities {
         editable_rows: true,
         ddl: true,
         paged_catalog: false,
+        roles: true,
     };
 
     /// Redis is the reason this struct exists. It has logical databases and
@@ -178,6 +184,7 @@ impl Capabilities {
         editable_rows: false,
         ddl: false,
         paged_catalog: true,
+        roles: false,
     };
 
     pub fn is_sql(&self) -> bool {
@@ -332,6 +339,27 @@ pub trait Driver: Send + Sync + 'static {
         _limit: usize,
     ) -> BoxFuture<'a, DbResult<KeyPage>> {
         Box::pin(async { Err(unpaged()) })
+    }
+
+    /// Every role on the server, and which one this connection is.
+    ///
+    /// Read once per connection and not per tab: the list changes when
+    /// somebody runs `create role`, which is not something the app should poll
+    /// for. `None` from a driver whose [`Capabilities::roles`] is false, so
+    /// that a caller which forgot to check gets an empty view rather than an
+    /// error about a question that simply does not apply.
+    fn roles<'a>(&'a self) -> BoxFuture<'a, DbResult<Option<RoleSet>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Who may do what to one relation, including the connected role itself.
+    ///
+    /// Per relation and on demand, because it is a different answer for every
+    /// table and most tables are never asked about. The expensive half is
+    /// [`Grants::mine`], which is a question about the caller and cannot be
+    /// cached across a `set role`.
+    fn grants<'a>(&'a self, _relation: &'a RelationRef) -> BoxFuture<'a, DbResult<Option<Grants>>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Run one statement and bring back at most `max_rows` rows.

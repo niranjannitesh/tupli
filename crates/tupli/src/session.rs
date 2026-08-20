@@ -16,12 +16,13 @@
 //! and open transactions all behave the way a person typing SQL expects them
 //! to, which no pool can promise.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use db::{
-    Catalog, ConnectionConfig, Cursor, DbError, Driver, ErrorClass, KeyFacts, KeyQuery, KeyType,
-    Outcome, ResultSet, SchemaSnapshot,
+    Catalog, ConnectionConfig, Cursor, DbError, Driver, ErrorClass, Grants, KeyFacts, KeyQuery,
+    KeyType, Outcome, RelationRef, ResultSet, RoleSet, SchemaSnapshot,
 };
 use gpui::{Context, EventEmitter, SharedString, Task};
 use gpui_tokio::Tokio;
@@ -134,6 +135,12 @@ pub enum SessionEvent {
     KeysChanged,
     /// A key was read. `Session::last_key` has it.
     KeyOpened,
+    /// The roles arrived, or one relation's grants did. Separate from
+    /// [`SessionEvent::SchemaChanged`] because it lands on its own schedule —
+    /// grants are read when somebody opens the Privileges tab, and rebuilding
+    /// the whole tree for that would be a redraw of everything to fill in one
+    /// pane.
+    PrivilegesChanged,
 }
 
 /// One finished commit of staged grid edits.
@@ -218,6 +225,18 @@ pub struct Session {
     key_pattern: String,
     /// What the last [`Session::open_key`] found out about the key it opened.
     pub last_key: Option<KeyView>,
+    /// Every role on the server, read once when the connection opens. `None`
+    /// on an engine that has no roles, and also while the read is in flight.
+    pub roles: Option<Arc<RoleSet>>,
+    /// The privileges on the relations somebody has looked at.
+    ///
+    /// Kept rather than re-read because the answer is stable until somebody
+    /// runs `grant`, and thrown away wholesale on reconnect because a `set
+    /// role` — or a different login — changes every one of them at once.
+    pub grants: HashMap<RelationRef, Arc<Grants>>,
+    /// The relation whose grants are being read, so two clicks on the same tab
+    /// do not become two round trips.
+    loading_grants: Option<RelationRef>,
     /// The in-flight operation. Dropping it detaches this side; the server-side
     /// half is stopped by [`Session::cancel`].
     task: Option<Task<()>>,
@@ -249,6 +268,9 @@ impl Session {
             key_cursor: None,
             key_pattern: String::new(),
             last_key: None,
+            roles: None,
+            grants: HashMap::new(),
+            loading_grants: None,
             task: None,
             last: None,
             last_apply: None,
@@ -325,7 +347,15 @@ impl Session {
                     false => error,
                 })?;
             let catalog = connection.catalog().await?;
-            Ok::<_, DbError>((connection, catalog))
+            // On the same trip as the catalog, and tolerant of failing: a
+            // server that will not say who its roles are is still a server
+            // worth browsing, and losing the connection over a list nobody
+            // asked for yet would be absurd.
+            let roles = connection.roles().await.unwrap_or_else(|error| {
+                log::warn!("could not read the roles: {}", error.full_text());
+                None
+            });
+            Ok::<_, DbError>((connection, catalog, roles))
         });
 
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -334,9 +364,10 @@ impl Session {
                 this.activity = Activity::Idle;
                 this.task = None;
                 match result {
-                    Ok((connection, catalog)) => {
+                    Ok((connection, catalog, roles)) => {
                         this.connection = Some(connection);
                         this.set_catalog(catalog);
+                        this.roles = roles.map(Arc::new);
                         this.state = SessionState::Connected;
                         cx.emit(SessionEvent::SchemaChanged);
                     }
@@ -359,6 +390,9 @@ impl Session {
         self.connection = None;
         self.snapshot = None;
         self.keyspace = None;
+        self.roles = None;
+        self.grants.clear();
+        self.loading_grants = None;
         self.keys.clear();
         self.keys_complete = false;
         self.key_cursor = None;
@@ -398,6 +432,56 @@ impl Session {
             })
             .ok();
         }));
+    }
+
+    /// Read who may do what to one relation, unless it is already known or
+    /// already on its way.
+    ///
+    /// Deliberately outside [`Session::task`] and outside [`Activity`]: this is
+    /// three small catalog reads for a pane that is being looked at, and making
+    /// it take the one busy slot would mean opening the Privileges tab could
+    /// stop somebody's query from starting.
+    pub fn load_grants(&mut self, relation: RelationRef, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        if !connection.capabilities().roles
+            || self.grants.contains_key(&relation)
+            || self.loading_grants.as_ref() == Some(&relation)
+        {
+            return;
+        }
+        self.loading_grants = Some(relation.clone());
+        let wanted = relation.clone();
+        let work = Tokio::spawn(cx, async move { connection.grants(&wanted).await });
+        cx.spawn(async move |this, cx| {
+            let result = joined(work.await);
+            this.update(cx, |this, cx| {
+                if this.loading_grants.as_ref() == Some(&relation) {
+                    this.loading_grants = None;
+                }
+                match result {
+                    Ok(Some(grants)) => {
+                        this.grants.insert(relation, Arc::new(grants));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!("could not read the privileges: {}", error.full_text())
+                    }
+                }
+                cx.emit(SessionEvent::PrivilegesChanged);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Forget what was read, so the next pane that wants it asks again. Called
+    /// after DDL and after a `grant`, both of which can change every answer.
+    pub fn forget_grants(&mut self) {
+        self.grants.clear();
+        self.loading_grants = None;
     }
 
     /// Walk the keyspace and put what it finds in [`Session::keys`].

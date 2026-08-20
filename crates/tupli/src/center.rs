@@ -36,13 +36,21 @@ impl Workspace {
 
     /// Which results tab is showing, which is not always the one that was
     /// picked: Structure and DDL are not offered on a connection with no
-    /// schema, and a tab left on one of them by the last connection would
-    /// otherwise draw a pane that is not in the strip above it.
+    /// schema, Privileges is not offered over an ad-hoc result, and a tab left
+    /// on one of them by the last connection would otherwise draw a pane that
+    /// is not in the strip above it.
     fn results_tab(&self, cx: &App) -> ResultsTab {
         let tab = self.pane().results_tab;
-        match (tab, self.capabilities(cx).is_sql()) {
-            (ResultsTab::Structure | ResultsTab::Ddl, false) => ResultsTab::Data,
-            (tab, _) => tab,
+        let capabilities = self.capabilities(cx);
+        match tab {
+            ResultsTab::Structure | ResultsTab::Ddl if !capabilities.is_sql() => ResultsTab::Data,
+            ResultsTab::Privileges
+                if !capabilities.roles
+                    || !self.pane().active().is_some_and(|t| t.relation.is_some()) =>
+            {
+                ResultsTab::Data
+            }
+            tab => tab,
         }
     }
 
@@ -739,6 +747,21 @@ impl Workspace {
                     ),
             );
         }
+        // Only where the server has roles to grant to, and only over something
+        // that can be granted: an ad-hoc `select 1` has no owner and no ACL,
+        // and a tab that could only ever say "nothing to check" is a tab worth
+        // not drawing.
+        if self.capabilities(cx).roles && self.pane().active().is_some_and(|t| t.relation.is_some())
+        {
+            tabs.push(
+                Tab::new("results-privileges", "Privileges")
+                    .icon(IconName::Shield)
+                    .active(tab == ResultsTab::Privileges)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.select_results_tab(ResultsTab::Privileges, cx)
+                    })),
+            );
+        }
         tabs.push(
             Tab::new("results-messages", "Messages")
                 .icon(IconName::Terminal)
@@ -833,6 +856,11 @@ impl Workspace {
                     .child(self.render_structure(_window, cx))
                     .into_any_element(),
                 ResultsTab::Ddl => self.render_ddl(_window, cx),
+                ResultsTab::Privileges => v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_privileges(_window, cx))
+                    .into_any_element(),
                 ResultsTab::Messages => v_flex()
                     .flex_1()
                     .min_h_0()

@@ -10,6 +10,7 @@ pub mod driver;
 pub mod error;
 pub mod keyspace;
 pub mod php;
+pub mod roles;
 pub mod schema;
 pub mod value;
 
@@ -27,6 +28,7 @@ pub use keyspace::{
     format_ttl, key_text, Cursor, KeyFacts, KeyInfo, KeyListing, KeyPage, KeyQuery, KeyType,
     Keyspace, KeyspaceDatabase,
 };
+pub use roles::{Grant, Grants, Privilege, Role, RoleSet, PUBLIC};
 pub use schema::{
     CheckConstraint, ColumnDef, ForeignKey, IdentityKind, IndexDef, RefAction, Relation,
     RelationKind, RelationRef, Routine, Schema, SchemaSnapshot, TriggerDef,

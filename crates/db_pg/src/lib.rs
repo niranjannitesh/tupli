@@ -9,6 +9,7 @@ pub mod client;
 pub mod driver;
 pub mod introspect;
 pub mod params;
+pub mod roles;
 pub mod types;
 
 pub use client::{Canceller, PgConnection};

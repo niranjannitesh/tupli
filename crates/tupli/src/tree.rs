@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use db::{KeyInfo, KeyType, Keyspace, RelationKind, RelationRef, SchemaSnapshot};
+use db::{KeyInfo, KeyType, Keyspace, RelationKind, RelationRef, Role, RoleSet, SchemaSnapshot};
 use gpui::SharedString;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,6 +23,15 @@ pub enum NodeKind {
     MaterializedView,
     FunctionGroup,
     Function,
+    /// The heading over the roles. A sibling of the databases rather than a
+    /// child of one, because a role is a property of the server: the same
+    /// `analytics` grants apply in every database on it.
+    RoleGroup,
+    /// A role that can log in.
+    Role,
+    /// A role that cannot, which everybody calls a group even though Postgres
+    /// stopped having a separate concept for it twenty years ago.
+    RoleGroupMember,
     /// A logical database of a key-value server — `DB 0`.
     KeyDatabase,
     /// A `:`-separated prefix that several keys share. Not a thing on the
@@ -132,7 +141,11 @@ impl TreeNode {
 ///
 /// Grouping rows — "tables", "views", "functions" — appear only when they have
 /// something in them. A schema with no views should not make the reader check.
-pub fn from_snapshot(connection: &str, snapshot: &SchemaSnapshot) -> Vec<TreeNode> {
+pub fn from_snapshot(
+    connection: &str,
+    snapshot: &SchemaSnapshot,
+    roles: Option<&RoleSet>,
+) -> Vec<TreeNode> {
     let mut nodes = Vec::new();
 
     nodes.push(
@@ -230,10 +243,56 @@ pub fn from_snapshot(connection: &str, snapshot: &SchemaSnapshot) -> Vec<TreeNod
         }
     }
 
+    // After every database, because it is about all of them. Only when there
+    // is more than one role: a server with nothing but `postgres` on it has no
+    // access story to tell, and a folder that opens onto the name you are
+    // already logged in as is a row that costs more than it says.
+    if let Some(roles) = roles.filter(|roles| roles.roles.len() > 1) {
+        nodes.push(
+            TreeNode::new(1, NodeKind::RoleGroup, "roles")
+                .meta(roles.roles.len().to_string())
+                .expandable(),
+        );
+        for role in &roles.roles {
+            let kind = match role.can_login {
+                true => NodeKind::Role,
+                false => NodeKind::RoleGroupMember,
+            };
+            let mine = &*role.name == &*roles.current;
+            nodes.push(
+                TreeNode::new(2, kind, role.name.to_string()).when_some(role_meta(role, mine)),
+            );
+        }
+    }
+
     for (id, node) in nodes.iter_mut().enumerate() {
         node.id = id;
     }
     nodes
+}
+
+/// A role's line in the sidebar's narrow right-hand column.
+///
+/// Not [`Role::summary`], which is the whole story and belongs in the
+/// Privileges tab: `postgres` on a fresh server has five attributes, and a
+/// meta column that long squeezes out the name it is describing. Two chips,
+/// because [`Role::attributes`] already orders them by how much they matter,
+/// and "you" outranks any of them — which one you are is the single most
+/// useful fact in the list.
+fn role_meta(role: &Role, mine: bool) -> Option<String> {
+    const SHOWN: usize = 2;
+    let mut parts: Vec<&str> = Vec::new();
+    if mine {
+        parts.push("you");
+    }
+    parts.extend(role.attributes().into_iter().take(SHOWN - parts.len()));
+    match parts.is_empty() {
+        true => match role.member_of.len() {
+            0 => None,
+            n => Some(format!("member of {n}")),
+        },
+        false => Some(parts.join(" · ")),
+    }
 }
 
 /// Build the tree for one connected key-value server.
@@ -457,6 +516,49 @@ mod tests {
     use db::{Relation, RelationKind, Schema};
     use std::sync::Arc;
 
+    fn role(name: &str, superuser: bool) -> Role {
+        Role {
+            name: Arc::from(name),
+            superuser,
+            can_login: true,
+            create_db: superuser,
+            create_role: superuser,
+            inherit: true,
+            replication: superuser,
+            bypass_rls: superuser,
+            connection_limit: -1,
+            valid_until: None,
+            member_of: Vec::new(),
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn the_role_you_are_connected_as_says_so_before_anything_else() {
+        assert_eq!(
+            role_meta(&role("postgres", true), true).as_deref(),
+            Some("you · Superuser")
+        );
+    }
+
+    #[test]
+    fn a_long_list_of_attributes_is_cut_so_the_name_still_fits() {
+        // Five attributes in a column this narrow would elide the name they
+        // are describing, which is the one thing the row is for.
+        assert_eq!(
+            role_meta(&role("deploy", true), false).as_deref(),
+            Some("Superuser · Create DB")
+        );
+    }
+
+    #[test]
+    fn a_role_with_nothing_to_say_falls_back_to_who_it_inherits_from() {
+        let mut member = role("reporting", false);
+        member.member_of = vec![Arc::from("analytics")];
+        assert_eq!(role_meta(&member, false).as_deref(), Some("member of 1"));
+        assert_eq!(role_meta(&role("app", false), false), None);
+    }
+
     fn relation(schema: &str, name: &str, kind: RelationKind, rows: i64) -> Relation {
         Relation {
             reference: RelationRef::new(Arc::from(schema), Arc::from(name)),
@@ -505,7 +607,7 @@ mod tests {
 
     #[test]
     fn every_database_on_the_server_is_a_row_and_only_the_open_one_opens() {
-        let nodes = from_snapshot("local", &snapshot());
+        let nodes = from_snapshot("local", &snapshot(), None);
         let databases: Vec<_> = nodes
             .iter()
             .filter(|node| node.kind == NodeKind::Database)
@@ -529,7 +631,7 @@ mod tests {
 
     #[test]
     fn the_tree_is_flat_and_ids_are_positions() {
-        let nodes = from_snapshot("local", &snapshot());
+        let nodes = from_snapshot("local", &snapshot(), None);
         assert!(nodes.iter().enumerate().all(|(i, node)| node.id == i));
         assert_eq!(nodes[0].kind, NodeKind::Connection);
         assert_eq!(nodes[0].meta.as_deref(), Some("16.4"));
@@ -538,7 +640,7 @@ mod tests {
 
     #[test]
     fn empty_groups_do_not_appear() {
-        let nodes = from_snapshot("local", &snapshot());
+        let nodes = from_snapshot("local", &snapshot(), None);
         let names: Vec<_> = nodes.iter().map(|n| n.name.as_ref()).collect();
         assert!(names.contains(&"tables"));
         assert!(names.contains(&"views"));
@@ -549,7 +651,7 @@ mod tests {
 
     #[test]
     fn relations_carry_the_reference_needed_to_open_them() {
-        let nodes = from_snapshot("local", &snapshot());
+        let nodes = from_snapshot("local", &snapshot(), None);
         let users = nodes.iter().find(|n| n.name == *"users").unwrap();
         let reference = users.target.as_ref().unwrap().relation().unwrap();
         assert_eq!(reference.qualified(), "public.users");
@@ -569,7 +671,7 @@ mod tests {
 
     #[test]
     fn schemas_start_closed_but_the_root_does_not() {
-        let nodes = from_snapshot("local", &snapshot());
+        let nodes = from_snapshot("local", &snapshot(), None);
         let closed = initially_collapsed(&nodes);
         assert!(!closed.contains(&0));
         assert!(!closed.contains(&1));

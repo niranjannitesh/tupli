@@ -10,6 +10,10 @@
 //! editor as the one above it, so SQL is highlighted the same way wherever it
 //! is being read.
 //!
+//! **Privileges** is the answer to "why is this grid read-only", written out
+//! in full: who owns the table, who has been granted what, and — the line
+//! everybody actually came for — what the role you are logged in as may do.
+//!
 //! **Messages** is the log the status bar cannot be: the status bar shows the
 //! last statement, this shows the last two hundred, with the server's own words
 //! attached to the ones that failed. It is the tab you open when something went
@@ -34,6 +38,8 @@ pub enum ResultsTab {
     Structure,
     /// The object as the statements that would recreate it.
     Ddl,
+    /// Who may do what to the object, and what you yourself may do.
+    Privileges,
     Messages,
 }
 
@@ -683,7 +689,7 @@ impl Workspace {
 // ---- pieces --------------------------------------------------------------
 
 /// A fixed-width cell that clips rather than pushing its neighbours around.
-fn cell(width: gpui::Pixels) -> gpui::Div {
+pub(crate) fn cell(width: gpui::Pixels) -> gpui::Div {
     h_flex().w(width).flex_none().overflow_hidden()
 }
 
@@ -697,7 +703,7 @@ fn cell(width: gpui::Pixels) -> gpui::Div {
 /// `ARRAY['developer'::character varying]` next to a name of `role` wants three
 /// quarters of the free space, not half of it.
 #[derive(Copy, Clone)]
-enum Slot {
+pub(crate) enum Slot {
     Fixed(gpui::Pixels),
     Flex(f32),
 }
@@ -705,7 +711,7 @@ enum Slot {
 /// A flexible slot: `flex-basis: 0` so the weights decide the whole width
 /// rather than only the space left after the text, and `min-width: 0` so a long
 /// value elides instead of pushing its neighbours off the edge.
-fn flex_cell(weight: f32) -> gpui::Div {
+pub(crate) fn flex_cell(weight: f32) -> gpui::Div {
     h_flex()
         .flex_grow(weight)
         .flex_shrink(1.)
@@ -713,7 +719,7 @@ fn flex_cell(weight: f32) -> gpui::Div {
         .min_w_0()
 }
 
-fn structure_header(c: &ui::ThemeColors, columns: &[(&'static str, Slot)]) -> gpui::Div {
+pub(crate) fn structure_header(c: &ui::ThemeColors, columns: &[(&'static str, Slot)]) -> gpui::Div {
     let mut row = h_flex()
         .w_full()
         .flex_none()
@@ -735,7 +741,7 @@ fn structure_header(c: &ui::ThemeColors, columns: &[(&'static str, Slot)]) -> gp
     row
 }
 
-fn structure_row(c: &ui::ThemeColors, index: usize) -> gpui::Div {
+pub(crate) fn structure_row(c: &ui::ThemeColors, index: usize) -> gpui::Div {
     h_flex()
         .w_full()
         .flex_none()

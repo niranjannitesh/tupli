@@ -15,6 +15,7 @@ pub mod mock;
 pub mod objects;
 pub mod palette;
 pub mod pane;
+pub mod privileges;
 pub mod restore;
 pub mod results;
 pub mod save_sheet;

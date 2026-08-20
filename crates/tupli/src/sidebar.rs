@@ -535,6 +535,9 @@ fn icon_for(node: &TreeNode, cx: &Context<Workspace>) -> (IconName, IconColor) {
         NodeKind::View => (IconName::Eye, IconColor::Custom(c.success)),
         NodeKind::MaterializedView => (IconName::EyeFilled, IconColor::Custom(c.success)),
         NodeKind::Function => (IconName::BracketsCurly, IconColor::Muted),
+        NodeKind::RoleGroup => (IconName::Users, IconColor::Subtle),
+        NodeKind::Role => (IconName::User, IconColor::Muted),
+        NodeKind::RoleGroupMember => (IconName::Users, IconColor::Muted),
         NodeKind::KeyDatabase => (IconName::Database, IconColor::Custom(c.accent)),
         NodeKind::KeyFolder => (IconName::Folder, IconColor::Subtle),
         // A key row with no target: nothing builds one, but the tree is data

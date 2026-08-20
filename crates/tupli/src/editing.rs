@@ -89,12 +89,57 @@ impl Workspace {
             _ => Err(NotEditable::NotATable),
         };
 
-        let editable = identity.is_ok() && !self.is_read_only(cx);
+        // Ask the server what this role may do here, if it has not been asked
+        // already. Detached and cached, so browsing a table costs one extra
+        // round trip once and never blocks the rows arriving.
+        if let (Some(session), Some(reference)) = (self.session.clone(), relation.clone()) {
+            session.update(cx, |session, cx| session.load_grants(reference, cx));
+        }
+        let editable = identity.is_ok()
+            && !self.is_read_only(cx)
+            && self.write_denied(relation.as_ref(), cx).is_none();
         if let Some(pane_ref) = self.pane_by_mut(pane) {
             pane_ref.editing_relation = relation;
             pane_ref.identity = identity;
         }
         grid.update(cx, |grid, cx| grid.set_editable(editable, cx));
+    }
+
+    /// Why the *server* would refuse a write to this relation, if it would.
+    ///
+    /// A grid that lets an edit be typed and then fails on Commit with
+    /// `permission denied for table users` has wasted the work and explained
+    /// nothing. The privileges are already loaded for the Privileges tab, so
+    /// the same answer can be given before the first keystroke instead — and
+    /// it names the role, because "you cannot" is only useful next to "as
+    /// whom".
+    ///
+    /// `None` while the answer is unknown: an engine with no roles, a
+    /// connection whose grants have not arrived yet, or a pane that is not
+    /// browsing a table. Being optimistic there costs a failed commit at
+    /// worst; being pessimistic would lock a grid the user can in fact edit.
+    pub(crate) fn write_denied(
+        &self,
+        relation: Option<&db::RelationRef>,
+        cx: &gpui::App,
+    ) -> Option<SharedString> {
+        let session = self.session.as_ref()?.read(cx);
+        let grants = session.grants.get(relation?)?;
+        if grants.may_write() {
+            return None;
+        }
+        let who = session
+            .roles
+            .as_ref()
+            .map(|roles| format!("You are connected as {}, which", roles.current))
+            .unwrap_or_else(|| "This connection".into());
+        Some(
+            format!(
+                "{who} may read this table but not change it. It is owned by {}.",
+                grants.owner
+            )
+            .into(),
+        )
     }
 
     /// Whether the open connection forbids writes. A read-only connection is
@@ -111,6 +156,11 @@ impl Workspace {
     pub(crate) fn not_editable(&self, cx: &gpui::App) -> Option<SharedString> {
         if self.is_read_only(cx) {
             return Some("This connection is read-only.".into());
+        }
+        // The server's answer outranks ours: a table whose rows we know how to
+        // address is still not editable if this role was never granted it.
+        if let Some(denied) = self.write_denied(self.pane().editing_relation.as_ref(), cx) {
+            return Some(denied);
         }
         match &self.pane().identity {
             Ok(Identity::Ctid) => Some(

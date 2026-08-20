@@ -9,3 +9,6 @@
 /docs/PLAN.md
 /docs/ICON_INTEGRATION.md
 /docs/TODO.md
+
+# Agent worktrees. A checkout of this repo inside itself, created per task.
+/.claude/worktrees

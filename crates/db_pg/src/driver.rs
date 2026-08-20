@@ -7,11 +7,14 @@
 
 use std::sync::Arc;
 
-use db::{Capabilities, Catalog, DbResult, Driver, Engine, Notice, Outcome, Write};
+use db::{
+    Capabilities, Catalog, DbResult, Driver, Engine, Grants, Notice, Outcome, RelationRef, RoleSet,
+    Write,
+};
 use futures::future::BoxFuture;
 
 use crate::client::PgConnection;
-use crate::introspect;
+use crate::{introspect, roles};
 
 impl Driver for PgConnection {
     fn engine(&self) -> Engine {
@@ -36,6 +39,14 @@ impl Driver for PgConnection {
 
     fn catalog<'a>(&'a self) -> BoxFuture<'a, DbResult<Catalog>> {
         Box::pin(async move { introspect::snapshot(self).await.map(Catalog::Sql) })
+    }
+
+    fn roles<'a>(&'a self) -> BoxFuture<'a, DbResult<Option<RoleSet>>> {
+        Box::pin(async move { roles::roles(self).await.map(Some) })
+    }
+
+    fn grants<'a>(&'a self, relation: &'a RelationRef) -> BoxFuture<'a, DbResult<Option<Grants>>> {
+        Box::pin(async move { roles::grants(self, relation).await.map(Some) })
     }
 
     fn query<'a>(
