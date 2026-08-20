@@ -2,7 +2,11 @@
 // Run after tools/build_icons.mjs.
 import { readdirSync, writeFileSync } from "node:fs";
 
-const DIR = "/Users/theux.dev/Developer/tupli/assets/icons";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const DIR = join(root, "assets/icons");
 const files = readdirSync(DIR).filter((f) => f.endsWith(".svg"));
 const duo = new Set(
   files.filter((f) => f.endsWith(".duo.svg")).map((f) => f.slice(0, -8))
@@ -70,5 +74,5 @@ ${names.map((n) => `        IconName::${variant(n)},`).join("\n")}
 }
 `;
 
-writeFileSync("/Users/theux.dev/Developer/tupli/crates/ui/src/icon_name.rs", out);
+writeFileSync(join(root, "crates/ui/src/icon_name.rs"), out);
 console.log(`${names.length} icons, ${duo.size} with a duo layer`);

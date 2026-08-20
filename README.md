@@ -150,8 +150,10 @@ crates/
   tupli       the application: window, panes, sidebar, inspector, commands
 ```
 
-Nothing above `db` knows what a Postgres is. That is the constraint that makes a second
-engine possible, and it is checked by having actually written one.
+`db` holds the shared vocabulary — rows, values, schemas — and everything above the
+drivers is written against it rather than against Postgres. The last mile is not done:
+`db_pg` still shows up by name in a couple of places in the app layer, and a `Driver`
+trait to dispatch through is the next structural piece of work.
 
 ## Developing
 

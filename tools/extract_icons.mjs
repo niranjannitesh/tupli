@@ -6,10 +6,11 @@ import { pathToFileURL } from "node:url";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-const NM =
-  "/private/tmp/claude-501/-Users-theux-dev-Developer-tqlui/31c613b6-df4d-4c46-aa15-5256d6ff75bf/scratchpad/icons/node_modules";
-const OUT =
-  "/private/tmp/claude-501/-Users-theux-dev-Developer-tqlui/3f3e0a1b-701b-4eb1-b7be-04a48586d53f/scratchpad/svg";
+// Where the packs were installed, and where the SVGs should land. Both are
+// outside the repository: the input is licensed and the output is 8k files, of
+// which `build_icons.mjs` keeps the ~150 named in `icons.json`.
+const NM = process.env.NUCLEO_MODULES ?? "./node_modules";
+const OUT = process.env.ICON_OUT ?? "./svg";
 
 const PACKS = [
   { pkg: "nucleo-micro-bold", out: "micro", duo: false, strip: /^Icon/ },

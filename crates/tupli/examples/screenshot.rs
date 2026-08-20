@@ -144,6 +144,23 @@ fn main() {
             cx.run_until_parked();
         }
 
+        // `TUPLI_DOCK=<px>` sets the height of the results dock. A frame taken
+        // for a README wants the rows to carry it, and the saved layout has no
+        // opinion about that — a fresh profile opens on whatever the default
+        // is, which splits the centre evenly between typing and reading.
+        if let Ok(height) = std::env::var("TUPLI_DOCK") {
+            let height: f32 = height.parse().expect("TUPLI_DOCK is a number of pixels");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        workspace.dock_height = px(height);
+                        cx.notify();
+                    })
+                    .expect("set the dock height")
+            });
+            cx.run_until_parked();
+        }
+
         // `TUPLI_TYPE=<sql>` puts a statement in the console without sending
         // it, and `TUPLI_FORMAT=1` then presses Format. Together they are the
         // only way to photograph the editor's own behaviour, which owes

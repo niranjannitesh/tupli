@@ -28,8 +28,8 @@ it is regenerating the set.
 ### 2. Extract, then curate
 
 ```sh
-node tools/extract_icons.mjs            # edit NM/OUT at the top first
-ICON_SRC=<out dir> node tools/build_icons.mjs
+NUCLEO_MODULES=./node_modules ICON_OUT=/tmp/nucleo-svg node tools/extract_icons.mjs
+ICON_SRC=/tmp/nucleo-svg node tools/build_icons.mjs
 ```
 
 `extract_icons.mjs` renders every React icon component to a plain SVG with
