@@ -142,6 +142,12 @@ pub struct Grid {
     /// applying deltas keeps the width exact — accumulated deltas drift by a
     /// pixel per event as they round.
     pub(crate) dragging_column: Option<(usize, Pixels, Pixels)>,
+    /// True between pressing in the body and letting go, so a move extends the
+    /// selection instead of merely hovering. A press is a selection gesture
+    /// until the button comes back up, wherever the pointer wanders in the
+    /// meantime — leaving the grid, or running past the last row, is part of
+    /// the gesture rather than the end of it.
+    pub(crate) selecting: bool,
     /// Which column edge the pointer is currently within grabbing distance of.
     ///
     /// A cursor shape is per-frame state, so the frame has to be redrawn when
@@ -246,6 +252,7 @@ impl Grid {
             autoscroll: false,
             measured: false,
             dragging_column: None,
+            selecting: false,
             hover_edge: None,
             hover_header: None,
             sort: None,

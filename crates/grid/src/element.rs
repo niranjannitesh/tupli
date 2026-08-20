@@ -204,6 +204,50 @@ impl Frame {
         }
         Region::Cell(row, self.column_at(x))
     }
+
+    /// The row a drag is pointing at, clamped into the grid.
+    ///
+    /// Unlike [`Frame::region`] this never answers "nowhere". A drag that has
+    /// run past the last row, off the side, or out of the window altogether is
+    /// still pointing at a row, and stopping the selection dead because the
+    /// pointer left the cells by two pixels is the bug this exists to avoid.
+    fn drag_row(&self, p: Point<Pixels>) -> usize {
+        let row = row_at(p.y, self.body, self.row_height, self.scroll.y);
+        row.min(self.row_count().saturating_sub(1))
+    }
+
+    /// How many rows past the visible edge a drag is reaching, signed.
+    fn drag_beyond(&self, p: Point<Pixels>) -> isize {
+        rows_beyond(p.y, self.body, self.row_height)
+    }
+}
+
+/// The row under `y`, with the pointer clamped into the body first.
+fn row_at(y: Pixels, body: Bounds<Pixels>, row_height: Pixels, scroll: Pixels) -> usize {
+    let top = body.origin.y;
+    let last = (top + body.size.height - row_height).max(top);
+    let offset = (y.clamp(top, last) - top + scroll).max(px(0.));
+    (f32::from(offset) / f32::from(row_height)) as usize
+}
+
+/// How many rows past the visible edge `y` is, signed, zero while inside.
+///
+/// Dragging below the last visible row means "keep going", so each move event
+/// walks the cursor one row further and lets the autoscroll that every cursor
+/// move already asks for do the scrolling. Reaching further out walks faster,
+/// which is how every list on this platform behaves. The cap is there because
+/// a pointer flung to the other end of a 6K display should not select ten
+/// thousand rows in one event.
+fn rows_beyond(y: Pixels, body: Bounds<Pixels>, row_height: Pixels) -> isize {
+    let top = body.origin.y;
+    let bottom = top + body.size.height;
+    let past = match () {
+        _ if y < top => y - top,
+        _ if y > bottom => y - bottom,
+        _ => return 0,
+    };
+    let rows = (f32::from(past) / f32::from(row_height)) as isize;
+    rows.clamp(-24, 24) + if past > px(0.) { 1 } else { -1 }
 }
 
 pub struct PrepaintState {
@@ -725,6 +769,7 @@ impl GridElement {
                         grid.dragging_column = Some((col, e.position.x, grid.columns[col].width));
                     }
                     Region::Cell(row, col) => {
+                        grid.selecting = true;
                         grid.set_cursor(row, col, extend, cx);
                         // Double-click is the only way into a cell: the click
                         // that came before it picked the row, and this one says
@@ -739,7 +784,10 @@ impl GridElement {
                             }
                         }
                     }
-                    Region::Gutter(row) => grid.set_cursor(row, 0, extend, cx),
+                    Region::Gutter(row) => {
+                        grid.selecting = true;
+                        grid.set_cursor(row, 0, extend, cx);
+                    }
                     Region::Header(col) => grid.cycle_sort(col, cx),
                     Region::Empty => {}
                 });
@@ -753,10 +801,9 @@ impl GridElement {
 
         // Drag: resize a column, or extend the selection.
         {
-            let hitbox = hitbox.clone();
             let grid = grid.clone();
             let f = f.clone();
-            window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Bubble || e.pressed_button != Some(MouseButton::Left) {
                     return;
                 }
@@ -765,18 +812,28 @@ impl GridElement {
                     grid.update(cx, |grid, cx| grid.resize_column(col, width, cx));
                     return;
                 }
-                if hitbox.is_hovered(window) {
-                    if let Region::Cell(row, col) = f.region(e.position) {
-                        grid.update(cx, |grid, cx| grid.set_cursor(row, col, true, cx));
-                    }
+                if !grid.read(cx).selecting {
+                    return;
                 }
+                let beyond = f.drag_beyond(e.position);
+                let row = f.drag_row(e.position).saturating_add_signed(beyond);
+                grid.update(cx, |grid, cx| {
+                    let col = grid.cursor.1;
+                    grid.set_cursor(row, col, true, cx);
+                });
             });
         }
 
         {
             let grid = grid.clone();
             window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
-                if phase == DispatchPhase::Bubble && grid.read(cx).dragging_column.is_some() {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                if grid.read(cx).selecting {
+                    grid.update(cx, |grid, _| grid.selecting = false);
+                }
+                if grid.read(cx).dragging_column.is_some() {
                     // Notify, because the next frame is what takes the resize
                     // shape back off the pointer, and letting go of a button is
                     // not by itself a reason for gpui to draw one. The frame
@@ -1100,7 +1157,16 @@ fn write_usize(out: &mut String, mut n: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{one_line, write_ordinal};
+    use super::{one_line, row_at, rows_beyond, write_ordinal};
+    use gpui::{point, px, size, Bounds};
+
+    /// A body 100px tall at y=50, showing five 20px rows.
+    fn body() -> Bounds<gpui::Pixels> {
+        Bounds {
+            origin: point(px(0.), px(50.)),
+            size: size(px(400.), px(100.)),
+        }
+    }
 
     fn ordinal(n: usize) -> String {
         let mut out = String::new();
@@ -1122,6 +1188,37 @@ mod tests {
         assert_eq!(one_line("a\r\nb"), "a↵b");
         assert_eq!(one_line("a\rb"), "a↵b");
         assert_eq!(one_line("a\tb\0c"), "a b c");
+    }
+
+    #[test]
+    fn a_drag_inside_the_body_lands_on_the_row_under_it() {
+        assert_eq!(row_at(px(50.), body(), px(20.), px(0.)), 0);
+        assert_eq!(row_at(px(69.), body(), px(20.), px(0.)), 0);
+        assert_eq!(row_at(px(70.), body(), px(20.), px(0.)), 1);
+        // Scrolled by two rows, the top of the body is row 2.
+        assert_eq!(row_at(px(50.), body(), px(20.), px(40.)), 2);
+    }
+
+    #[test]
+    fn a_drag_past_either_edge_still_names_a_row() {
+        // Above the grid, and far above it: the first visible row, not nothing.
+        assert_eq!(row_at(px(0.), body(), px(20.), px(0.)), 0);
+        assert_eq!(row_at(px(-4000.), body(), px(20.), px(0.)), 0);
+        // Below it: the last row that fits, not the one the pointer is over.
+        assert_eq!(row_at(px(200.), body(), px(20.), px(0.)), 4);
+        assert_eq!(row_at(px(4000.), body(), px(20.), px(0.)), 4);
+    }
+
+    #[test]
+    fn only_a_drag_outside_the_body_walks_further() {
+        assert_eq!(rows_beyond(px(100.), body(), px(20.)), 0);
+        assert_eq!(rows_beyond(px(151.), body(), px(20.)), 1);
+        assert_eq!(rows_beyond(px(200.), body(), px(20.)), 3);
+        assert_eq!(rows_beyond(px(49.), body(), px(20.)), -1);
+        assert_eq!(rows_beyond(px(-50.), body(), px(20.)), -6);
+        // A pointer thrown to the far edge of a large display does not select
+        // the whole result set in one event.
+        assert_eq!(rows_beyond(px(40_000.), body(), px(20.)), 25);
     }
 
     #[test]

@@ -17,14 +17,6 @@ use uuid::Uuid;
 
 const SERVICE: &str = "tupli";
 
-/// The service the items were written under before the app was called Tupli.
-///
-/// A renamed service is a different keyring as far as macOS is concerned, so
-/// every saved password went quiet on the launch after the rename. Read through
-/// once, and written back under the new name so it is asked for once and never
-/// again.
-const LEGACY_SERVICE: &str = "tqlui";
-
 /// What the Keychain has already said, for the life of the process.
 ///
 /// macOS asks the user before handing a password to a process, and it remembers
@@ -68,7 +60,7 @@ pub fn password(id: Uuid) -> Result<Option<String>> {
     }
     let answer = match passwords::get_generic_password(SERVICE, &id.to_string()) {
         Ok(bytes) => Some(String::from_utf8(bytes).context("keychain item is not UTF-8")?),
-        Err(error) if error.code() == ITEM_NOT_FOUND => adopt_legacy(id)?,
+        Err(error) if error.code() == ITEM_NOT_FOUND => None,
         Err(error) => {
             return Err(anyhow!(
                 "could not read the password from the Keychain: {} ({})",
@@ -79,28 +71,6 @@ pub fn password(id: Uuid) -> Result<Option<String>> {
     };
     cache().insert(id, answer.clone());
     Ok(answer)
-}
-
-/// The password this connection had under the old service name, moved over.
-///
-/// `None` for the ordinary case of a connection that never had one. A failure
-/// to *write* the item back is not a failure to read it: the password is
-/// returned either way, and the worst that a failed write costs is doing this
-/// again next launch.
-fn adopt_legacy(id: Uuid) -> Result<Option<String>> {
-    let bytes = match passwords::get_generic_password(LEGACY_SERVICE, &id.to_string()) {
-        Ok(bytes) => bytes,
-        // Anything at all, including a locked keychain: this is a fallback for
-        // a name nobody uses any more, and it must not turn "no password" into
-        // an error on the path that already answered that question.
-        Err(_) => return Ok(None),
-    };
-    let password = String::from_utf8(bytes).context("keychain item is not UTF-8")?;
-    if let Err(error) = passwords::set_generic_password(SERVICE, &id.to_string(), password.as_bytes())
-    {
-        log::warn!("could not re-file the Keychain item under {SERVICE}: {error}");
-    }
-    Ok(Some(password))
 }
 
 /// Store (or replace) the password for a connection. An empty password deletes
