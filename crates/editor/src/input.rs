@@ -87,6 +87,14 @@ impl Input {
         self
     }
 
+    /// Change the placeholder after construction. A field can mean a different
+    /// thing than it did a moment ago — `Database` is a name on one engine and
+    /// a number on another — and a placeholder left behind is worse than none.
+    pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut App) {
+        self.editor
+            .update(cx, |editor, _| editor.set_placeholder(text));
+    }
+
     /// Bullets instead of characters. The value is still readable through
     /// [`Input::text`] — this hides it from the room, not from the app.
     pub fn masked(self, cx: &mut App) -> Self {

@@ -678,6 +678,7 @@ mod tests {
             detail: relation.as_ref().map(|r| r.schema.to_string().into()),
             dirty: false,
             relation,
+            key: None,
             saved_query: None,
             sql: format!("-- {title}"),
             filter: crate::filter::Filter::default(),

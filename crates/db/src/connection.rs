@@ -11,6 +11,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::driver::Engine;
+
 /// How hard to insist on TLS.
 ///
 /// The names and semantics are libpq's, because these end up in a connection
@@ -112,6 +114,10 @@ pub enum SafetyLevel {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: Uuid,
+    /// Which server is at the other end, and so which driver opens it. Saved
+    /// rather than guessed: a port is a hint, not a fact.
+    #[serde(default)]
+    pub engine: Engine,
     pub name: String,
     /// Optional folder in the connection list.
     pub group: Option<String>,
@@ -139,13 +145,14 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             id: Uuid::new_v4(),
+            engine: Engine::default(),
             name: String::new(),
             group: None,
             host: "localhost".into(),
-            port: 5432,
+            port: Engine::default().default_port(),
             database: String::new(),
             user: whoami(),
-            ssl_mode: SslMode::default(),
+            ssl_mode: Engine::default().default_ssl_mode(),
             ssl_cert: None,
             ssl_key: None,
             ssl_root_cert: None,
@@ -171,9 +178,10 @@ impl ConnectionConfig {
         format!("{}@{}/{}", self.user, self.host, db)
     }
 
-    /// `host:port/database`, for the status bar and the tab subtitle.
+    /// `host:port/database`, for the status bar and the tab subtitle. The port
+    /// is left out when it is the one the engine would have used anyway.
     pub fn endpoint(&self) -> String {
-        if self.port == 5432 {
+        if self.port == self.engine.default_port() {
             format!("{}/{}", self.host, self.database)
         } else {
             format!("{}:{}/{}", self.host, self.port, self.database)
@@ -221,8 +229,15 @@ impl ConnectionConfig {
         if self.port == 0 {
             problems.push("Port must be between 1 and 65535");
         }
-        if self.user.trim().is_empty() {
+        // Redis reaches most servers as the implicit `default` user, so an
+        // empty name there is the normal case rather than a mistake.
+        if self.engine == Engine::Postgres && self.user.trim().is_empty() {
             problems.push("User is required");
+        }
+        if self.engine == Engine::Redis && !self.database.trim().is_empty() {
+            if self.database.trim().parse::<u8>().is_err() {
+                problems.push("Redis databases are numbered, not named");
+            }
         }
         if self.ssl_mode.verifies_certificate() && self.ssl_root_cert.is_none() {
             problems.push("Certificate verification needs a root certificate");
@@ -232,6 +247,30 @@ impl ConnectionConfig {
 
     pub fn is_read_only(&self) -> bool {
         self.safety == SafetyLevel::ReadOnly
+    }
+
+    /// What a connection to this server will be able to do. Answerable before
+    /// anything is open, which is when the window decides what to draw.
+    pub fn capabilities(&self) -> crate::driver::Capabilities {
+        self.engine.capabilities()
+    }
+
+    /// Change engines, carrying the port and the TLS setting along when
+    /// neither was ever chosen.
+    ///
+    /// Somebody who has typed a port meant it; somebody who left 5432 alone
+    /// and then picked Redis did not mean 5432. The same argument covers
+    /// `ssl_mode`, which is a default per engine rather than one setting with
+    /// a safe value — see [`Engine::default_ssl_mode`]. A mode that was picked
+    /// on purpose is never moved, in either direction.
+    pub fn set_engine(&mut self, engine: Engine) {
+        if self.port == self.engine.default_port() {
+            self.port = engine.default_port();
+        }
+        if self.ssl_mode == self.engine.default_ssl_mode() {
+            self.ssl_mode = engine.default_ssl_mode();
+        }
+        self.engine = engine;
     }
 
     /// Parse a libpq keyword/value string — the inverse of
@@ -248,19 +287,30 @@ impl ConnectionConfig {
     /// `database=` when you meant `dbname=`.
     pub fn from_spec(spec: &str) -> Result<Self, String> {
         let mut config = Self::default();
+        // A port or an sslmode that was typed is a decision; one that was not
+        // follows whatever engine turns up in the spec, whichever order the
+        // two came in.
+        let mut port_given = false;
+        let mut ssl_given = false;
         for (key, value) in split_spec(spec)? {
             match key.as_str() {
                 "host" => config.host = value,
                 "port" => {
+                    port_given = true;
                     config.port = value
                         .parse()
                         .map_err(|_| format!("port must be a number, not {value:?}"))?
+                }
+                "engine" => {
+                    config.engine = Engine::from_str(&value)
+                        .ok_or_else(|| format!("unknown engine {value:?}"))?
                 }
                 // `db` is not libpq's spelling; it is accepted because it is
                 // what everybody types, and rejecting it would teach nothing.
                 "dbname" | "db" | "database" => config.database = value,
                 "user" => config.user = value,
                 "sslmode" => {
+                    ssl_given = true;
                     config.ssl_mode = SslMode::from_str(&value)
                         .ok_or_else(|| format!("unknown sslmode {value:?}"))?
                 }
@@ -272,6 +322,12 @@ impl ConnectionConfig {
                 "application_name" => {}
                 other => return Err(format!("unknown keyword {other:?}")),
             }
+        }
+        if !port_given {
+            config.port = config.engine.default_port();
+        }
+        if !ssl_given {
+            config.ssl_mode = config.engine.default_ssl_mode();
         }
         Ok(config)
     }
@@ -463,5 +519,72 @@ mod tests {
                 .unwrap();
         assert_eq!(config.database, "tupli_dev");
         assert_eq!(config.port, 55432);
+    }
+
+    #[test]
+    fn an_engine_brings_its_own_port_unless_one_was_typed() {
+        let redis = ConnectionConfig::from_spec("engine=redis host=cache").unwrap();
+        assert_eq!(redis.engine, Engine::Redis);
+        assert_eq!(redis.port, 6379);
+        // Order does not matter: the port is settled after the whole spec is
+        // read, not as each keyword arrives.
+        let early = ConnectionConfig::from_spec("port=6380 engine=redis").unwrap();
+        assert_eq!(early.port, 6380);
+        assert_eq!(ConnectionConfig::from_spec("host=db").unwrap().port, 5432);
+        assert!(ConnectionConfig::from_spec("engine=mysql").is_err());
+    }
+
+    #[test]
+    fn switching_engines_moves_a_port_nobody_chose() {
+        let mut config = ConnectionConfig::default();
+        config.set_engine(Engine::Redis);
+        assert_eq!(config.port, 6379);
+        // A typed port survives the switch, because typing it was the decision.
+        let mut chosen = ConnectionConfig {
+            port: 5433,
+            ..Default::default()
+        };
+        chosen.set_engine(Engine::Redis);
+        assert_eq!(chosen.port, 5433);
+    }
+
+    #[test]
+    fn tls_follows_the_engine_until_somebody_picks_one() {
+        // A plain Redis on 6379 answers a TLS handshake with silence, so the
+        // Postgres default would cost a ten-second wait on every first attempt.
+        let mut config = ConnectionConfig::default();
+        assert_eq!(config.ssl_mode, SslMode::Require);
+        config.set_engine(Engine::Redis);
+        assert_eq!(config.ssl_mode, SslMode::Disable);
+
+        // But a mode somebody chose stays chosen, and so does the way back.
+        let mut chosen = ConnectionConfig::default();
+        chosen.ssl_mode = SslMode::VerifyFull;
+        chosen.set_engine(Engine::Redis);
+        assert_eq!(chosen.ssl_mode, SslMode::VerifyFull);
+
+        let spec = ConnectionConfig::from_spec("engine=redis host=127.0.0.1").unwrap();
+        assert_eq!(spec.ssl_mode, SslMode::Disable);
+        let typed = ConnectionConfig::from_spec("engine=redis sslmode=verify-full").unwrap();
+        assert_eq!(typed.ssl_mode, SslMode::VerifyFull);
+    }
+
+    #[test]
+    fn each_engine_is_asked_for_what_it_can_actually_be_asked_for() {
+        let redis = ConnectionConfig {
+            engine: Engine::Redis,
+            database: "not-a-number".into(),
+            user: String::new(),
+            ..Default::default()
+        };
+        // No user is the normal case on Redis, but a named database is not.
+        let problems = redis.problems();
+        assert!(!problems.iter().any(|p| p.contains("User")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("numbered")),
+            "{problems:?}"
+        );
+        assert!(!redis.capabilities().schemas);
+        assert!(ConnectionConfig::default().capabilities().schemas);
     }
 }

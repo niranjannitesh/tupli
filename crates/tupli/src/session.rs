@@ -1,10 +1,16 @@
 //! A live connection, as the window sees it.
 //!
 //! The bridge between two schedulers. GPUI owns the main thread and will not
-//! tolerate a blocking call on it; `tokio-postgres` needs a Tokio reactor. So
-//! every database operation is a Tokio future handed to [`gpui_tokio::Tokio`],
-//! and its result comes back through a GPUI task that updates this entity on
-//! the main thread. Nothing else in the app touches `db_pg` directly.
+//! tolerate a blocking call on it; the drivers need a Tokio reactor. So every
+//! database operation is a Tokio future handed to [`gpui_tokio::Tokio`], and
+//! its result comes back through a GPUI task that updates this entity on the
+//! main thread.
+//!
+//! What is on the other end is an [`Arc<dyn Driver>`] and nothing more
+//! specific: this crate does not depend on `db_pg` or `db_redis` at all, so
+//! "the window does not know which engine it is talking to" is checked rather
+//! than promised. What it may assume instead is
+//! [`ConnectionConfig::capabilities`].
 //!
 //! One session is one server connection, not a pool. `SET`, temporary tables
 //! and open transactions all behave the way a person typing SQL expects them
@@ -13,8 +19,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use db::{ConnectionConfig, DbError, ErrorClass, ResultSet, SchemaSnapshot};
-use db_pg::{introspect, Canceller, Outcome, PgConnection};
+use db::{
+    Catalog, ConnectionConfig, Cursor, DbError, Driver, ErrorClass, KeyFacts, KeyQuery, KeyType,
+    Outcome, ResultSet, SchemaSnapshot,
+};
 use gpui::{Context, EventEmitter, SharedString, Task};
 use gpui_tokio::Tokio;
 
@@ -63,7 +71,7 @@ pub struct Run {
     /// grid, which leaves `None` behind — a result set is large enough that
     /// keeping a second copy here would be a real cost, not a tidy one.
     pub rows: Option<ResultSet>,
-    /// Rows the server had more of than [`db_pg::DEFAULT_MAX_ROWS`].
+    /// Rows the server had more of than [`db::DEFAULT_MAX_ROWS`].
     pub truncated: bool,
     /// `UPDATE 3` — the count for a statement that returned no rows.
     pub affected: Option<u64>,
@@ -79,6 +87,37 @@ impl Run {
     }
 }
 
+/// How many keys one turn of the walk asks for.
+///
+/// Large enough that the tree looks populated after one round trip, small
+/// enough that a `MATCH` which hits nothing does not hold the server inside a
+/// single `SCAN` for long. `SCAN`'s `COUNT` is a hint about work done and not
+/// a count of keys returned, so this is a budget, not a promise.
+const KEY_PAGE: usize = 500;
+
+/// How much of one key's contents is read at a time. A list can hold ten
+/// million items; the grid is virtualised but the wire is not.
+const KEY_ROWS: usize = 1000;
+
+/// One opened key: what it is, and as much of it as was read.
+///
+/// The shape of [`Run`] and for the same reason — the rows are taken out by
+/// whoever draws them rather than copied — but it is not a `Run`, because
+/// nothing was run. There is no statement to put in the message log and no
+/// elapsed time worth reporting for two round trips.
+pub struct KeyView {
+    pub key: Arc<[u8]>,
+    pub kind: KeyType,
+    /// TTL, encoding, memory, length — the facts bar above the rows. `None`
+    /// when the key went away between being listed and being opened, which is
+    /// ordinary in Redis rather than an error.
+    pub facts: Option<KeyFacts>,
+    pub rows: Option<ResultSet>,
+    /// Where the next page of *this key's* contents starts.
+    pub more: Option<Cursor>,
+    pub error: Option<DbError>,
+}
+
 pub enum SessionEvent {
     /// Connected, disconnected, or failed. The titlebar and status bar redraw.
     StateChanged,
@@ -88,6 +127,13 @@ pub enum SessionEvent {
     Finished,
     /// A grid commit finished. `Session::last_apply` has it.
     Applied,
+    /// A page of the keyspace arrived. The sidebar rebuilds its tree, which is
+    /// the same job [`SessionEvent::SchemaChanged`] does — separate because a
+    /// scan lands repeatedly while the walk continues and must not re-run
+    /// everything else that a new catalog means.
+    KeysChanged,
+    /// A key was read. `Session::last_key` has it.
+    KeyOpened,
 }
 
 /// One finished commit of staged grid edits.
@@ -149,11 +195,29 @@ pub struct Session {
     password: Option<String>,
     state: SessionState,
     activity: Activity,
-    connection: Option<Arc<PgConnection>>,
-    /// Kept beside the connection because cancelling needs a second socket, and
-    /// the connection itself is busy on the first one.
-    canceller: Option<Canceller>,
+    connection: Option<Arc<dyn Driver>>,
+    /// The catalog of a SQL server. `None` on a connection that has no schema
+    /// to read — see [`Session::keyspace`].
     pub snapshot: Option<Arc<SchemaSnapshot>>,
+    /// The catalog of a key-value server, which is the databases and how full
+    /// they are. Exactly one of this and [`Session::snapshot`] is set on a
+    /// connected session.
+    pub keyspace: Option<Arc<db::Keyspace>>,
+    /// The keys the browser has seen so far, in the order the server handed
+    /// them over. A *sample* and not an inventory: on a keyspace of any size
+    /// this is the first few thousand keys of a walk that has not finished,
+    /// which is why [`Session::keys_complete`] exists and why nothing here
+    /// reports a total.
+    pub keys: Vec<db::KeyInfo>,
+    /// Whether the walk that produced [`Session::keys`] reached the end.
+    pub keys_complete: bool,
+    /// Where the walk stopped, so "load more" has somewhere to resume from.
+    key_cursor: Option<db::Cursor>,
+    /// The glob the current listing was asked for, so a scan already running
+    /// against the same pattern is not started again.
+    key_pattern: String,
+    /// What the last [`Session::open_key`] found out about the key it opened.
+    pub last_key: Option<KeyView>,
     /// The in-flight operation. Dropping it detaches this side; the server-side
     /// half is stopped by [`Session::cancel`].
     task: Option<Task<()>>,
@@ -178,8 +242,13 @@ impl Session {
             state: SessionState::Offline,
             activity: Activity::Idle,
             connection: None,
-            canceller: None,
             snapshot: None,
+            keyspace: None,
+            keys: Vec::new(),
+            keys_complete: false,
+            key_cursor: None,
+            key_pattern: String::new(),
+            last_key: None,
             task: None,
             last: None,
             last_apply: None,
@@ -192,6 +261,16 @@ impl Session {
 
     pub fn activity(&self) -> Activity {
         self.activity
+    }
+
+    /// What the server said it is, empty until there is one. A `SchemaSnapshot`
+    /// carries this for a SQL server; a keyspace has no snapshot to carry it,
+    /// so the tree asks here.
+    pub fn server_version(&self) -> Arc<str> {
+        match &self.connection {
+            Some(connection) => connection.server_version(),
+            None => Arc::from(""),
+        }
     }
 
     pub fn is_busy(&self) -> bool {
@@ -211,7 +290,6 @@ impl Session {
         self.state = SessionState::Connecting;
         self.activity = Activity::Connecting;
         self.connection = None;
-        self.canceller = None;
         cx.emit(SessionEvent::StateChanged);
         cx.notify();
 
@@ -233,7 +311,7 @@ impl Session {
                 (None, Err(_)) => store::secrets::password(config.id)
                     .map_err(|error| DbError::internal(format!("Keychain: {error:#}")))?,
             };
-            let connection = PgConnection::connect(&config, password.as_deref())
+            let connection = drivers::connect(&config, password.as_deref())
                 .await
                 // The driver's way of saying the server asked for a password
                 // and was not given one. On its own it reads like the app lost
@@ -246,8 +324,8 @@ impl Session {
                     ),
                     false => error,
                 })?;
-            let snapshot = introspect::snapshot(&connection).await?;
-            Ok::<_, DbError>((connection, snapshot))
+            let catalog = connection.catalog().await?;
+            Ok::<_, DbError>((connection, catalog))
         });
 
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -256,10 +334,9 @@ impl Session {
                 this.activity = Activity::Idle;
                 this.task = None;
                 match result {
-                    Ok((connection, snapshot)) => {
-                        this.canceller = Some(connection.canceller());
-                        this.connection = Some(Arc::new(connection));
-                        this.snapshot = Some(Arc::new(snapshot));
+                    Ok((connection, catalog)) => {
+                        this.connection = Some(connection);
+                        this.set_catalog(catalog);
                         this.state = SessionState::Connected;
                         cx.emit(SessionEvent::SchemaChanged);
                     }
@@ -280,8 +357,11 @@ impl Session {
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.task = None;
         self.connection = None;
-        self.canceller = None;
         self.snapshot = None;
+        self.keyspace = None;
+        self.keys.clear();
+        self.keys_complete = false;
+        self.key_cursor = None;
         self.activity = Activity::Idle;
         self.state = SessionState::Offline;
         cx.emit(SessionEvent::SchemaChanged);
@@ -301,19 +381,147 @@ impl Session {
         self.activity = Activity::Introspecting;
         cx.notify();
 
-        let work = Tokio::spawn(cx, async move { introspect::snapshot(&connection).await });
+        let work = Tokio::spawn(cx, async move { connection.catalog().await });
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = joined(work.await);
             this.update(cx, |this, cx| {
                 this.activity = Activity::Idle;
                 this.task = None;
                 match result {
-                    Ok(snapshot) => {
-                        this.snapshot = Some(Arc::new(snapshot));
+                    Ok(catalog) => {
+                        this.set_catalog(catalog);
                         cx.emit(SessionEvent::SchemaChanged);
                     }
                     Err(error) => log::error!("refresh failed: {}", error.full_text()),
                 }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Walk the keyspace and put what it finds in [`Session::keys`].
+    ///
+    /// A *sample*, not a listing: `SCAN` gives no total and no order, and the
+    /// only command that would give both is the one that stalls the server. So
+    /// this is called again — with the same `pattern` — for each further page,
+    /// and the tree says how many keys it has *seen* rather than how many
+    /// there are.
+    ///
+    /// Sizes are left out (`memory: false`): `MEMORY USAGE` is a command per
+    /// key, and the browser only shows a size for the key that is open, which
+    /// [`Session::open_key`] fetches on its own.
+    pub fn scan_keys(&mut self, pattern: impl Into<String>, cx: &mut Context<Self>) {
+        let pattern = pattern.into();
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        if !connection.capabilities().paged_catalog || self.is_busy() {
+            return;
+        }
+        // A new pattern is a new walk, and the keys from the old one are about
+        // a different question.
+        let restart = pattern != self.key_pattern;
+        if restart {
+            self.keys.clear();
+            self.keys_complete = false;
+            self.key_cursor = None;
+            self.key_pattern = pattern.clone();
+        } else if self.keys_complete {
+            return;
+        }
+
+        let query = KeyQuery {
+            pattern,
+            kind: None,
+            from: self.key_cursor.clone(),
+            limit: KEY_PAGE,
+            memory: false,
+        };
+        self.activity = Activity::Introspecting;
+        cx.notify();
+
+        let work = Tokio::spawn(cx, async move { connection.list_keys(&query).await });
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = joined(work.await);
+            this.update(cx, |this, cx| {
+                this.activity = Activity::Idle;
+                this.task = None;
+                match result {
+                    Ok(listing) => {
+                        this.keys.extend(listing.keys);
+                        this.keys_complete = listing.more.is_none();
+                        this.key_cursor = listing.more;
+                        cx.emit(SessionEvent::KeysChanged);
+                    }
+                    Err(error) => log::error!("scan failed: {}", error.full_text()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Read one key. The result arrives as [`SessionEvent::KeyOpened`].
+    ///
+    /// Two round trips rather than one, because what a key *is* and what a key
+    /// *holds* are different questions and the second cannot be asked without
+    /// the answer to the first — `LRANGE` on a hash is an error. The `kind` the
+    /// listing already knew is passed in anyway: it is what decides the reader,
+    /// and re-deriving it here would make an open cost a `TYPE` it does not
+    /// need.
+    pub fn open_key(&mut self, key: Arc<[u8]>, kind: KeyType, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        if self.is_busy() {
+            return;
+        }
+        self.activity = Activity::Running;
+        cx.notify();
+
+        let opened = key.clone();
+        let reading = kind.clone();
+        let work = Tokio::spawn(cx, async move {
+            let facts = connection.describe_key(&opened).await;
+            let page = connection.read_key(&opened, &reading, None, KEY_ROWS).await;
+            (facts, page)
+        });
+
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let joined = work.await;
+            this.update(cx, |this, cx| {
+                this.activity = Activity::Idle;
+                this.task = None;
+                let view = match joined {
+                    Ok((facts, page)) => {
+                        // A key that expired between the listing and the click
+                        // is not a failure — it is what a TTL is for — so the
+                        // tab opens empty rather than red.
+                        let (rows, more, error) = match page {
+                            Ok(page) => (Some(page.rows), page.more, None),
+                            Err(error) => (None, None, Some(error)),
+                        };
+                        KeyView {
+                            key,
+                            kind,
+                            facts: facts.ok().flatten(),
+                            rows,
+                            more,
+                            error,
+                        }
+                    }
+                    Err(error) => KeyView {
+                        key,
+                        kind,
+                        facts: None,
+                        rows: None,
+                        more: None,
+                        error: Some(DbError::internal(error.to_string())),
+                    },
+                };
+                this.last_key = Some(view);
+                cx.emit(SessionEvent::KeyOpened);
                 cx.notify();
             })
             .ok();
@@ -330,7 +538,10 @@ impl Session {
             self.finish_locally(sql, DbError::connection("Not connected"), cx);
             return;
         };
-        if self.config.is_read_only() && writes(&sql) {
+        // The keyword sniffer is SQL's. A command engine enforces its own
+        // read-only rule at the socket, where the command's name is a fact
+        // rather than a guess.
+        if self.config.is_read_only() && self.config.capabilities().is_sql() && writes(&sql) {
             let error = DbError::new(
                 ErrorClass::Server,
                 "This connection is marked read-only. Change it in the connection settings to run writes.",
@@ -350,7 +561,7 @@ impl Session {
             // Timed inside the Tokio task so the number is the round trip and
             // not the round trip plus however long the UI took to notice.
             let started = Instant::now();
-            let outcome = connection.query(&statement, db_pg::DEFAULT_MAX_ROWS).await;
+            let outcome = connection.query(&statement, db::DEFAULT_MAX_ROWS).await;
             // Drained here rather than on the UI thread: by the time the result
             // gets there another statement could have been sent, and the
             // notices would follow the wrong one.
@@ -451,9 +662,9 @@ impl Session {
             let started = Instant::now();
             // Borrowed here rather than in the caller: `Write` holds slices,
             // and the statements have to outlive the await.
-            let writes: Vec<db_pg::Write<'_>> = statements
+            let writes: Vec<db::Write<'_>> = statements
                 .iter()
-                .map(|s| db_pg::Write {
+                .map(|s| db::Write {
                     sql: &s.sql,
                     params: &s.params,
                     expect_rows: s.expect_rows,
@@ -508,13 +719,37 @@ impl Session {
     /// The server may already have finished, in which case this does nothing
     /// and the result arrives normally.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
-        let Some(canceller) = self.canceller.clone() else {
+        let Some(connection) = self.connection.clone() else {
             return;
         };
-        if !self.is_busy() {
+        if !self.is_busy() || !self.config.capabilities().cancel {
             return;
         }
-        Tokio::spawn(cx, async move { canceller.cancel().await }).detach();
+        Tokio::spawn(cx, async move { connection.cancel().await }).detach();
+    }
+
+    /// Put a freshly read catalog where the sidebar looks for it.
+    ///
+    /// Both fields are set every time, not just the one that matched: a
+    /// session that switches to a connection of the other kind must not keep
+    /// showing the tree it had before.
+    fn set_catalog(&mut self, catalog: Catalog) {
+        match catalog {
+            Catalog::Sql(snapshot) => {
+                self.snapshot = Some(Arc::new(snapshot));
+                self.keyspace = None;
+            }
+            Catalog::Keyspace(keyspace) => {
+                self.snapshot = None;
+                self.keyspace = Some(Arc::new(keyspace));
+            }
+        }
+        // The keys under the old catalog are not the keys under the new one,
+        // and a tree holding both would be showing a database's keys under
+        // another database's name.
+        self.keys.clear();
+        self.keys_complete = false;
+        self.key_cursor = None;
     }
 
     /// Take the rows off the last run, leaving the timing and the statement

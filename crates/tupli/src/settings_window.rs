@@ -185,7 +185,7 @@ impl SettingsWindow {
 /// subject, and reads as one only if the gap before it beats the gap between
 /// the rows it heads.
 fn section(title: &'static str) -> impl IntoElement {
-    div().pt(px(10.)).child(SectionHeader::new(title))
+    div().pt(px(10.)).child(SectionHeader::new(title).flush())
 }
 
 fn change(
@@ -288,7 +288,7 @@ impl SettingsWindow {
 
         v_flex()
             .gap(px(14.))
-            .child(SectionHeader::new("At launch"))
+            .child(SectionHeader::new("At launch").flush())
             .child(
                 FormRow::new("Restore")
                     .hint("Bring back the tabs and the half-written statement from last time.")
@@ -355,7 +355,7 @@ impl SettingsWindow {
 
         v_flex()
             .gap(px(14.))
-            .child(SectionHeader::new("Theme"))
+            .child(SectionHeader::new("Theme").flush())
             .child(
                 FormRow::new("Match System")
                     .hint("Follow macOS between light and dark, using the last theme you picked for each.")
@@ -476,7 +476,7 @@ impl SettingsWindow {
 
         v_flex()
             .gap(px(14.))
-            .child(SectionHeader::new("Code"))
+            .child(SectionHeader::new("Code").flush())
             .child(
                 FormRow::new("Font")
                     .hint("The face used by the console, the grid and every value.")
@@ -554,7 +554,7 @@ impl SettingsWindow {
 
         v_flex()
             .gap(px(14.))
-            .child(SectionHeader::new("Browsing a table"))
+            .child(SectionHeader::new("Browsing a table").flush())
             .child(
                 FormRow::new("Row limit")
                     .hint("The limit applied when a table is opened. Every row is fetched before anything is drawn, so a bigger number costs time on a slow link as well as memory \u{2014} the pager reaches the rest either way.")
@@ -600,7 +600,7 @@ impl SettingsWindow {
         v_flex()
             .gap(px(14.))
             .child(
-                SectionHeader::new("Saved connections").end_child(
+                SectionHeader::new("Saved connections").flush().end_child(
                     Label::new(count.to_string())
                         .size(LabelSize::Small)
                         .color(IconColor::Subtle),
@@ -689,7 +689,7 @@ fn shortcuts(cx: &mut Context<SettingsWindow>) -> impl IntoElement {
 
     v_flex()
         .gap(px(14.))
-        .child(SectionHeader::new("Finding things"))
+        .child(SectionHeader::new("Finding things").flush())
         .child(shortcut_table("palette", palette, cx))
         .child(section("Commands"))
         .child(shortcut_table("commands", commands, cx))
@@ -744,7 +744,7 @@ fn advanced(_cx: &mut Context<SettingsWindow>) -> impl IntoElement {
 
     v_flex()
         .gap(px(14.))
-        .child(SectionHeader::new("About"))
+        .child(SectionHeader::new("About").flush())
         .children(rows.into_iter().map(|(label, value)| {
             FormRow::new(label).plain().child(
                 Label::new(value)

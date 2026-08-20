@@ -23,6 +23,7 @@ use gpui::{
     InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, ScrollWheelEvent, Style, TextAlign, TextRun, Window,
 };
+use smallvec::SmallVec;
 use sqlgen::{PendingChanges, RowRef};
 use ui::ActiveTheme;
 
@@ -458,10 +459,16 @@ impl Element for GridElement {
                     if text.is_empty() {
                         continue;
                     }
+                    // Only an ordinary value gets a quiet tail. When the colour
+                    // is already saying something — null, staged, disabled — a
+                    // second colour inside the same cell would be saying it
+                    // twice, in a different language.
+                    let quiet = (color == c.text).then_some((column.meta.kind, c.text_subtle));
                     paint_cell_text(
                         text,
                         cell,
                         color,
+                        quiet,
                         &mono,
                         ty.mono_size,
                         f.row_height,
@@ -538,6 +545,7 @@ impl Element for GridElement {
                     &buf,
                     cell,
                     color,
+                    None,
                     &mono,
                     ty.ui_size_sm,
                     f.row_height,
@@ -571,6 +579,7 @@ impl Element for GridElement {
                 size: size(f.gutter_width, f.header_height),
             },
             c.text_subtle,
+            None,
             &mono,
             ty.ui_size_sm,
             f.header_height,
@@ -614,6 +623,7 @@ impl Element for GridElement {
                         &meta.name,
                         name_cell,
                         color,
+                        None,
                         &mono,
                         ty.ui_size_sm,
                         f.header_height,
@@ -897,6 +907,7 @@ fn paint_cell_text(
     text: &str,
     cell: Bounds<Pixels>,
     color: Hsla,
+    quiet: Option<(db::ValueKind, Hsla)>,
     font: &Font,
     font_size: Pixels,
     line_height: Pixels,
@@ -911,14 +922,32 @@ fn paint_cell_text(
     }
     let text = &*one_line(text);
 
-    let run = TextRun {
-        len: text.len(),
+    // Split after `one_line`, because that is the string being shaped: a byte
+    // offset into the original would land mid-character in a value that had a
+    // newline replaced.
+    let split = quiet
+        .and_then(|(kind, _)| quiet_tail(kind, text))
+        .filter(|at| *at > 0 && *at < text.len());
+
+    let mut runs = SmallVec::<[TextRun; 2]>::new();
+    runs.push(TextRun {
+        len: split.unwrap_or(text.len()),
         font: font.clone(),
         color,
         background_color: None,
         underline: None,
         strikethrough: None,
-    };
+    });
+    if let Some(at) = split {
+        runs.push(TextRun {
+            len: text.len() - at,
+            font: font.clone(),
+            color: quiet.map(|(_, dim)| dim).unwrap_or(color),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
     // Hash-keyed shaping: on a cache hit — every cell that was also on screen
     // last frame — this never materialises a `SharedString` at all, which is
     // the difference between one allocation per visible cell per frame and none.
@@ -930,16 +959,15 @@ fn paint_cell_text(
         color.s.to_bits().hash(&mut h);
         color.l.to_bits().hash(&mut h);
         font.family.hash(&mut h);
+        split.hash(&mut h);
         h.finish()
     };
-    let line = window.text_system().shape_line_by_hash(
-        hash,
-        text.len(),
-        font_size,
-        std::slice::from_ref(&run),
-        None,
-        || text.to_string().into(),
-    );
+    let line =
+        window
+            .text_system()
+            .shape_line_by_hash(hash, text.len(), font_size, &runs, None, || {
+                text.to_string().into()
+            });
 
     let overflows = line.width() > inner_width;
     let x = if right_aligned && !overflows {
@@ -959,6 +987,46 @@ fn paint_cell_text(
         });
     } else {
         let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
+    }
+}
+
+/// Where a value's quiet tail begins, as a byte offset into `text`.
+///
+/// None of these characters can be dropped — `2026-08-20 11:02:31.482913+00` is
+/// only that value with all of it — but a column of them is read at the minute,
+/// and the rest is something the eye has to step over on every row. Dimming
+/// keeps the value whole and still lets the column be scanned. The same goes
+/// for a `numeric(20,16)` that is holding an integer, and for the twenty-eight
+/// characters of a uuid that are not what tells two rows apart.
+fn quiet_tail(kind: db::ValueKind, text: &str) -> Option<usize> {
+    match kind {
+        db::ValueKind::Timestamp | db::ValueKind::Time => {
+            // From the *first* colon: a `+05:30` offset has colons of its own,
+            // and searching backwards would find one of those.
+            let clock = text.find(':')?;
+            let fraction = text[clock..].find('.').map(|at| clock + at);
+            let zone = text[clock..].find(['+', '-', 'Z']).map(|at| clock + at);
+            match (fraction, zone) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        }
+        db::ValueKind::Decimal | db::ValueKind::Float => {
+            let point = text.find('.')?;
+            // An exponent has no zeros to spare: `1.500e10` means the scale.
+            if text[point..].contains(['e', 'E']) {
+                return None;
+            }
+            match text[point + 1..].rfind(|c: char| c != '0') {
+                // 7065.0000000000000000 — the point itself is part of the noise.
+                None => Some(point),
+                Some(last) => Some(point + 2 + last),
+            }
+        }
+        // The first group of a uuid is enough to tell two rows apart, and is
+        // what anyone reads when they are looking for one.
+        db::ValueKind::Uuid => (text.len() == 36 && text.as_bytes()[8] == b'-').then_some(8),
+        _ => None,
     }
 }
 
@@ -1193,7 +1261,7 @@ fn write_usize(out: &mut String, mut n: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{one_line, row_at, rows_beyond, write_ordinal};
+    use super::{one_line, quiet_tail, row_at, rows_beyond, write_ordinal};
     use gpui::{point, px, size, Bounds};
 
     /// A body 100px tall at y=50, showing five 20px rows.
@@ -1265,5 +1333,54 @@ mod tests {
         assert_eq!(ordinal(999_982), "999,982");
         assert_eq!(ordinal(1_234_567), "1,234,567");
         assert_eq!(ordinal(12_345_678), "12,345,678");
+    }
+
+    fn quiet(kind: db::ValueKind, text: &str) -> &str {
+        match quiet_tail(kind, text) {
+            Some(at) => &text[at..],
+            None => "",
+        }
+    }
+
+    #[test]
+    fn a_timestamp_goes_quiet_after_the_seconds() {
+        use db::ValueKind::{Time, Timestamp};
+        assert_eq!(
+            quiet(Timestamp, "2026-08-20 11:02:31.482913+00"),
+            ".482913+00"
+        );
+        assert_eq!(quiet(Timestamp, "2026-08-20 11:02:31+05:30"), "+05:30");
+        assert_eq!(quiet(Timestamp, "2026-08-20T11:02:31Z"), "Z");
+        // Nothing to dim: this one is already only what it says.
+        assert_eq!(quiet(Timestamp, "2026-08-20 11:02:31"), "");
+        assert_eq!(quiet(Time, "11:02:31.482913"), ".482913");
+        // A date has no clock, so it has no tail — and the dashes in it must
+        // not be read as a zone offset.
+        assert_eq!(quiet(db::ValueKind::Date, "2026-08-20"), "");
+    }
+
+    #[test]
+    fn a_numeric_goes_quiet_where_it_stops_saying_anything() {
+        use db::ValueKind::{Decimal, Float};
+        assert_eq!(quiet(Decimal, "7065.0000000000000000"), ".0000000000000000");
+        assert_eq!(quiet(Decimal, "7065.5000000000000000"), "000000000000000");
+        assert_eq!(quiet(Decimal, "-0.1200"), "00");
+        assert_eq!(quiet(Decimal, "7065.5"), "");
+        assert_eq!(quiet(Decimal, "1200"), "");
+        // The zeros of an exponent are its scale, not padding.
+        assert_eq!(quiet(Float, "1.500e10"), "");
+    }
+
+    #[test]
+    fn a_uuid_keeps_its_first_group() {
+        use db::ValueKind::{Text, Uuid};
+        assert_eq!(
+            quiet(Uuid, "3f3e0a1b-701b-4eb1-b7be-04a48586d53f"),
+            "-701b-4eb1-b7be-04a48586d53f"
+        );
+        // Not every uuid column holds a uuid — a driver that could not map the
+        // type hands over whatever text the server sent.
+        assert_eq!(quiet(Uuid, "not-a-uuid"), "");
+        assert_eq!(quiet(Text, "3f3e0a1b-701b-4eb1-b7be-04a48586d53f"), "");
     }
 }

@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use crate::value::{format_f64, hex_prefix, Value, ValueKind};
+use crate::value::{byte_size, format_f64, hex_prefix, Value, ValueKind, HEX_IN_CELL};
 
 /// A bitset of null positions. One bit per row rather than an `Option` per
 /// value, which would double the size of an `i64` column for information that
@@ -379,7 +379,11 @@ impl Column {
             ColumnData::Bytes(b) => {
                 scratch.clear();
                 let bytes = b.get(row);
-                let _ = write!(scratch, "\\x{}", hex_prefix(bytes, 12));
+                if bytes.len() <= HEX_IN_CELL {
+                    let _ = write!(scratch, "\\x{}", hex_prefix(bytes, HEX_IN_CELL));
+                } else {
+                    let _ = write!(scratch, "{}", byte_size(bytes.len()));
+                }
                 CellText::Formatted
             }
         }

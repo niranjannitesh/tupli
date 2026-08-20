@@ -274,7 +274,7 @@ async fn every_kind_of_key_reads_back_as_a_grid() {
 
     // Each type is a different set of columns, and that is the whole point:
     // the pane does not have to know what it is looking at, the reader does.
-    let page = |name: &'static str, kind: db_redis::KeyType| async move {
+    let page = |name: &'static str, kind: db::KeyType| async move {
         let key = key(name);
         assert_eq!(
             db_redis::keys::type_of(conn, &key).await.expect("type"),
@@ -283,35 +283,35 @@ async fn every_kind_of_key_reads_back_as_a_grid() {
         db_redis::keys::read(conn, &key, &kind, None, 100).await.expect("read")
     };
 
-    let string = page("string", db_redis::KeyType::String).await;
+    let string = page("string", db::KeyType::String).await;
     assert_eq!(names(&string.rows), ["value"]);
     assert_eq!(cell(&string.rows, 0, 0).as_deref(), Some("hello"));
 
-    let list = page("list", db_redis::KeyType::List).await;
+    let list = page("list", db::KeyType::List).await;
     assert_eq!(names(&list.rows), ["index", "value"]);
     assert_eq!(column_text(&list.rows, 0), vec![Some("0".into()), Some("1".into()), Some("2".into())]);
     assert_eq!(column_text(&list.rows, 1), vec![Some("a".into()), Some("b".into()), Some("c".into())]);
     assert_eq!(list.total, Some(3));
     assert!(list.more.is_none(), "the whole list fitted in one page");
 
-    let set = page("set", db_redis::KeyType::Set).await;
+    let set = page("set", db::KeyType::Set).await;
     assert_eq!(names(&set.rows), ["member"]);
     let mut members = column_text(&set.rows, 0);
     members.sort();
     assert_eq!(members, vec![Some("x".into()), Some("y".into())]);
 
-    let zset = page("zset", db_redis::KeyType::SortedSet).await;
+    let zset = page("zset", db::KeyType::SortedSet).await;
     assert_eq!(names(&zset.rows), ["member", "score"]);
     assert_eq!(column_text(&zset.rows, 0), vec![Some("one".into()), Some("two".into())]);
     // The score is a float column, not the text the server sent: `1.5` and `2`
     // have to sort as numbers.
     assert_eq!(zset.rows.columns[1].value(0), db::Value::Float(1.5));
 
-    let hash = page("hash", db_redis::KeyType::Hash).await;
+    let hash = page("hash", db::KeyType::Hash).await;
     assert_eq!(names(&hash.rows), ["field", "value"]);
     assert_eq!(hash.rows.row_count(), 2);
 
-    let stream = page("stream", db_redis::KeyType::Stream).await;
+    let stream = page("stream", db::KeyType::Stream).await;
     // One column per field name seen in the page; the entry that lacks the
     // other's field gets a null rather than a shifted row.
     assert_eq!(names(&stream.rows), ["id", "a", "b"]);
@@ -321,7 +321,7 @@ async fn every_kind_of_key_reads_back_as_a_grid() {
 
     // And the facts a header bar shows.
     let facts = db_redis::keys::describe(conn, &key("hash")).await.expect("describe").expect("exists");
-    assert_eq!(facts.kind, db_redis::KeyType::Hash);
+    assert_eq!(facts.kind, db::KeyType::Hash);
     assert_eq!(facts.length, Some(2));
     assert_eq!(facts.ttl, None, "no expiry set");
     assert!(facts.encoding.is_some(), "{facts:?}");
@@ -340,14 +340,14 @@ async fn a_list_longer_than_a_page_says_where_it_stopped() {
     }
     fixture.conn.command(&push).await.expect("rpush");
 
-    let first = db_redis::keys::read(&fixture.conn, &key, &db_redis::KeyType::List, None, 10)
+    let first = db_redis::keys::read(&fixture.conn, &key, &db::KeyType::List, None, 10)
         .await
         .expect("read");
     assert_eq!(first.rows.row_count(), 10);
     assert_eq!(first.total, Some(25));
     let more = first.more.expect("there is more");
 
-    let second = db_redis::keys::read(&fixture.conn, &key, &db_redis::KeyType::List, Some(&more), 100)
+    let second = db_redis::keys::read(&fixture.conn, &key, &db::KeyType::List, Some(&more), 100)
         .await
         .expect("read");
     // Picking up where it left off, not starting again.
@@ -375,22 +375,72 @@ async fn the_key_browser_walks_the_keyspace_without_keys() {
     assert!(scan.is_done());
     assert_eq!(scan.seen(), 41);
 
-    let listed = found.iter().find(|info| info.key == fixture.key("s0")).expect("s0");
+    let listed = found.iter().find(|info| &*info.key == fixture.key("s0")).expect("s0");
     assert!(matches!(listed.ttl, Some(ttl) if ttl > 0 && ttl <= 600), "{:?}", listed.ttl);
-    let list = found.iter().find(|info| info.key == fixture.key("list")).expect("list");
-    assert_eq!(list.kind, db_redis::KeyType::List);
+    let list = found.iter().find(|info| &*info.key == fixture.key("list")).expect("list");
+    assert_eq!(list.kind, db::KeyType::List);
 
     // Filtering by type is the server's job where the server can do it.
     let mut lists = db_redis::Scan::new()
         .matching(&pattern)
-        .of_type(&db_redis::KeyType::List);
+        .of_type(&db::KeyType::List);
     let only = lists.take(&fixture.conn, 1000).await.expect("scan");
     assert_eq!(only.len(), 1);
-    assert_eq!(only[0].key, fixture.key("list"));
+    assert_eq!(&*only[0].key, fixture.key("list"));
 
     let rows = db_redis::scan::to_result_set(&found);
     assert_eq!(names(&rows), ["key", "type", "ttl", "size"]);
     assert_eq!(rows.row_count(), 41);
+    fixture.clear().await;
+}
+
+#[tokio::test]
+async fn the_browser_reaches_the_keyspace_through_the_trait_and_not_through_this_crate() {
+    // What the app actually holds is an `Arc<dyn Driver>`, so the browsing
+    // path has to work without naming a single Redis type. If this stops
+    // compiling, the UI has lost the ability to browse a keyspace it does not
+    // know the engine of.
+    let config = server!();
+    let fixture = Fixture::open(config, "trait").await;
+    for n in 0..12u32 {
+        fixture.send(&[b"SET", &fixture.key(&format!("k{n}")), b"v"]).await;
+    }
+    fixture.send(&[b"HSET", &fixture.key("h"), b"field", b"value"]).await;
+
+    let driver: &dyn db::Driver = &fixture.conn;
+    assert!(driver.capabilities().paged_catalog);
+
+    let query = db::KeyQuery {
+        pattern: format!("{}*", fixture.prefix),
+        limit: 500,
+        memory: true,
+        ..Default::default()
+    };
+    let listing = driver.list_keys(&query).await.expect("list");
+    assert_eq!(listing.keys.len(), 13);
+    // The walk finished inside one call, so there is nothing to resume.
+    assert!(listing.more.is_none());
+
+    let hash = fixture.key("h");
+    let facts = driver.describe_key(&hash).await.expect("describe").expect("present");
+    assert_eq!(facts.kind, db::KeyType::Hash);
+    assert_eq!(facts.length, Some(1));
+    assert_eq!(db::format_ttl(facts.ttl), "Forever");
+
+    let page = driver
+        .read_key(&hash, &db::KeyType::Hash, None, 100)
+        .await
+        .expect("read");
+    assert_eq!(names(&page.rows), ["field", "value"]);
+    assert_eq!(page.rows.row_count(), 1);
+
+    // A key that expired between being listed and being clicked is an answer,
+    // not a failure.
+    assert!(driver
+        .describe_key(&fixture.key("gone"))
+        .await
+        .expect("describe")
+        .is_none());
     fixture.clear().await;
 }
 
@@ -488,7 +538,7 @@ async fn a_wrapped_value_survives_the_round_trip_to_the_inspector() {
     db_redis::write::set_field(conn, &blobs, b"gz", &gzipped).await.expect("hset");
     db_redis::write::set_field(conn, &blobs, b"mp", &msgpack).await.expect("hset");
 
-    let page = db_redis::keys::read(conn, &blobs, &db_redis::KeyType::Hash, None, 100)
+    let page = db_redis::keys::read(conn, &blobs, &db::KeyType::Hash, None, 100)
         .await
         .expect("read");
     // One non-text value makes the whole value column binary, so the grid shows
@@ -506,17 +556,17 @@ async fn a_wrapped_value_survives_the_round_trip_to_the_inspector() {
     assert_eq!(bytes("gz"), gzipped);
 
     // What the inspector does with them: sniff, then run the chain.
-    let chain = db_redis::sniff(&bytes("gz"));
-    assert_eq!(chain.first(), Some(&db_redis::Decoder::Gzip));
-    let decoded = db_redis::decode(&bytes("gz"), &chain).expect("decode");
-    assert_eq!(decoded.form, db_redis::Form::Json);
+    let chain = db::sniff(&bytes("gz"));
+    assert_eq!(chain.first(), Some(&db::Decoder::Gzip));
+    let decoded = db::decode(&bytes("gz"), &chain).expect("decode");
+    assert_eq!(decoded.form, db::Form::Json);
     assert!(decoded.text.contains("\"tupli\""), "{}", decoded.text);
 
-    let decoded = db_redis::decode(&bytes("mp"), &[db_redis::Decoder::MsgPack]).expect("decode");
+    let decoded = db::decode(&bytes("mp"), &[db::Decoder::MsgPack]).expect("decode");
     assert!(decoded.text.contains("\"a\""), "{}", decoded.text);
     // And the honest fallback for something that is none of the above.
-    let decoded = db_redis::decode(&[0xff, 0x00], &[]).expect("decode");
-    assert_eq!(decoded.form, db_redis::Form::Hex);
+    let decoded = db::decode(&[0xff, 0x00], &[]).expect("decode");
+    assert_eq!(decoded.form, db::Form::Hex);
     fixture.clear().await;
 }
 

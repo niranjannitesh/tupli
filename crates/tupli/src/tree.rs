@@ -6,7 +6,9 @@
 //! collapsing a branch is "skip while depth is greater", which needs no
 //! bookkeeping at all.
 
-use db::{RelationKind, RelationRef, SchemaSnapshot};
+use std::sync::Arc;
+
+use db::{KeyInfo, KeyType, Keyspace, RelationKind, RelationRef, SchemaSnapshot};
 use gpui::SharedString;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -21,12 +23,50 @@ pub enum NodeKind {
     MaterializedView,
     FunctionGroup,
     Function,
+    /// A logical database of a key-value server — `DB 0`.
+    KeyDatabase,
+    /// A `:`-separated prefix that several keys share. Not a thing on the
+    /// server: the server has a flat namespace and this is the convention
+    /// everybody names keys by, drawn as the folder it is pretending to be.
+    KeyFolder,
+    Key,
 }
 
 impl NodeKind {
     /// Whether double-clicking this row should open a data tab.
     pub fn is_relation(self) -> bool {
         matches!(self, Self::Table | Self::View | Self::MaterializedView)
+    }
+}
+
+/// What a row opens.
+///
+/// Two engines, two kinds of thing to open, one tree. The alternative was a
+/// second tree type with a second sidebar drawing it, which would have been
+/// two copies of filtering, collapsing and keyboard navigation to keep in
+/// step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Relation(RelationRef),
+    /// A key and what it holds. The type comes along because the listing
+    /// already knew it, and asking the server again on the way to opening it
+    /// would be a round trip to learn something nobody had forgotten.
+    Key(Arc<[u8]>, KeyType),
+}
+
+impl Target {
+    pub fn relation(&self) -> Option<&RelationRef> {
+        match self {
+            Self::Relation(reference) => Some(reference),
+            Self::Key(..) => None,
+        }
+    }
+
+    pub fn key(&self) -> Option<(&Arc<[u8]>, &KeyType)> {
+        match self {
+            Self::Key(key, kind) => Some((key, kind)),
+            Self::Relation(_) => None,
+        }
     }
 }
 
@@ -41,7 +81,7 @@ pub struct TreeNode {
     pub expandable: bool,
     /// What to open when the row is activated. `None` for the grouping rows,
     /// which exist only to be collapsed.
-    pub target: Option<RelationRef>,
+    pub target: Option<Target>,
 }
 
 impl TreeNode {
@@ -65,13 +105,25 @@ impl TreeNode {
         self
     }
 
+    fn when_some(mut self, meta: Option<String>) -> Self {
+        if let Some(meta) = meta {
+            self.meta = Some(meta.into());
+        }
+        self
+    }
+
     fn expandable(mut self) -> Self {
         self.expandable = true;
         self
     }
 
     fn target(mut self, target: &RelationRef) -> Self {
-        self.target = Some(target.clone());
+        self.target = Some(Target::Relation(target.clone()));
+        self
+    }
+
+    fn key(mut self, key: &Arc<[u8]>, kind: &KeyType) -> Self {
+        self.target = Some(Target::Key(key.clone(), kind.clone()));
         self
     }
 }
@@ -182,6 +234,150 @@ pub fn from_snapshot(connection: &str, snapshot: &SchemaSnapshot) -> Vec<TreeNod
         node.id = id;
     }
     nodes
+}
+
+/// Build the tree for one connected key-value server.
+///
+/// The shape is a lie that everybody tells: Redis has one flat namespace and
+/// no folders at all, but every keyspace in the world is named `user:1:cart`
+/// and read as though the colons were slashes. So the colons are treated as
+/// slashes here, and the folders are labelled with what is actually under them
+/// rather than with a promise — see [`scanned`].
+///
+/// `complete` is whether the walk that produced `keys` reached the end. It
+/// decides the wording and nothing else: a browser that has seen eight
+/// thousand of ten million keys must not draw a tree that looks like the
+/// keyspace.
+pub fn from_keyspace(
+    connection: &str,
+    version: &str,
+    keyspace: &Keyspace,
+    keys: &[KeyInfo],
+    complete: bool,
+) -> Vec<TreeNode> {
+    let mut nodes = vec![
+        TreeNode::new(0, NodeKind::Connection, connection.to_string())
+            .meta(short_version(version))
+            .expandable(),
+    ];
+
+    for database in &keyspace.databases {
+        let current = database.index == keyspace.current;
+        let mut node = TreeNode::new(1, NodeKind::KeyDatabase, format!("DB {}", database.index))
+            .meta(plural(database.keys as usize, "key", "keys"));
+        // Only the open database has keys to show. Switching to another one
+        // is a `SELECT` on the connection, which is what clicking it does.
+        if current {
+            node = node.expandable();
+        }
+        nodes.push(node);
+        if current {
+            push_keys(&mut nodes, keys, 2);
+        }
+    }
+
+    // A server that would not answer `INFO keyspace`, or one whose databases
+    // are all empty: the connection is open and there is nothing under it, and
+    // a tree with no database in it at all would read as a failure to connect.
+    if keyspace.databases.is_empty() {
+        nodes.push(
+            TreeNode::new(1, NodeKind::KeyDatabase, format!("DB {}", keyspace.current))
+                .meta(scanned(keys.len(), complete))
+                .expandable(),
+        );
+        push_keys(&mut nodes, keys, 2);
+    }
+
+    for (id, node) in nodes.iter_mut().enumerate() {
+        node.id = id;
+    }
+    nodes
+}
+
+/// The keys, folded into folders on their colons.
+///
+/// One pass over a sorted list rather than a trie built and then walked: the
+/// keys are already in the order the tree wants them in, so the only state
+/// needed is what the previous key's path was, and the folders to open are the
+/// segments where the two paths stop agreeing.
+fn push_keys(nodes: &mut Vec<TreeNode>, keys: &[KeyInfo], depth: usize) {
+    let mut rows: Vec<(Vec<&str>, &KeyInfo)> = keys
+        .iter()
+        .map(|info| (segments(&info.key), info))
+        .collect();
+    rows.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.key.cmp(&y.key)));
+
+    // How many keys sit under each folder path, so a folder can say so before
+    // it is opened. Counted first because the row is written before its
+    // children are.
+    let mut counts: std::collections::HashMap<&[&str], usize> = std::collections::HashMap::new();
+    for (path, _) in &rows {
+        for cut in 1..path.len() {
+            *counts.entry(&path[..cut]).or_default() += 1;
+        }
+    }
+
+    let mut open: Vec<&str> = Vec::new();
+    for (path, info) in &rows {
+        let folders = &path[..path.len() - 1];
+        let shared = open.iter().zip(folders).take_while(|(a, b)| a == b).count();
+        open.truncate(shared);
+        for cut in shared..folders.len() {
+            open.push(folders[cut]);
+            nodes.push(
+                TreeNode::new(depth + cut, NodeKind::KeyFolder, folders[cut].to_string())
+                    .meta(plural(
+                        counts.get(&path[..cut + 1]).copied().unwrap_or(0),
+                        "key",
+                        "keys",
+                    ))
+                    .expandable(),
+            );
+        }
+        // The last segment, not the whole key: the folders above it already
+        // spell out the prefix, and a column of `large:pokemon:…` elided in a
+        // narrow panel tells the reader nothing the folder did not.
+        let name = path.last().copied().unwrap_or_default();
+        nodes.push(
+            TreeNode::new(depth + folders.len(), NodeKind::Key, name.to_string())
+                .key(&info.key, &info.kind)
+                .when_some(ttl_meta(info.ttl)),
+        );
+    }
+}
+
+/// A key split on its colons, with empty segments kept.
+///
+/// `user::1` has an empty middle segment and it is a real one — the key is not
+/// `user:1` and must not be drawn as though it were.
+fn segments(key: &[u8]) -> Vec<&str> {
+    // Not `from_utf8_lossy`: the borrow has to outlive this call, and a key
+    // that is not UTF-8 is drawn from its bytes further down rather than
+    // silently regrouped on colons that may be inside a multi-byte character.
+    match std::str::from_utf8(key) {
+        Ok(text) => text.split(':').collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `8,409 keys` or `8,409 scanned` — which one being the whole point.
+///
+/// A scan is a sample and not an inventory, so a count that came out of an
+/// unfinished walk is labelled as how far it got rather than as how many there
+/// are.
+fn scanned(count: usize, complete: bool) -> String {
+    match complete {
+        true => plural(count, "key", "keys"),
+        false => format!("{count} scanned"),
+    }
+}
+
+/// The grey text on a key's row: how long it has left, and nothing when it has
+/// forever. Most keys have no expiry, and a column of `Forever` would be a
+/// column of the word "Forever".
+fn ttl_meta(ttl: Option<i64>) -> Option<String> {
+    ttl.filter(|ttl| *ttl >= 0)
+        .map(|ttl| db::format_ttl(Some(ttl)))
 }
 
 /// Ids of the rows that should start closed.
@@ -355,7 +551,8 @@ mod tests {
     fn relations_carry_the_reference_needed_to_open_them() {
         let nodes = from_snapshot("local", &snapshot());
         let users = nodes.iter().find(|n| n.name == *"users").unwrap();
-        assert_eq!(users.target.as_ref().unwrap().qualified(), "public.users");
+        let reference = users.target.as_ref().unwrap().relation().unwrap();
+        assert_eq!(reference.qualified(), "public.users");
         // Grouping rows are not openable.
         let group = nodes.iter().find(|n| n.name == *"tables").unwrap();
         assert!(group.target.is_none());

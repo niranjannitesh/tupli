@@ -6,10 +6,15 @@
 //! of `async fn`s that the app drives from a Tokio runtime it owns.
 
 pub mod client;
+pub mod driver;
 pub mod introspect;
 pub mod params;
 pub mod types;
 
-pub use client::{Canceller, Outcome, PgConnection, Write, DEFAULT_MAX_ROWS};
+pub use client::{Canceller, PgConnection};
+// Re-exported rather than redefined: these are the app's types, not this
+// crate's, and a caller that has a `PgConnection` should not have to know
+// which crate the `Outcome` it hands back came from.
+pub use db::{Outcome, Write, DEFAULT_MAX_ROWS};
 pub use params::Param;
 pub use types::{kind_for, Decoded};

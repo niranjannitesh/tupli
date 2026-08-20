@@ -874,6 +874,7 @@ impl crate::workspace::Workspace {
         cx.subscribe(&editor, Self::on_structure_event).detach();
         let session = self.session.clone();
         self.pane_mut().tabs.push(crate::workspace::CenterTab {
+            key: None,
             kind: crate::workspace::CenterKind::Structure,
             title: title.into(),
             detail: detail.map(Into::into),

@@ -14,7 +14,7 @@ use ui::{
 };
 
 use crate::session::Activity;
-use crate::tree::NodeKind;
+use crate::tree::{NodeKind, Target, TreeNode};
 use crate::workspace::{day_of, format_duration, now_ms, SidebarTab, Workspace};
 
 impl Workspace {
@@ -208,7 +208,7 @@ impl Workspace {
             let collapsed = keep.is_none() && self.collapsed.contains(&node.id);
 
             let id = node.id;
-            let (icon, mut color) = icon_for(node.kind, cx);
+            let (icon, mut color) = icon_for(node, cx);
             if node.kind == NodeKind::Connection {
                 if let Some(tint) = tint {
                     color = IconColor::Custom(tint);
@@ -248,13 +248,18 @@ impl Workspace {
                     .on_secondary_click(cx.listener(
                         move |this, event: &gpui::ClickEvent, _, cx| {
                             this.selected_node = Some(id);
-                            if let Some(target) = this
+                            // Only a relation has a menu: its verbs are DDL,
+                            // and there is no `rename` or `truncate` to put
+                            // under a key.
+                            if let Some(relation) = this
                                 .tree
                                 .iter()
                                 .find(|node| node.id == id)
-                                .and_then(|node| node.target.clone())
+                                .and_then(|node| node.target.as_ref())
+                                .and_then(Target::relation)
+                                .cloned()
                             {
-                                this.open_object_menu(target, event.position(), cx);
+                                this.open_object_menu(relation, event.position(), cx);
                             }
                             cx.notify();
                         },
@@ -273,7 +278,7 @@ impl Workspace {
                                 this.open_database(&node.name.clone(), cx);
                             }
                             Some(node) => match node.target.clone() {
-                                Some(target) => this.open_relation(&target, cx),
+                                Some(target) => this.open_target(&target, cx),
                                 // A schema or a folder has nothing to open, so
                                 // the click does the only thing it could have
                                 // meant: opens the row. Aiming for the eight
@@ -496,9 +501,30 @@ fn no_matches() -> gpui::AnyElement {
 
 /// Node kind → glyph. Colour carries the category so a long tree can be scanned
 /// without reading: blue for containers, amber for tables, green for views.
-fn icon_for(kind: NodeKind, cx: &Context<Workspace>) -> (IconName, IconColor) {
+///
+/// A key takes its glyph from what it holds rather than from its kind, which is
+/// the one thing a keyspace has instead of a schema: every row is a key, and
+/// the only structure on offer is the difference between a hash and a list.
+/// The colours are the syntax palette's, so they are already six hues a theme
+/// has committed to keeping apart, in a theme that is already showing them next
+/// to each other in the console.
+fn icon_for(node: &TreeNode, cx: &Context<Workspace>) -> (IconName, IconColor) {
     let c = cx.colors();
-    match kind {
+    if let Some((_, kind)) = node.target.as_ref().and_then(Target::key) {
+        let syntax = cx.syntax();
+        return match kind {
+            db::KeyType::String => (IconName::TextA, IconColor::Custom(syntax.string)),
+            db::KeyType::List => (IconName::BulletList, IconColor::Custom(syntax.number)),
+            db::KeyType::Hash => (IconName::BracketsCurly, IconColor::Custom(syntax.keyword)),
+            db::KeyType::Set => (IconName::Layers, IconColor::Custom(syntax.type_name)),
+            db::KeyType::SortedSet => (IconName::SortAsc, IconColor::Custom(syntax.function)),
+            db::KeyType::Stream => (IconName::History, IconColor::Custom(c.info)),
+            // A module type — RedisJSON, a time series, something this build
+            // has never heard of. It is still a key and still has a name.
+            db::KeyType::Other(_) => (IconName::File, IconColor::Muted),
+        };
+    }
+    match node.kind {
         NodeKind::Connection => (IconName::Plug, IconColor::Custom(c.accent)),
         NodeKind::Database => (IconName::Database, IconColor::Custom(c.accent)),
         NodeKind::SchemaGroup | NodeKind::TableGroup | NodeKind::FunctionGroup => {
@@ -509,5 +535,10 @@ fn icon_for(kind: NodeKind, cx: &Context<Workspace>) -> (IconName, IconColor) {
         NodeKind::View => (IconName::Eye, IconColor::Custom(c.success)),
         NodeKind::MaterializedView => (IconName::EyeFilled, IconColor::Custom(c.success)),
         NodeKind::Function => (IconName::BracketsCurly, IconColor::Muted),
+        NodeKind::KeyDatabase => (IconName::Database, IconColor::Custom(c.accent)),
+        NodeKind::KeyFolder => (IconName::Folder, IconColor::Subtle),
+        // A key row with no target: nothing builds one, but the tree is data
+        // and this is the honest glyph for a key nobody can open.
+        NodeKind::Key => (IconName::Key, IconColor::Muted),
     }
 }

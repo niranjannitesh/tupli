@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use db::{
     Cell, ColumnBuilder, ColumnMeta, ConnectionConfig, DbError, DbResult, ErrorClass, Notice,
-    ResultSet, SslMode, Value,
+    Outcome, ResultSet, SslMode, Value, Write,
 };
 use futures::StreamExt as _;
 use postgres_types::{FromSql, Type};
@@ -22,44 +22,6 @@ use tokio_postgres::{Client, Config, Statement};
 
 use crate::params::Param;
 use crate::types::{self, Decoded};
-
-/// Rows fetched in one go before the result is called truncated.
-///
-/// A person cannot read more than this, and the point of a limit is that a
-/// mistyped `select * from events` should not pull 400 million rows into
-/// memory before anyone can react.
-pub const DEFAULT_MAX_ROWS: usize = 50_000;
-
-/// What running a statement produced.
-#[derive(Debug)]
-pub enum Outcome {
-    /// A result set, and whether the fetch stopped early.
-    Rows { rows: ResultSet, truncated: bool },
-    /// A statement that returned no columns: `insert`, `update`, DDL.
-    Affected(u64),
-}
-
-impl Outcome {
-    pub fn row_count(&self) -> usize {
-        match self {
-            Self::Rows { rows, .. } => rows.row_count(),
-            Self::Affected(n) => *n as usize,
-        }
-    }
-}
-
-/// One statement of a transaction, with what it is supposed to touch.
-///
-/// Borrowed rather than owned: these are built from a change set that outlives
-/// the call, and a commit of ten thousand rows should not copy every parameter
-/// to describe itself.
-pub struct Write<'a> {
-    pub sql: &'a str,
-    pub params: &'a [Value],
-    /// Rows this must affect, when that is known. `None` for anything whose
-    /// count is not a claim — DDL, or a statement written by hand.
-    pub expect_rows: Option<u64>,
-}
 
 /// The error for a statement that touched the wrong number of rows. Worded for
 /// the person who pressed Commit, not for a log.

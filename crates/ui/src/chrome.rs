@@ -420,6 +420,7 @@ impl RenderOnce for EmptyState {
 pub struct SectionHeader {
     label: SharedString,
     end: Option<AnyElement>,
+    inset: bool,
 }
 
 impl SectionHeader {
@@ -427,7 +428,16 @@ impl SectionHeader {
         Self {
             label: label.into(),
             end: None,
+            inset: true,
         }
+    }
+
+    /// Drop the inset. The default matches a list, whose rows are inset by the
+    /// same 8px; a form's labels start at the edge, and a heading that does not
+    /// start where they do reads as belonging to something else.
+    pub fn flush(mut self) -> Self {
+        self.inset = false;
+        self
     }
 
     pub fn end_child(mut self, child: impl IntoElement) -> Self {
@@ -443,7 +453,7 @@ impl RenderOnce for SectionHeader {
             .h(px(22.))
             .w_full()
             .flex_none()
-            .px(px(8.))
+            .when(self.inset, |el| el.px(px(8.)))
             .child(
                 Label::new(SharedString::from(self.label.to_uppercase()))
                     .size(LabelSize::Small)

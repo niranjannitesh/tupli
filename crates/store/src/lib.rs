@@ -22,7 +22,7 @@ pub use saved::SavedQuery;
 
 /// The schema version this build expects. [`Store::migrate`] walks
 /// `user_version` up to it, one step per release that changed the schema.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub struct Store {
     db: Connection,
@@ -117,6 +117,17 @@ impl Store {
                  );",
             )?;
         }
+        if version < 2 {
+            // Every connection that existed before there was a choice is a
+            // Postgres one, which is what the default says. A column rather
+            // than a rebuild: `alter table add column` is instant in SQLite
+            // when there is a default, and a rewrite of the connection list is
+            // the one migration nobody would forgive going wrong.
+            self.db.execute_batch(
+                "alter table connections
+                     add column engine text not null default 'postgres';",
+            )?;
+        }
         self.db
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -128,7 +139,8 @@ impl Store {
     pub fn connections(&self) -> Result<Vec<ConnectionConfig>> {
         let mut statement = self.db.prepare(
             "select id, name, grp, host, port, database, username, ssl_mode,
-                    ssl_cert, ssl_key, ssl_root_cert, color, safety, keep_alive
+                    ssl_cert, ssl_key, ssl_root_cert, color, safety, keep_alive,
+                    engine
              from connections
              order by sort_order, name",
         )?;
@@ -148,6 +160,7 @@ impl Store {
                 color: parse_color(&row.get::<_, String>(11)?),
                 safety: parse_safety(&row.get::<_, String>(12)?),
                 keep_alive: row.get(13)?,
+                engine: parse_engine(&row.get::<_, String>(14)?),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -166,15 +179,17 @@ impl Store {
         self.db.execute(
             "insert into connections
                  (id, name, grp, host, port, database, username, ssl_mode,
-                  ssl_cert, ssl_key, ssl_root_cert, color, safety, keep_alive, sort_order)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                  ssl_cert, ssl_key, ssl_root_cert, color, safety, keep_alive, sort_order,
+                  engine)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              on conflict(id) do update set
                  name = excluded.name, grp = excluded.grp, host = excluded.host,
                  port = excluded.port, database = excluded.database,
                  username = excluded.username, ssl_mode = excluded.ssl_mode,
                  ssl_cert = excluded.ssl_cert, ssl_key = excluded.ssl_key,
                  ssl_root_cert = excluded.ssl_root_cert, color = excluded.color,
-                 safety = excluded.safety, keep_alive = excluded.keep_alive",
+                 safety = excluded.safety, keep_alive = excluded.keep_alive,
+                 engine = excluded.engine",
             params![
                 config.id.to_string(),
                 config.name,
@@ -191,6 +206,7 @@ impl Store {
                 safety_name(config.safety),
                 config.keep_alive,
                 next,
+                config.engine.as_str(),
             ],
         )?;
         Ok(())
@@ -257,6 +273,12 @@ impl Store {
 
 fn parse_uuid(text: String) -> Uuid {
     Uuid::parse_str(&text).unwrap_or_else(|_| Uuid::nil())
+}
+
+fn parse_engine(text: &str) -> db::Engine {
+    // An unknown engine is a row from a newer build, not a Redis one. Postgres
+    // is the only thing every version of this file has been able to open.
+    db::Engine::from_str(text).unwrap_or_default()
 }
 
 fn parse_ssl_mode(text: &str) -> SslMode {
@@ -406,6 +428,117 @@ mod tests {
         assert_eq!(parse_ssl_mode("verify-full"), SslMode::VerifyFull);
         // An unknown SSL mode falls back to `require`, never to `disable`.
         assert_eq!(parse_ssl_mode("nonsense"), SslMode::Require);
+    }
+
+    /// The v1 schema, spelled out rather than borrowed from `migrate`.
+    ///
+    /// A copy on purpose: the point of the test is that a file written by the
+    /// *shipped* v1 opens, and a constant shared with the migration would drift
+    /// with it and stop testing anything.
+    const V1_SCHEMA: &str = "create table connections (
+             id            text primary key,
+             name          text not null,
+             grp           text,
+             host          text not null,
+             port          integer not null,
+             database      text not null,
+             username      text not null,
+             ssl_mode      text not null,
+             ssl_cert      text,
+             ssl_key       text,
+             ssl_root_cert text,
+             color         text not null,
+             safety        text not null,
+             keep_alive    integer not null,
+             sort_order    integer not null default 0
+         );
+
+         create table history (
+             id            integer primary key autoincrement,
+             connection_id text,
+             sql           text not null,
+             started_at    integer not null,
+             duration_ms   integer,
+             row_count     integer,
+             error         text
+         );
+         create index history_by_time on history (started_at desc);
+
+         create table saved_queries (
+             id            text primary key,
+             connection_id text,
+             name          text not null,
+             sql           text not null,
+             updated_at    integer not null
+         );
+
+         create table settings (
+             key   text primary key,
+             value text not null
+         );";
+
+    #[test]
+    fn a_v1_file_opens_with_its_connections_intact() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(V1_SCHEMA).unwrap();
+        db.execute(
+            "insert into connections
+                 (id, name, grp, host, port, database, username, ssl_mode,
+                  ssl_cert, ssl_key, ssl_root_cert, color, safety, keep_alive, sort_order)
+             values (?1, 'Production', 'Work', 'db.example.com', 5432, 'app', 'postgres',
+                     'verify-full', null, null, null, 'red', 'read-only', 1, 0)",
+            params![Uuid::nil().to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "insert into history (connection_id, sql, started_at)
+             values (?1, 'select 1', 1700000000000)",
+            params![Uuid::nil().to_string()],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 1).unwrap();
+
+        let store = Store::from_connection(db).unwrap();
+        let loaded = store.connections().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Production");
+        assert_eq!(loaded[0].group.as_deref(), Some("Work"));
+        assert_eq!(loaded[0].safety, SafetyLevel::ReadOnly);
+        assert_eq!(loaded[0].ssl_mode, SslMode::VerifyFull);
+        // The column the migration added: a connection saved before there was
+        // a choice is a Postgres one.
+        assert_eq!(loaded[0].engine, db::Engine::Postgres);
+        // Everything else the file held is still there.
+        assert_eq!(store.recent_queries(10).unwrap().len(), 1);
+
+        // And the upgraded row is writable, which an `alter table` that
+        // half-applied would not be.
+        let mut edited = loaded[0].clone();
+        edited.engine = db::Engine::Redis;
+        store.save_connection(&edited).unwrap();
+        assert_eq!(store.connections().unwrap()[0].engine, db::Engine::Redis);
+    }
+
+    #[test]
+    fn a_migration_that_has_already_run_is_not_run_twice() {
+        // Opening the same file twice is the common case, and `alter table add
+        // column` is not idempotent: a second run would error, which on the
+        // real path means the app refuses to start.
+        let store = Store::in_memory().unwrap();
+        store.save_connection(&config("Production")).unwrap();
+        store.migrate().unwrap();
+        assert_eq!(store.connections().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_engine_survives_a_round_trip() {
+        let store = Store::in_memory().unwrap();
+        let mut redis = config("Cache");
+        redis.engine = db::Engine::Redis;
+        redis.port = 6379;
+        store.save_connection(&redis).unwrap();
+        let loaded = store.connections().unwrap();
+        assert_eq!(loaded[0].engine, db::Engine::Redis);
     }
 
     #[test]

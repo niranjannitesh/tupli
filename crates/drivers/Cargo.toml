@@ -1,0 +1,10 @@
+[package]
+name = "drivers"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+db = { path = "../db" }
+db_pg = { path = "../db_pg" }
+db_redis = { path = "../db_redis" }

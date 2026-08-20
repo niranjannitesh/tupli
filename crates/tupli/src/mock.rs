@@ -105,9 +105,9 @@ pub fn tree() -> Vec<TreeNode> {
             // The real tree hangs a relation off every table and view row, and
             // anything that reads the tree — the palette's object list, most
             // of all — is only exercised if the mock does too.
-            target: kind
-                .is_relation()
-                .then(|| db::RelationRef::new("public", name)),
+            target: kind.is_relation().then(|| {
+                crate::tree::Target::Relation(db::RelationRef::new("public", name))
+            }),
         })
         .collect()
 }

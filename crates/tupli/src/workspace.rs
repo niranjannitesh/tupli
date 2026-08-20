@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
@@ -209,6 +210,11 @@ pub struct Workspace {
     _on_quit: Option<gpui::Subscription>,
     /// A table named by `TUPLI_OPEN`, waiting for the catalog to arrive.
     pending_open: Vec<db::RelationRef>,
+    /// A key named by `TUPLI_KEY`, waiting for the walk to reach it. Not the
+    /// same wait as `pending_open`: a keyspace catalog knows the databases and
+    /// nothing about what is in them, so the key's type — which is what
+    /// decides how to read it — only turns up when the scan does.
+    pending_key: Option<String>,
     /// `TUPLI_PAGE`: the page a browsed table should open on. Applied to the
     /// statement rather than by pressing `›` afterwards, because a second run
     /// issued while the first is still in flight is dropped — see
@@ -248,6 +254,10 @@ pub struct Workspace {
     /// a catalog, and whether to put the preview sheet over it. `None` for the
     /// reference means a table that does not exist yet.
     pending_design: Option<(Option<db::RelationRef>, bool)>,
+    /// `TUPLI_DECODER`: the inspector column whose chain menu to open, once
+    /// there is a row with something decodable in it. Screenshots only, for
+    /// the same reason as [`Self::pending_demo`].
+    pub(crate) pending_decoder: Option<String>,
     /// This window, learned on the first frame. Held so that something
     /// started in another window — editing a connection from Settings — can
     /// bring the window the sheet actually appears in to the front.
@@ -271,6 +281,16 @@ pub struct Workspace {
     /// scroll with no landmarks, and the question a reader has is about one
     /// field.
     pub(crate) expanded_field: Option<usize>,
+    /// A decoder chain somebody chose by hand, by column name.
+    ///
+    /// Per column rather than per cell because a column of MessagePack blobs is
+    /// MessagePack in every row of it, and by name rather than by index so the
+    /// choice survives the next key: every hash in a keyspace has a `value`
+    /// column, and being told twice how to read the same convention is the
+    /// thing a viewer exists to avoid.
+    pub(crate) field_decoders: HashMap<String, Vec<db::Decoder>>,
+    /// The chain menu, while it is up.
+    pub(crate) decoder_menu: Option<crate::inspector::DecoderMenu>,
 
     // ---- objects ---------------------------------------------------------
     /// The context menu, while it is open.
@@ -300,6 +320,14 @@ pub struct Workspace {
 /// The first pane's id. Ids are handed out in order and never reused, so this
 /// one is only ever the pane a window opens with.
 const FIRST_PANE: PaneId = 0;
+
+/// How many keys the browser will walk to before it stops on its own.
+///
+/// Not a page size and not a total — the tree says "scanned" rather than
+/// "keys" for exactly this reason. A keyspace can hold tens of millions of
+/// keys and no tree is a useful way to look at those; past this many, the way
+/// to find a key is to search for it.
+const KEY_BROWSER_LIMIT: usize = 5_000;
 
 /// A pane, wired to the workspace that will hold it.
 ///
@@ -549,6 +577,7 @@ impl Workspace {
             detail: None,
             dirty: false,
             relation: None,
+            key: None,
             saved_query: None,
             sql: String::new(),
             filter: crate::filter::Filter::default(),
@@ -777,6 +806,7 @@ impl Workspace {
                         detail: None,
                         dirty: true,
                         relation: None,
+                        key: None,
                         saved_query: None,
                         // The tab that is showing does not hold its own text; the
                         // console does, and hands it back when the tab is left.
@@ -794,6 +824,7 @@ impl Workspace {
                         detail: Some("public".into()),
                         dirty: false,
                         relation: None,
+                        key: None,
                         saved_query: None,
                         sql: String::new(),
                         filter: crate::filter::Filter::default(),
@@ -907,6 +938,7 @@ impl Workspace {
             _on_quit: None,
             pending_focus: None,
             pending_open: Vec::new(),
+            pending_key: None,
             pending_page: None,
             pending_switch: None,
             pending_after: None,
@@ -915,6 +947,7 @@ impl Workspace {
             pending_follow: false,
             pending_demo: None,
             pending_design: None,
+            pending_decoder: None,
             pending_refresh: false,
 
             menu: None,
@@ -928,6 +961,8 @@ impl Workspace {
 
             inspector_tab: InspectorTab::Row,
             expanded_field: None,
+            field_decoders: HashMap::new(),
+            decoder_menu: None,
         }
     }
 
@@ -1342,6 +1377,7 @@ impl Workspace {
                     detail: None,
                     dirty: false,
                     relation: None,
+                    key: None,
                     saved_query: Some(id),
                     sql: String::new(),
                     filter: crate::filter::Filter::default(),
@@ -1447,19 +1483,21 @@ impl Workspace {
         // back to a table therefore asks again rather than showing another
         // tab's answer under this one's name. A page costs milliseconds; being
         // wrong about which table is on screen costs more than that.
-        let relation = self
+        let showing = self
             .pane()
             .tabs
             .get(index)
-            .filter(|tab| tab.kind == CenterKind::Table)
-            .and_then(|tab| tab.relation.clone());
-        match relation {
-            Some(relation) => self.reload_relation(relation, cx),
+            .map(|tab| (tab.kind, tab.relation.clone(), tab.key.clone()));
+        match showing {
+            Some((CenterKind::Table, Some(relation), _)) => self.reload_relation(relation, cx),
+            // The same rule for a key, which is a browse of something that can
+            // change under you rather more often than a table can.
+            Some((CenterKind::Key, _, Some((key, kind)))) => self.reload_key(key, kind, cx),
             // Nothing is going to refill the grid, so what is in it — and any
             // edit staged against it — belongs to the tab that just left. A
             // script's answers under another script's name, with a Commit
             // button offering to write them, is the confusion this avoids.
-            None => self.clear_results(cx),
+            _ => self.clear_results(cx),
         }
     }
 
@@ -1504,6 +1542,7 @@ impl Workspace {
             detail: None,
             dirty: false,
             relation: None,
+            key: None,
             saved_query: None,
             sql: String::new(),
             filter: crate::filter::Filter::default(),
@@ -1665,7 +1704,16 @@ impl Workspace {
         );
 
         for node in &self.tree {
-            let Some(target) = node.target.clone() else {
+            // Relations only. A keyspace has no fixed list of objects to search
+            // — the tree holds whatever the last scan happened to reach — so a
+            // palette full of keys would be a palette that answers differently
+            // every time it is opened.
+            let Some(target) = node
+                .target
+                .as_ref()
+                .and_then(tree::Target::relation)
+                .cloned()
+            else {
                 continue;
             };
             if !node.kind.is_relation() {
@@ -2247,18 +2295,125 @@ impl Workspace {
             let session = session.read(cx);
             (session.config.display_name(), session.snapshot.clone())
         });
-        let (name, snapshot) = match described {
-            Some((name, snapshot)) => (name, snapshot),
-            None => (String::new(), None),
+        let snapshot = match described {
+            Some((_, snapshot)) => snapshot,
+            None => None,
         };
-        self.tree = match &snapshot {
-            Some(snapshot) => tree::from_snapshot(&name, snapshot),
-            None => Vec::new(),
-        };
+        self.rebuild_tree(cx);
         self.collapsed = tree::initially_collapsed(&self.tree).into_iter().collect();
         self.selected_node = None;
         self.catalog.set(snapshot);
         cx.notify();
+    }
+
+    /// What the connection in front can do.
+    ///
+    /// The one question the UI is allowed to ask about an engine. Everything
+    /// that would otherwise be spelled `is this Redis?` is spelled as a
+    /// capability instead, so a third engine is a row in a table rather than a
+    /// branch in every file. A window with nothing open answers as a SQL
+    /// server, which is what its empty console is.
+    pub(crate) fn capabilities(&self, cx: &App) -> db::Capabilities {
+        match self.session.as_ref() {
+            Some(session) => session.read(cx).config.capabilities(),
+            None => db::Capabilities::POSTGRES,
+        }
+    }
+
+    /// Open the key `TUPLI_KEY` named, once the walk has turned it up.
+    fn open_pending_key(&mut self, session: &Entity<Session>, cx: &mut Context<Self>) {
+        let Some(wanted) = self.pending_key.clone() else {
+            return;
+        };
+        let found = session
+            .read(cx)
+            .keys
+            .iter()
+            .find(|info| &*info.key == wanted.as_bytes())
+            .map(|info| (info.key.clone(), info.kind.clone()));
+        match found {
+            Some((key, kind)) => {
+                self.pending_key = None;
+                self.open_key(key, kind, cx);
+            }
+            // Still walking. A pattern the whole keyspace does not contain
+            // simply never opens, and the warning is the log's job.
+            None if session.read(cx).keys_complete => {
+                log::warn!("TUPLI_KEY={wanted:?} is not in this database");
+                self.pending_key = None;
+            }
+            None => {}
+        }
+    }
+
+    /// Whether the key browser has all of the keyspace it is going to get.
+    ///
+    /// A keyspace arrives in two stages — the databases, then the keys — and
+    /// anything waiting for "the tree is drawn" has to wait for the second
+    /// one. Always true on a server with a schema, which has no second stage.
+    pub fn keys_settled(&self, cx: &App) -> bool {
+        let Some(session) = self.session.as_ref().map(|session| session.read(cx)) else {
+            return true;
+        };
+        if session.keyspace.is_none() {
+            return true;
+        }
+        let walked = session.keys_complete || session.keys.len() >= KEY_BROWSER_LIMIT;
+        // And the key that was asked for is not only found but read: its rows
+        // arrive a round trip after the walk that named it.
+        let read = match self.pane().active().and_then(|tab| tab.key.clone()) {
+            Some((key, _)) => session
+                .last_key
+                .as_ref()
+                .is_some_and(|view| view.key == key),
+            None => true,
+        };
+        walked && self.pending_key.is_none() && read
+    }
+
+    /// Carry the keyspace walk on, up to [`KEY_BROWSER_LIMIT`].
+    ///
+    /// A page at a time and always one more page than has landed, so the tree
+    /// fills in while it is being looked at rather than after a pause nobody
+    /// asked for. It stops at a limit because a browser is not a dump: past a
+    /// few thousand rows the tree has stopped being something a person reads
+    /// and the answer is a pattern, not more scrolling.
+    fn scan_more_keys(&mut self, session: &Entity<Session>, cx: &mut Context<Self>) {
+        let wanted = {
+            let session = session.read(cx);
+            session.keyspace.is_some()
+                && !session.keys_complete
+                && session.keys.len() < KEY_BROWSER_LIMIT
+        };
+        if wanted {
+            session.update(cx, |session, cx| session.scan_keys("*", cx));
+        }
+    }
+
+    /// Redraw the sidebar tree from whatever the window's session is holding.
+    ///
+    /// There are two kinds of catalog — a schema and a keyspace — and this is
+    /// the only place that knows it. Everything that needs a tree asks for one
+    /// rather than deciding which builder to call, so adding a third kind of
+    /// server is a third arm here and no branches anywhere else.
+    fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            self.tree = Vec::new();
+            return;
+        };
+        let session = session.read(cx);
+        let name = session.config.display_name();
+        self.tree = match (&session.snapshot, &session.keyspace) {
+            (Some(snapshot), _) => tree::from_snapshot(&name, snapshot),
+            (None, Some(keyspace)) => tree::from_keyspace(
+                &name,
+                &session.server_version(),
+                keyspace,
+                &session.keys,
+                session.keys_complete,
+            ),
+            (None, None) => Vec::new(),
+        };
     }
 
     /// The titlebar's switcher: every database on this server, the open one
@@ -2451,6 +2606,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Open whatever a tree row points at.
+    ///
+    /// The one place that knows both kinds of target, so that everything which
+    /// merely *has* one — a click, the palette, a restored session — can hand
+    /// it over without asking which engine it came from.
+    pub fn open_target(&mut self, target: &tree::Target, cx: &mut Context<Self>) {
+        match target {
+            tree::Target::Relation(relation) => self.open_relation(relation, cx),
+            tree::Target::Key(key, kind) => self.open_key(key.clone(), kind.clone(), cx),
+        }
+    }
+
     /// Open a table for browsing: a new centre tab and the first page of rows.
     ///
     /// The statement is a plain `select * … limit n` rather than a cursor
@@ -2507,6 +2674,7 @@ impl Workspace {
                     detail: Some(detail),
                     dirty: false,
                     relation: Some(relation.clone()),
+                    key: None,
                     saved_query: None,
                     sql: String::new(),
                     filter: filter.unwrap_or_default(),
@@ -2519,6 +2687,64 @@ impl Workspace {
             }
         }
         self.save_session(cx);
+    }
+
+    /// Open a key for browsing: a tab named after it, and its contents.
+    ///
+    /// The tab is found by the key rather than by its title, because the tree
+    /// shows a key by its last `:` segment and two prefixes can end in the same
+    /// word. A table can be found by name; a key is its bytes.
+    pub fn open_key(&mut self, key: Arc<[u8]>, kind: db::KeyType, cx: &mut Context<Self>) {
+        self.dock_open = true;
+        let title: SharedString = db::key_text(&key).into();
+        let detail: SharedString = kind.label().to_string().into();
+
+        match self
+            .pane()
+            .tabs
+            .iter()
+            .position(|tab| tab.key.as_ref().is_some_and(|(open, _)| *open == key))
+        {
+            Some(index) => {
+                // The type is taken from the listing again rather than kept:
+                // `DEL` and `SET` on the same name make a key that used to be a
+                // list into a string, and reading it as what it was would be an
+                // error the server is right to give.
+                self.pane_mut().tabs[index].key = Some((key, kind));
+                self.show_tab(index, cx);
+            }
+            None => {
+                let session = self.session.clone();
+                self.pane_mut().tabs.push(CenterTab {
+                    kind: CenterKind::Key,
+                    title,
+                    detail: Some(detail),
+                    dirty: false,
+                    relation: None,
+                    key: Some((key, kind)),
+                    saved_query: None,
+                    sql: String::new(),
+                    filter: crate::filter::Filter::default(),
+                    page: None,
+                    structure: None,
+                    session,
+                    reconnect: None,
+                });
+                self.show_tab(self.pane().tabs.len() - 1, cx);
+            }
+        }
+        self.save_session(cx);
+    }
+
+    /// Ask for a key's contents again — on opening its tab, and on coming back
+    /// to it. Not [`Workspace::run`]: there is no statement, so there is
+    /// nothing to put in the console, nothing to log, and nothing to time.
+    fn reload_key(&mut self, key: Arc<[u8]>, kind: db::KeyType, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        self.running_pane = Some(self.active_pane);
+        session.update(cx, |session, cx| session.open_key(key, kind, cx));
     }
 
     /// A table tab with nothing behind it: named, pointed at a relation, never
@@ -2542,6 +2768,7 @@ impl Workspace {
             detail: Some(detail),
             dirty: false,
             relation: Some(relation.clone()),
+            key: None,
             saved_query: None,
             sql: String::new(),
             filter: crate::filter::Filter::default(),
@@ -3252,14 +3479,8 @@ impl Workspace {
                     cx.notify();
                     return;
                 }
-                let (name, snapshot) = {
-                    let session = session.read(cx);
-                    (session.config.display_name(), session.snapshot.clone())
-                };
-                self.tree = match &snapshot {
-                    Some(snapshot) => tree::from_snapshot(&name, snapshot),
-                    None => Vec::new(),
-                };
+                let snapshot = session.read(cx).snapshot.clone();
+                self.rebuild_tree(cx);
                 self.collapsed = tree::initially_collapsed(&self.tree).into_iter().collect();
                 self.selected_node = None;
                 // And the consoles complete against the catalog they can now
@@ -3267,6 +3488,10 @@ impl Workspace {
                 // to re-install: one write reaches every one of them, including
                 // the panes that are not on screen.
                 self.catalog.set(snapshot.clone());
+                // A keyspace catalog is only the databases and how full they
+                // are, so the browser is still empty at this point: the keys
+                // themselves are a walk, and this is where it starts.
+                self.scan_more_keys(&session, cx);
                 // A tab that was moved to this database asks it for the table
                 // it was on. `reload_relation` decides whether that is a
                 // statement or a notice.
@@ -3391,7 +3616,69 @@ impl Workspace {
             }
             SessionEvent::Finished => self.absorb_run(session, cx),
             SessionEvent::Applied => self.absorb_apply(session, cx),
+            SessionEvent::KeysChanged => {
+                // Only the tree, and only what is expanded is left alone: a
+                // walk lands over and over as it goes, and a sidebar that
+                // collapsed itself every few hundred keys would be unusable
+                // for exactly as long as the scan is interesting.
+                if self.session.as_ref() == Some(&session) {
+                    self.rebuild_tree(cx);
+                    cx.notify();
+                }
+                self.scan_more_keys(&session, cx);
+                self.open_pending_key(&session, cx);
+            }
+            SessionEvent::KeyOpened => self.absorb_key(session, cx),
         }
+    }
+
+    /// Move an opened key's contents into the pane that asked for it.
+    ///
+    /// [`Workspace::absorb_run`] without the half that is about statements —
+    /// no `sql`, no elapsed time, no message log entry — because a key was
+    /// clicked, not typed. What is left is the same: rows into the grid, and
+    /// only if the pane is still looking at the connection they came from.
+    fn absorb_key(&mut self, session: Entity<Session>, cx: &mut Context<Self>) {
+        let Some((rows, error)) = session.update(cx, |session, _| {
+            session
+                .last_key
+                .as_mut()
+                .map(|view| (view.rows.take(), view.error.clone()))
+        }) else {
+            return;
+        };
+        let target = self.running_pane.take().unwrap_or(self.active_pane);
+        let elsewhere = self
+            .pane_by(target)
+            .and_then(|pane| pane.active())
+            .and_then(|tab| tab.session.clone())
+            .is_some_and(|showing| showing != session);
+        if elsewhere {
+            return;
+        }
+        let Some(pane) = self.pane_by_mut(target) else {
+            return;
+        };
+        pane.error = error;
+        pane.elapsed = None;
+        pane.affected = None;
+        pane.last_sql = None;
+        pane.truncated = false;
+        pane.results.clear();
+        pane.result_index = 0;
+        pane.unsorted = None;
+        let arrived = rows.map(|rows| {
+            pane.row_count = rows.row_count();
+            pane.selected_row = (pane.row_count > 0).then_some(0);
+            pane.selected_column = 0;
+            (pane.grid.clone(), Arc::new(rows))
+        });
+        if let Some((grid, rows)) = arrived {
+            grid.update(cx, |grid, cx| grid.set_data_arc(rows, cx));
+        }
+        // A key is never editable through the grid — there is no transaction to
+        // stage an edit into — so nothing here asks whether it is.
+        cx.notify();
     }
 
     /// Move a finished commit into the window.
@@ -3828,6 +4115,11 @@ impl Workspace {
                 }
             }
         }
+        // `TUPLI_KEY=user:1:profile` opens that key once the walk has found
+        // it, which is the keyspace's answer to `TUPLI_OPEN`.
+        if let Ok(key) = std::env::var("TUPLI_KEY") {
+            self.pending_key = Some(key);
+        }
         if let Ok(database) = std::env::var("TUPLI_SWITCH") {
             self.pending_switch = Some(database);
         }
@@ -3903,6 +4195,9 @@ impl Workspace {
                 None if spec == "new" => self.pending_design = Some((None, preview)),
                 None => log::warn!("TUPLI_DESIGN={spec:?} is not schema.table or `new`"),
             }
+        }
+        if let Ok(column) = std::env::var("TUPLI_DECODER") {
+            self.pending_decoder = Some(column);
         }
         if let Ok(spec) = std::env::var("TUPLI_CONNECT") {
             match db::ConnectionConfig::from_spec(&spec) {
@@ -4596,6 +4891,7 @@ impl Render for Workspace {
             .children(self.render_row_menu(cx))
             .children(self.render_database_menu(cx))
             .children(self.render_filter_menu(cx))
+            .children(self.render_decoder_menu(cx))
     }
 }
 

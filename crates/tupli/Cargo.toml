@@ -36,7 +36,7 @@ gpui_tokio.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
-db_pg = { path = "../db_pg" }
+drivers = { path = "../drivers" }
 store = { path = "../store" }
 uuid = { workspace = true, features = ["v4"] }
 time.workspace = true

@@ -275,6 +275,11 @@ impl PaneSnapshot<'_> {
         self.tabs
             .iter()
             .enumerate()
+            // A key tab is not put back. A key can expire between quitting and
+            // launching — that is what a TTL is — and a tab reopening onto
+            // nothing would be the app remembering something that stopped
+            // being true. A table is still there tomorrow; a key is a guess.
+            .filter(|(_, tab)| tab.kind != CenterKind::Key)
             .map(|(ix, tab)| Tab::from_center_tab(tab, self.sources.get(ix).cloned().flatten()))
             .collect()
     }
@@ -351,6 +356,9 @@ impl Tab {
                 CenterKind::Query => "query",
                 CenterKind::Table => "table",
                 CenterKind::Structure => "structure",
+                // Filtered out before this by `tabs_to_save`; a query tab is
+                // the harmless answer if one ever gets here.
+                CenterKind::Key => "query",
             }
             .to_string(),
             title: tab.title.to_string(),
@@ -373,6 +381,7 @@ impl Tab {
             _ => None,
         };
         CenterTab {
+            key: None,
             // An unknown word is a tab kind from a build this one is older
             // than. It becomes a query tab, which is the kind that needs
             // nothing but its text to be useful.
@@ -440,6 +449,7 @@ mod tests {
             detail: None,
             dirty: true,
             relation: None,
+            key: None,
             saved_query: None,
             sql: sql.to_string(),
             filter: crate::filter::Filter::default(),
@@ -469,6 +479,7 @@ mod tests {
             detail: Some("public".into()),
             dirty: false,
             relation: Some(db::RelationRef::new("public", "users")),
+            key: None,
             saved_query: None,
             sql: String::new(),
             filter: crate::filter::Filter::default(),

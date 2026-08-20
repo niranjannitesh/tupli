@@ -18,10 +18,10 @@
 //! cancelled. That is the whole mechanism, and it is why paging is a method on
 //! a struct rather than a stream this crate drives itself.
 
-use db::{ColumnMeta, DbResult, ResultSet, ValueKind};
+use db::{ColumnMeta, DbResult, KeyInfo, KeyType, ResultSet, ValueKind};
 
 use crate::client::RedisConnection;
-use crate::keys::{scan_reply, KeyType};
+use crate::keys::scan_reply;
 use crate::resp::RespValue;
 use crate::rows;
 
@@ -31,18 +31,6 @@ use crate::rows;
 /// a round trip for each handful. This is a page of a browser at a time.
 pub const DEFAULT_COUNT: usize = 500;
 
-/// One key, as the browser lists it.
-#[derive(Clone, Debug)]
-pub struct KeyInfo {
-    pub key: Vec<u8>,
-    pub kind: KeyType,
-    /// Seconds until this expires. `None` means it does not.
-    pub ttl: Option<i64>,
-    /// Bytes, as `MEMORY USAGE` estimates them — `None` on a server that does
-    /// not have the command.
-    pub memory: Option<u64>,
-}
-
 /// A walk of the keyspace, resumable and stoppable.
 pub struct Scan {
     cursor: u64,
@@ -51,12 +39,11 @@ pub struct Scan {
     count: usize,
     done: bool,
     seen: usize,
-    /// Whether `MEMORY USAGE` is worth sending. Cleared for good the first
-    /// time the server refuses it.
+    /// Whether this walk wants sizes at all. Separate from whether the server
+    /// has `MEMORY USAGE` — that is [`RedisConnection::has_memory_usage`], a
+    /// fact about the server that outlives any one walk, while this is a
+    /// caller saying it is only drawing names.
     memory: bool,
-    /// Whether the server understands `SCAN … TYPE`, which arrived in 6.0.
-    /// Cleared the same way, after which the filtering happens here.
-    server_side_type: bool,
 }
 
 impl Default for Scan {
@@ -75,8 +62,22 @@ impl Scan {
             done: false,
             seen: 0,
             memory: true,
-            server_side_type: true,
         }
+    }
+
+    /// Resume a walk at a cursor an earlier page handed back.
+    ///
+    /// A cursor is only meaningful to the server that issued it, and a stale
+    /// one is not an error — the server restarts the walk somewhere valid. So
+    /// nothing here validates it; there is nothing to validate it against.
+    pub fn resume(mut self, cursor: u64) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Where the next page starts, or `None` when the walk has finished.
+    pub fn position(&self) -> Option<u64> {
+        (!self.done).then_some(self.cursor)
     }
 
     /// Only keys matching a glob — `user:*`, `session:??`.
@@ -164,7 +165,7 @@ impl Scan {
             args.push(b"MATCH".to_vec());
             args.push(pattern.clone());
         }
-        if let (Some(kind), true) = (&self.kind, self.server_side_type) {
+        if let (Some(kind), true) = (&self.kind, conn.has_scan_type()) {
             args.push(b"TYPE".to_vec());
             args.push(kind.clone().into_bytes());
         }
@@ -174,8 +175,8 @@ impl Scan {
             // `SCAN … TYPE` is a 6.0 command. An older server calls it a
             // syntax error, and the filtering moves here — the keys still all
             // cross the wire, but the browser shows the right ones.
-            Err(error) if self.server_side_type && self.kind.is_some() => {
-                self.server_side_type = false;
+            Err(error) if conn.has_scan_type() && self.kind.is_some() => {
+                conn.without_scan_type();
                 log::debug!("SCAN TYPE refused ({:?}); filtering client-side", error.class);
                 return Box::pin(self.walk(conn)).await;
             }
@@ -199,7 +200,8 @@ impl Scan {
         conn: &RedisConnection,
         found: Vec<Vec<u8>>,
     ) -> DbResult<Vec<KeyInfo>> {
-        let per_key = if self.memory { 3 } else { 2 };
+        let want_memory = self.memory && conn.has_memory_usage();
+        let per_key = if want_memory { 3 } else { 2 };
         let batch = |memory: bool| {
             let mut batch = Vec::with_capacity(found.len() * 3);
             for key in &found {
@@ -211,13 +213,13 @@ impl Scan {
             }
             batch
         };
-        let (replies, per_key) = match conn.pipeline(&batch(self.memory)).await {
+        let (replies, per_key) = match conn.pipeline(&batch(want_memory)).await {
             Ok(replies) => (replies, per_key),
             // `MEMORY USAGE` is missing before 4.0 and disabled on some
             // hosted Redises. One refusal fails the whole pipeline, so it is
             // dropped for the rest of this walk rather than retried per page.
-            Err(error) if self.memory => {
-                self.memory = false;
+            Err(error) if want_memory => {
+                conn.without_memory_usage();
                 log::debug!("MEMORY USAGE refused ({:?}); listing without sizes", error.class);
                 (conn.pipeline(&batch(false)).await?, 2)
             }
@@ -237,7 +239,7 @@ impl Scan {
             else {
                 continue;
             };
-            if !self.server_side_type {
+            if !conn.has_scan_type() {
                 if let Some(wanted) = &self.kind {
                     if kind.as_str() != wanted {
                         continue;
@@ -245,7 +247,7 @@ impl Scan {
                 }
             }
             keys.push(KeyInfo {
-                key,
+                key: key.into(),
                 kind,
                 // -1 is "no expiry" and -2 is "no key"; neither is a duration.
                 ttl: replies
@@ -265,7 +267,7 @@ impl Scan {
 
 /// A listing as the grid draws it.
 pub fn to_result_set(keys: &[KeyInfo]) -> ResultSet {
-    let names: Vec<_> = keys.iter().map(|key| Some(key.key.as_slice())).collect();
+    let names: Vec<_> = keys.iter().map(|key| Some(&*key.key)).collect();
     ResultSet::new(vec![
         rows::bytes_column("key", &names),
         rows::text_column(
@@ -347,13 +349,13 @@ mod tests {
     fn a_listing_has_a_column_per_thing_the_browser_shows() {
         let keys = vec![
             KeyInfo {
-                key: b"user:1".to_vec(),
+                key: b"user:1".to_vec().into(),
                 kind: KeyType::Hash,
                 ttl: Some(60),
                 memory: Some(120),
             },
             KeyInfo {
-                key: b"queue".to_vec(),
+                key: b"queue".to_vec().into(),
                 kind: KeyType::List,
                 ttl: None,
                 memory: None,

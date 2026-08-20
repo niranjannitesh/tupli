@@ -6,7 +6,7 @@
 //! every serious editor converged on.
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, Context, ElementId, IntoElement, ParentElement,
+    div, prelude::*, px, relative, AnyElement, App, Context, ElementId, IntoElement, ParentElement,
     Pixels, SharedString, Window,
 };
 use ui::{
@@ -30,8 +30,20 @@ impl Workspace {
         !self.panes.is_empty()
             && self.panes.iter().all(|pane| {
                 pane.active()
-                    .is_some_and(|tab| tab.kind == CenterKind::Table)
+                    .is_some_and(|tab| matches!(tab.kind, CenterKind::Table | CenterKind::Key))
             })
+    }
+
+    /// Which results tab is showing, which is not always the one that was
+    /// picked: Structure and DDL are not offered on a connection with no
+    /// schema, and a tab left on one of them by the last connection would
+    /// otherwise draw a pane that is not in the strip above it.
+    fn results_tab(&self, cx: &App) -> ResultsTab {
+        let tab = self.pane().results_tab;
+        match (tab, self.capabilities(cx).is_sql()) {
+            (ResultsTab::Structure | ResultsTab::Ddl, false) => ResultsTab::Data,
+            (tab, _) => tab,
+        }
     }
 
     /// The centre stack has given its whole height to the dock.
@@ -318,6 +330,7 @@ impl Workspace {
                     CenterKind::Query => (IconName::Code, IconColor::Accent),
                     CenterKind::Table => (IconName::Table, IconColor::Custom(c.warning)),
                     CenterKind::Structure => (IconName::Columns, IconColor::Muted),
+                    CenterKind::Key => (IconName::Key, IconColor::Custom(c.info)),
                 };
                 Tab::new(pane_id("center-tab", id, i), tab.title.clone())
                     .icon(icon)
@@ -657,7 +670,7 @@ impl Workspace {
             }
             _ => (SharedString::from("Result"), None),
         };
-        let tab = self.pane().results_tab;
+        let tab = self.results_tab(cx);
         // Messages carries a count once there is anything in it, because the
         // whole point of the tab is that you can ignore it until you cannot.
         let message_count = self.messages.len();
@@ -703,24 +716,29 @@ impl Workspace {
                 })
                 .collect(),
         };
-        tabs.push(
-            Tab::new("results-structure", "Structure")
-                .icon(IconName::Columns)
-                .active(tab == ResultsTab::Structure)
-                .on_click(
-                    cx.listener(|this, _, _, cx| {
+        // Structure and DDL are about a table: a list of columns with their
+        // types, and the `create table` that would make them. A keyspace has
+        // neither, and a tab that could only ever be empty is worse than one
+        // that is not there. Asked of the connection rather than of the tab,
+        // because a console on a Redis connection has no DDL either.
+        if self.capabilities(cx).is_sql() {
+            tabs.push(
+                Tab::new("results-structure", "Structure")
+                    .icon(IconName::Columns)
+                    .active(tab == ResultsTab::Structure)
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.select_results_tab(ResultsTab::Structure, cx)
-                    }),
-                ),
-        );
-        tabs.push(
-            Tab::new("results-ddl", "DDL")
-                .icon(IconName::Code)
-                .active(tab == ResultsTab::Ddl)
-                .on_click(
-                    cx.listener(|this, _, _, cx| this.select_results_tab(ResultsTab::Ddl, cx)),
-                ),
-        );
+                    })),
+            );
+            tabs.push(
+                Tab::new("results-ddl", "DDL")
+                    .icon(IconName::Code)
+                    .active(tab == ResultsTab::Ddl)
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.select_results_tab(ResultsTab::Ddl, cx)),
+                    ),
+            );
+        }
         tabs.push(
             Tab::new("results-messages", "Messages")
                 .icon(IconName::Terminal)
@@ -766,7 +784,7 @@ impl Workspace {
         let error = self.pane().error.clone();
 
         let tabs = self.results_tabs(collapsed, cx);
-        let tab = self.pane().results_tab;
+        let tab = self.results_tab(cx);
         // The statement a result came from, shown under the strip when a script
         // produced several and the tab is only called "Result 3".
         let shown_sql = (self.pane().results.len() > 1)
@@ -954,6 +972,73 @@ impl Workspace {
     /// are for the ninety per cent — one column, one operator, one value, and
     /// nothing to get syntactically wrong — and the funnel hands over to a
     /// plain `where` box for the rest, carrying the chips' SQL across so the
+    /// The facts bar over a key's contents: what it is, how long it has left,
+    /// how it is stored, how big it is.
+    ///
+    /// `None` for anything that is not a key tab, which is what puts the
+    /// filter bar back. Every fact is optional on purpose — a server that
+    /// refuses `MEMORY USAGE` still has a TTL and an encoding, and the honest
+    /// answer to a question the server would not answer is to leave the label
+    /// out rather than to print a zero.
+    fn render_key_facts(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (key, kind) = self
+            .pane()
+            .active()
+            .filter(|tab| tab.kind == CenterKind::Key)
+            .and_then(|tab| tab.key.clone())?;
+        let c = cx.colors().clone();
+        let ty = cx.typography().clone();
+        // The facts belong to the key that was opened, which is not this tab
+        // when a second tab has been opened since. Nothing is shown then
+        // rather than another key's TTL under this key's name.
+        let facts = self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx))
+            .and_then(|session| session.last_key.as_ref())
+            .filter(|view| view.key == key)
+            .and_then(|view| view.facts.clone());
+
+        let mut pairs: Vec<(SharedString, SharedString)> =
+            vec![("Type".into(), kind.label().to_string().into())];
+        if let Some(facts) = &facts {
+            pairs.push(("TTL".into(), db::format_ttl(facts.ttl).into()));
+            if let Some(encoding) = &facts.encoding {
+                pairs.push(("Encoding".into(), encoding.to_string().into()));
+            }
+            if let Some(memory) = facts.memory {
+                pairs.push((
+                    "Memory".into(),
+                    db::value::byte_size(memory as usize).into(),
+                ));
+            }
+            if let Some(length) = facts.length {
+                pairs.push((length_label(&kind).into(), thousands(length as usize).into()));
+            }
+        }
+
+        Some(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(14.))
+                .children(pairs.into_iter().map(|(name, value)| {
+                    h_flex()
+                        .flex_none()
+                        .gap(px(5.))
+                        .child(Label::new(name).size(LabelSize::Small).color(IconColor::Subtle))
+                        .child(
+                            div()
+                                .font(ty.mono_font())
+                                .text_size(ty.ui_size_sm)
+                                .text_color(c.text)
+                                .child(value),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// hard case starts from the easy one instead of from an empty field.
     fn render_filter_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let c = cx.colors().clone();
@@ -1190,6 +1275,10 @@ impl Workspace {
             .pane()
             .active()
             .is_some_and(|tab| tab.filter.is_active());
+        let keyed = self
+            .pane()
+            .active()
+            .is_some_and(|tab| tab.kind == CenterKind::Key);
 
         v_flex()
             .flex_1()
@@ -1198,19 +1287,30 @@ impl Workspace {
                 Toolbar::new("results-toolbar")
                     .transparent()
                     .borderless()
-                    .start_child(
-                        // The funnel switches between the two ways of saying
-                        // the same thing. It carries the accent when a filter
-                        // is in force, because the row of chips can be scrolled
-                        // out of sight and "why are there only nine rows" needs
-                        // an answer that is always visible.
-                        Button::icon("results-filter", IconName::Filter)
-                            .size(ButtonSize::XSmall)
-                            .tooltip(Tooltip::text("Filter Rows"))
-                            .selected(filtering)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(cx))),
-                    )
-                    .center_child(self.render_filter_bar(cx))
+                    // Nothing to filter on a key: its rows are what the key
+                    // holds, not a `select` this app wrote, and there is no
+                    // clause to add to a `HGETALL`.
+                    .when(!keyed, |bar| {
+                        bar.start_child(
+                            // The funnel switches between the two ways of
+                            // saying the same thing. It carries the accent when
+                            // a filter is in force, because the row of chips can
+                            // be scrolled out of sight and "why are there only
+                            // nine rows" needs an answer that is always visible.
+                            Button::icon("results-filter", IconName::Filter)
+                                .size(ButtonSize::XSmall)
+                                .tooltip(Tooltip::text("Filter Rows"))
+                                .selected(filtering)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(cx))),
+                        )
+                    })
+                    // A key's facts stand where a table's filter does: it is
+                    // the same question — "what am I looking at" — and a key
+                    // answers it with a TTL rather than with a `where`.
+                    .center_child(match self.render_key_facts(cx) {
+                        Some(facts) => facts,
+                        None => self.render_filter_bar(cx),
+                    })
                     .end_child(
                         Button::icon("row-add", IconName::Plus)
                             .size(ButtonSize::XSmall)
@@ -1334,4 +1434,17 @@ fn seam_id(path: &[usize], index: usize) -> ElementId {
     }
     name.push_str(&format!("-at-{index}"));
     SharedString::from(name).into()
+}
+
+/// What a key's length counts, in that key's own words. `LLEN` and `HLEN` are
+/// both "how many", but a hash has fields and a list has items, and the label
+/// is the cheapest place to say which one is on screen.
+fn length_label(kind: &db::KeyType) -> &'static str {
+    match kind {
+        db::KeyType::Hash => "Fields",
+        db::KeyType::List => "Items",
+        db::KeyType::Set | db::KeyType::SortedSet => "Members",
+        db::KeyType::Stream => "Entries",
+        db::KeyType::String | db::KeyType::Other(_) => "Length",
+    }
 }

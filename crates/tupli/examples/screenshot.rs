@@ -88,7 +88,11 @@ fn main() {
                 let ready = cx.update(|cx| {
                     window
                         .read(cx)
-                        .map(|workspace| workspace.is_connected(cx) && !workspace.tree.is_empty())
+                        .map(|workspace| {
+                            workspace.is_connected(cx)
+                                && !workspace.tree.is_empty()
+                                && workspace.keys_settled(cx)
+                        })
                         .unwrap_or(false)
                 });
                 // A browsed table needs its rows too, and those arrive on a

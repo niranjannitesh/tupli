@@ -15,7 +15,7 @@
 //! form that validates the shape of a hostname tells you nothing, and the only
 //! question anyone has when filling this in is whether it works.
 
-use db::{ConnectionColor, ConnectionConfig, SafetyLevel, SslMode};
+use db::{ConnectionColor, ConnectionConfig, Engine, SafetyLevel, SslMode};
 use gpui::{
     div, point, prelude::*, px, size, App, Bounds, Context, Entity, FocusHandle, Focusable,
     IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Subscription,
@@ -383,6 +383,7 @@ pub struct ConnectionForm {
     /// "unchanged" from "cleared".
     password_edited: bool,
 
+    engine: Engine,
     ssl: SslMode,
     color: ConnectionColor,
     safety: SafetyLevel,
@@ -415,9 +416,14 @@ impl ConnectionForm {
 
         let name = field(&config.name, "Production", cx);
         let host = field(&config.host, "localhost", cx);
-        let port = field(&config.port.to_string(), "5432", cx);
-        let database = field(&config.database, "postgres", cx);
-        let user = field(&config.user, &whoami_or_postgres(), cx);
+        let port = field(
+            &config.port.to_string(),
+            &config.engine.default_port().to_string(),
+            cx,
+        );
+        let (database_hint, user_hint) = engine_placeholder(config.engine);
+        let database = field(&config.database, &database_hint, cx);
+        let user = field(&config.user, &user_hint, cx);
         let password = cx.new(|cx| {
             Input::new(cx)
                 .size(InputSize::Medium)
@@ -449,6 +455,7 @@ impl ConnectionForm {
         );
 
         Self {
+            engine: config.engine,
             ssl: config.ssl_mode,
             color: config.color,
             safety: config.safety,
@@ -482,7 +489,9 @@ impl ConnectionForm {
             } else {
                 host
             },
-            port: text(&self.port).parse().unwrap_or(5432),
+            port: text(&self.port)
+                .parse()
+                .unwrap_or_else(|_| self.engine.default_port()),
             database: text(&self.database),
             user: text(&self.user),
             ssl_mode: self.ssl,
@@ -492,7 +501,37 @@ impl ConnectionForm {
             color: self.color,
             safety: self.safety,
             keep_alive: self.base.keep_alive,
+            engine: self.engine,
         }
+    }
+
+    /// Switching engines carries the port with it, but only a port nobody
+    /// chose: a typed 55432 is a tunnel, and moving it would be an edit the
+    /// person did not make.
+    fn set_engine(&mut self, engine: Engine, cx: &mut Context<Self>) {
+        if engine == self.engine {
+            return;
+        }
+        let port = self.port.read(cx).text(cx);
+        if port.trim().parse() == Ok(self.engine.default_port()) {
+            let next = engine.default_port().to_string();
+            self.port.update(cx, |input, cx| input.set_text(&next, cx));
+        }
+        for (input, text) in [
+            (&self.database, engine_placeholder(engine).0),
+            (&self.user, engine_placeholder(engine).1),
+            (&self.port, engine.default_port().to_string()),
+        ] {
+            input.update(cx, |input, cx| input.set_placeholder(text, cx));
+        }
+        // Same rule as the port: a TLS mode nobody chose follows the engine,
+        // and one somebody chose does not move in either direction.
+        if self.ssl == self.engine.default_ssl_mode() {
+            self.ssl = engine.default_ssl_mode();
+        }
+        self.engine = engine;
+        self.test = Test::Untried;
+        cx.notify();
     }
 
     /// `None` means "leave the Keychain alone".
@@ -520,16 +559,18 @@ impl ConnectionForm {
                 Some(password) => Some(password),
                 None => store::secrets::password(config.id).ok().flatten(),
             };
-            let connection = db_pg::PgConnection::connect(&config, password.as_deref()).await?;
-            let version = connection.scalar("select version()").await?;
-            Ok::<_, db::DbError>(version)
+            // Through the registry, so that testing a Redis connection tests
+            // Redis. The version comes off the handshake every driver already
+            // does, which is why this asks the server nothing further.
+            let connection = drivers::connect(&config, password.as_deref()).await?;
+            Ok::<_, db::DbError>(version_label(config.engine, &connection.server_version()))
         });
 
         cx.spawn(async move |this, cx| {
             let outcome = work.await;
             this.update(cx, |this, cx| {
                 this.test = match outcome {
-                    Ok(Ok(version)) => Test::Reached(short_version(&version).into()),
+                    Ok(Ok(version)) => Test::Reached(version.into()),
                     Ok(Err(error)) => Test::Failed(error.message.to_string().into()),
                     Err(error) => Test::Failed(error.to_string().into()),
                 };
@@ -548,6 +589,7 @@ impl Render for ConnectionForm {
         let problems = config.problems();
         let ssl = self.ssl;
         let safety = self.safety;
+        let engine = self.engine;
         let color = self.color;
 
         v_flex()
@@ -558,11 +600,33 @@ impl Render for ConnectionForm {
                 } else {
                     "New connection"
                 })
+                .flush()
                 .end_child(
                     Label::new(config.endpoint())
                         .size(LabelSize::Small)
                         .color(IconColor::Subtle),
                 ),
+            )
+            .child(
+                FormRow::new("Engine")
+                    .child(
+                        Segmented::new("engine", Engine::ALL.map(|engine| engine.label()))
+                            .selected(
+                                Engine::ALL
+                                    .iter()
+                                    .position(|e| *e == engine)
+                                    .unwrap_or_default(),
+                            )
+                            .on_select({
+                                let form = cx.entity();
+                                move |index, _, cx| {
+                                    form.update(cx, |this, cx| {
+                                        this.set_engine(Engine::ALL[index], cx)
+                                    });
+                                }
+                            }),
+                    )
+                    .hint(engine_hint(engine)),
             )
             .child(FormRow::new("Name").child(self.name.clone()))
             .child(
@@ -678,6 +742,24 @@ impl Render for ConnectionForm {
 
 /// One line about what the chosen mode actually promises, because the libpq
 /// names are famously misleading — `require` encrypts but verifies nothing.
+/// What the `Database` and `User` fields fall back to, which is not the same
+/// question on both engines: one is asking for a name, the other for an index.
+fn engine_placeholder(engine: Engine) -> (String, String) {
+    match engine {
+        Engine::Postgres => ("postgres".into(), whoami_or_postgres()),
+        // Redis numbers its databases from zero, and the user it ships with is
+        // literally called `default`.
+        Engine::Redis => ("0".into(), "default".into()),
+    }
+}
+
+fn engine_hint(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "Tables, a SQL editor, and editable results.",
+        Engine::Redis => "Keys by pattern, and a command line instead of SQL.",
+    }
+}
+
 fn ssl_hint(mode: SslMode) -> &'static str {
     match mode {
         SslMode::Disable => "No encryption. Only for a server on this machine.",
@@ -688,14 +770,18 @@ fn ssl_hint(mode: SslMode) -> &'static str {
     }
 }
 
-/// `PostgreSQL 16.4 (Homebrew) on aarch64-apple-darwin…` → the first six words.
-/// The full banner is three lines of build flags nobody asked for.
-fn short_version(banner: &str) -> String {
-    banner
-        .split_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// `PostgreSQL 16.4` — what the driver said, named.
+///
+/// The drivers report a bare number (`16.4 (Homebrew)`, `7.2.4`) because the
+/// status bar already knows which connection it is showing. Here nobody does:
+/// this line is the answer to "did it reach the thing I chose", so it says
+/// which thing. The trailing build details are dropped — three lines of
+/// compiler flags is not a version.
+fn version_label(engine: Engine, version: &str) -> String {
+    match version.split_whitespace().next() {
+        Some(number) => format!("{} {number}", engine.label()),
+        None => engine.label().to_string(),
+    }
 }
 
 fn whoami_or_postgres() -> String {

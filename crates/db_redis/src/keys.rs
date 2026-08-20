@@ -11,10 +11,10 @@
 //! interchangeable: the ordered types (list, sorted set, stream) can be asked
 //! for a range, and the unordered ones (hash, set) can only be walked with a
 //! cursor, in an order the server picks and does not promise to keep. So
-//! [`Position`] has a variant per method rather than pretending to one
+//! [`Cursor`] has a variant per method rather than pretending to one
 //! universal offset that would quietly mean three different things.
 
-use db::{ColumnMeta, DbResult, ResultSet, ValueKind};
+use db::{ColumnMeta, Cursor, DbResult, KeyFacts, KeyPage, KeyType, ResultSet, ValueKind};
 
 use crate::client::{argv, RedisConnection};
 use crate::resp::RespValue;
@@ -35,97 +35,6 @@ type Fields = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 /// would stall the connection every other pane shares, so a long value arrives
 /// as its first megabyte and says so.
 pub const MAX_STRING: u64 = 1024 * 1024;
-
-/// What kind of value a key holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KeyType {
-    String,
-    List,
-    Set,
-    SortedSet,
-    Hash,
-    Stream,
-    /// A type from a module — `ReJSON-RL`, `TSDB-TYPE`. Named rather than
-    /// swallowed, so the pane can say what it cannot read instead of showing
-    /// an empty table.
-    Other(String),
-}
-
-impl KeyType {
-    /// The word `TYPE` answers with. `none` — the key is gone — is `None`
-    /// here, because a key that does not exist has no type rather than a type
-    /// called "none".
-    pub fn parse(reply: &str) -> Option<Self> {
-        Some(match reply {
-            "none" | "" => return None,
-            "string" => Self::String,
-            "list" => Self::List,
-            "set" => Self::Set,
-            "zset" => Self::SortedSet,
-            "hash" => Self::Hash,
-            "stream" => Self::Stream,
-            other => Self::Other(other.to_string()),
-        })
-    }
-
-    /// The word Redis uses, for a badge in the tree and for `SCAN … TYPE`.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::String => "string",
-            Self::List => "list",
-            Self::Set => "set",
-            Self::SortedSet => "zset",
-            Self::Hash => "hash",
-            Self::Stream => "stream",
-            Self::Other(name) => name,
-        }
-    }
-
-    /// Whether this crate can read it.
-    pub fn is_readable(&self) -> bool {
-        !matches!(self, Self::Other(_))
-    }
-}
-
-/// Where the next page starts, in whichever terms this type can be paged by.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Position {
-    /// A `SCAN` cursor — hashes and sets. Opaque, and only meaningful to the
-    /// server that issued it.
-    Cursor(u64),
-    /// An element index — lists and sorted sets.
-    Index(u64),
-    /// A stream id, already written exclusively (`(1712-0`).
-    Id(String),
-}
-
-/// One page of a key's contents.
-pub struct KeyPage {
-    pub rows: ResultSet,
-    /// How many elements the key holds in total, when the server can say
-    /// cheaply. A cursor-paged type reports its total but cannot promise the
-    /// page count adds up to it — the keyspace can change underneath a scan.
-    pub total: Option<u64>,
-    /// Where to resume, or `None` when this was the last page.
-    pub more: Option<Position>,
-}
-
-/// What the header of the value pane shows: what the key is, how big, how
-/// long it has left.
-#[derive(Debug)]
-pub struct KeyFacts {
-    pub kind: KeyType,
-    /// Seconds until expiry. `None` means no expiry set.
-    pub ttl: Option<i64>,
-    /// `OBJECT ENCODING` — `listpack`, `hashtable`, `intset`. Worth showing:
-    /// it is the difference between a hash that costs 100 bytes and one that
-    /// costs 100 kilobytes.
-    pub encoding: Option<String>,
-    /// `MEMORY USAGE`, when the server has it.
-    pub memory: Option<u64>,
-    /// Elements, or bytes for a string.
-    pub length: Option<u64>,
-}
 
 /// What kind of value this key holds, or `None` if it does not exist.
 pub async fn type_of(conn: &RedisConnection, key: &[u8]) -> DbResult<Option<KeyType>> {
@@ -177,7 +86,7 @@ pub async fn describe(conn: &RedisConnection, key: &[u8]) -> DbResult<Option<Key
 
 /// Read a page of a key's contents.
 ///
-/// `from` is a [`Position`] this function handed back; `None` starts at the
+/// `from` is a [`Cursor`] this function handed back; `None` starts at the
 /// beginning. A `from` of the wrong variant for the type is treated as the
 /// beginning rather than as an error — it can only come from a key that
 /// changed type under a pane that was already open, which is a refresh, not a
@@ -186,7 +95,7 @@ pub async fn read(
     conn: &RedisConnection,
     key: &[u8],
     kind: &KeyType,
-    from: Option<&Position>,
+    from: Option<&Cursor>,
     limit: usize,
 ) -> DbResult<KeyPage> {
     let limit = limit.max(1);
@@ -243,7 +152,7 @@ async fn read_list(
     let values = scalars(&reply);
     let indices: Vec<_> = (0..values.len()).map(|n| Some(start as i64 + n as i64)).collect();
     let next = start + values.len() as u64;
-    let more = (next < total).then_some(Position::Index(next));
+    let more = (next < total).then_some(Cursor::Index(next));
     Ok(KeyPage {
         rows: ResultSet::new(vec![
             rows::int_column(ColumnMeta::new("index", ValueKind::Int, "integer"), indices),
@@ -283,7 +192,7 @@ async fn read_sorted_set(
         })
         .collect();
     let next = start + pairs.len() as u64;
-    let more = (next < total).then_some(Position::Index(next));
+    let more = (next < total).then_some(Cursor::Index(next));
     Ok(KeyPage {
         rows: ResultSet::new(vec![
             rows::nullable_value_column("member", &members),
@@ -331,7 +240,7 @@ async fn read_hash(
             rows::nullable_value_column("value", &values),
         ]),
         total: Some(total),
-        more: next.map(Position::Cursor),
+        more: next.map(Cursor::Walk),
     })
 }
 
@@ -361,7 +270,7 @@ async fn read_set(
     Ok(KeyPage {
         rows: ResultSet::new(vec![rows::nullable_value_column("member", &scalars(&reply))]),
         total: Some(total),
-        more: next.map(Position::Cursor),
+        more: next.map(Cursor::Walk),
     })
 }
 
@@ -374,12 +283,12 @@ async fn read_set(
 async fn read_stream(
     conn: &RedisConnection,
     key: &[u8],
-    from: Option<&Position>,
+    from: Option<&Cursor>,
     limit: usize,
 ) -> DbResult<KeyPage> {
     let total = conn.number(&argv([b"XLEN", key])).await? as u64;
     let start = match from {
-        Some(Position::Id(id)) => id.clone(),
+        Some(Cursor::Id(id)) => id.clone(),
         _ => "-".to_string(),
     };
     let reply = conn
@@ -426,7 +335,7 @@ async fn read_stream(
             .last()
             .and_then(|id| id.as_deref())
             .and_then(|id| std::str::from_utf8(id).ok())
-            .map(|id| Position::Id(format!("({id}"))),
+            .map(|id| Cursor::Id(format!("({id}"))),
         false => None,
     };
 
@@ -466,16 +375,16 @@ fn length_command(kind: &KeyType, key: &[u8]) -> Option<Vec<Vec<u8>>> {
     })
 }
 
-fn index(from: Option<&Position>) -> u64 {
+fn index(from: Option<&Cursor>) -> u64 {
     match from {
-        Some(Position::Index(index)) => *index,
+        Some(Cursor::Index(index)) => *index,
         _ => 0,
     }
 }
 
-fn cursor(from: Option<&Position>) -> u64 {
+fn cursor(from: Option<&Cursor>) -> u64 {
     match from {
-        Some(Position::Cursor(cursor)) => *cursor,
+        Some(Cursor::Walk(cursor)) => *cursor,
         _ => 0,
     }
 }

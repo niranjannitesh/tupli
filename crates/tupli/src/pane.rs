@@ -243,6 +243,8 @@ pub enum CenterKind {
     Table,
     /// A table's structure editor.
     Structure,
+    /// One key of a key-value server, opened for browsing.
+    Key,
 }
 
 /// A chip in the middle of being written.
@@ -266,6 +268,11 @@ pub struct CenterTab {
     /// that filled the grid, and re-parsing the title to get there would be a
     /// guess.
     pub relation: Option<db::RelationRef>,
+    /// The key this tab is browsing, and what it holds. The counterpart of
+    /// `relation` for a server whose objects are keys: refresh and paging both
+    /// need to re-read it, and the type comes along because it is what decides
+    /// the reader — deriving it again from the name is a `TYPE` per refresh.
+    pub key: Option<(std::sync::Arc<[u8]>, db::KeyType)>,
     /// The saved query this tab is editing, once it is editing one. ⌘S writes
     /// straight back to it; a tab with no id has to be named first.
     pub saved_query: Option<uuid::Uuid>,

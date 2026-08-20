@@ -54,6 +54,15 @@ pub struct RedisConnection {
     /// Set the first time a command fails for a connection reason, so the app
     /// can offer to reconnect rather than sending into a dead socket.
     closed: AtomicBool,
+    /// Whether this server has the two commands the browser would like but can
+    /// live without. Facts about the server rather than about any one walk,
+    /// which is why they are here: a hosted Redis with `MEMORY USAGE` disabled
+    /// refuses it every time, and rediscovering that once per page would cost
+    /// a failed pipeline per page for the life of the connection.
+    memory_usage: AtomicBool,
+    /// `SCAN … TYPE` arrived in 6.0. Where it is missing the filtering happens
+    /// client-side, which costs bandwidth and not correctness.
+    scan_type: AtomicBool,
 }
 
 impl RedisConnection {
@@ -89,6 +98,8 @@ impl RedisConnection {
             server_version: "".into(),
             resp3,
             closed: AtomicBool::new(false),
+            memory_usage: AtomicBool::new(true),
+            scan_type: AtomicBool::new(true),
         };
         let info = connection.text(&argv([b"INFO", b"server"])).await?;
         Ok(Self {
@@ -115,6 +126,25 @@ impl RedisConnection {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    /// Whether `MEMORY USAGE` is worth sending. Cleared for good the first
+    /// time the server refuses it.
+    pub fn has_memory_usage(&self) -> bool {
+        self.memory_usage.load(Ordering::Relaxed)
+    }
+
+    pub fn without_memory_usage(&self) {
+        self.memory_usage.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether `SCAN … TYPE` is understood here.
+    pub fn has_scan_type(&self) -> bool {
+        self.scan_type.load(Ordering::Relaxed)
+    }
+
+    pub fn without_scan_type(&self) {
+        self.scan_type.store(false, Ordering::Relaxed);
     }
 
     pub fn is_read_only(&self) -> bool {

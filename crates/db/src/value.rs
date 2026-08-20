@@ -167,6 +167,25 @@ pub fn hex_prefix(bytes: &[u8], n: usize) -> String {
     s
 }
 
+/// `4.2 KB`, in whichever unit keeps it to a couple of digits.
+pub fn byte_size(len: usize) -> String {
+    match len {
+        len if len < 1024 => format!("{len} B"),
+        len if len < 1024 * 1024 => format!("{:.1} KB", len as f32 / 1024.),
+        len => format!("{:.1} MB", len as f32 / (1024. * 1024.)),
+    }
+}
+
+/// How much of a `bytea` is worth showing as hex in a cell one line tall.
+///
+/// Eight bytes is a hash prefix, a flag word, an id — things that are read as
+/// hex and fit. Past that, the hex is a truncated dump of something the cell
+/// cannot show anyway: `\x89504E470D0A1A0A…` is the same sixteen characters for
+/// every PNG in the column, so it distinguishes nothing and costs the width of
+/// the column. The size does distinguish them, and the inspector still has the
+/// bytes.
+pub const HEX_IN_CELL: usize = 8;
+
 /// A `float4` as the `f64` that prints the way the server prints it.
 ///
 /// `3.4e38::float4` is stored as the nearest `f32`, and widening that to `f64`
