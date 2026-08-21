@@ -11,7 +11,7 @@ description = "A fast, native, keyboard-driven database client for macOS."
 # goes through scripts/bundle.sh. See docs/ICON_INTEGRATION.md.
 [package.metadata.bundle]
 name = "Tupli"
-identifier = "com.anuvaya.tupli"
+identifier = "dev.theux.tupli"
 icon = ["../../assets/app-icon-ribbon/production.icns"]
 category = "public.app-category.developer-tools"
 short_description = "A fast, native database client for macOS."

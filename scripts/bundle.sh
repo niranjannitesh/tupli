@@ -19,7 +19,7 @@
 #
 # Environment:
 #   TUPLI_CHANNEL        same as --channel; the flag wins
-#   TUPLI_BUNDLE_PREFIX  reverse-DNS namespace (default: com.anuvaya)
+#   TUPLI_BUNDLE_PREFIX  reverse-DNS namespace (default: dev.theux)
 #   TUPLI_APP_NAME       override the channel's display name
 #   TUPLI_SIGN_IDENTITY  code-signing identity (default: Tupli Development,
 #                        created by scripts/dev-identity.sh; falls back to ad hoc)
@@ -63,7 +63,7 @@ case $channel in
 esac
 app_name=${TUPLI_APP_NAME:-$app_name}
 
-prefix=${TUPLI_BUNDLE_PREFIX:-com.anuvaya}
+prefix=${TUPLI_BUNDLE_PREFIX:-dev.theux}
 identifier="$prefix.tupli$id_suffix"
 
 icon_src="$root/assets/app-icon-ribbon/$channel.icns"
