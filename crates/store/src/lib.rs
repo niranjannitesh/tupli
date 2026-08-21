@@ -17,12 +17,12 @@ use db::{ConnectionColor, ConnectionConfig, SafetyLevel, SslMode};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-pub use history::HistoryEntry;
+pub use history::{Finished, HistoryEntry, Kind as HistoryKind, Outcome};
 pub use saved::SavedQuery;
 
 /// The schema version this build expects. [`Store::migrate`] walks
 /// `user_version` up to it, one step per release that changed the schema.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub struct Store {
     db: Connection,
@@ -126,6 +126,26 @@ impl Store {
             self.db.execute_batch(
                 "alter table connections
                      add column engine text not null default 'postgres';",
+            )?;
+        }
+        if version < 3 {
+            // The Messages tab used to keep its own log in memory, with three
+            // facts this table had nowhere to put. One record of what was run
+            // is worth more than two that disagree, so the columns come here
+            // and the tab goes.
+            //
+            // `affected` beside `row_count` rather than folded into it: a
+            // statement that changed three rows and one that returned three
+            // are different statements, and a log that spells both "3 rows" is
+            // one nobody can read backwards.
+            self.db.execute_batch(
+                "alter table history add column affected integer;
+                 alter table history add column notices  text;
+                 alter table history add column outcome  text not null default 'ok';
+                 alter table history add column kind     text not null default 'statement';
+                 -- The rows already here know how they turned out; they were
+                 -- only ever asked in the other direction.
+                 update history set outcome = 'failed' where error is not null;",
             )?;
         }
         self.db
@@ -496,6 +516,12 @@ mod tests {
             params![Uuid::nil().to_string()],
         )
         .unwrap();
+        db.execute(
+            "insert into history (connection_id, sql, started_at, error)
+             values (?1, 'select oops', 1700000001000, 'no such column')",
+            params![Uuid::nil().to_string()],
+        )
+        .unwrap();
         db.pragma_update(None, "user_version", 1).unwrap();
 
         let store = Store::from_connection(db).unwrap();
@@ -509,7 +535,13 @@ mod tests {
         // a choice is a Postgres one.
         assert_eq!(loaded[0].engine, db::Engine::Postgres);
         // Everything else the file held is still there.
-        assert_eq!(store.recent_queries(10).unwrap().len(), 1);
+        let history = store.recent_queries(10).unwrap();
+        assert_eq!(history.len(), 2);
+        // A row written before there was an outcome column still knows how it
+        // turned out; it was only ever asked in the other direction.
+        assert_eq!(history[0].outcome, crate::Outcome::Failed);
+        assert_eq!(history[1].outcome, crate::Outcome::Ok);
+        assert_eq!(history[1].kind, crate::HistoryKind::Statement);
 
         // And the upgraded row is writable, which an `alter table` that
         // half-applied would not be.

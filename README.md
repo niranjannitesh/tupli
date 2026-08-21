@@ -84,7 +84,11 @@ is writable at all.
 
 **SQL** — tree-sitter-backed editor with syntax highlighting, completion for schemas,
 tables and columns, statement-under-cursor detection, formatting, run (`⌘↵`) or run-all
-(`⌘⇧↵`), cancellation (`⌘.`), messages and timing per statement.
+(`⌘⇧↵`), cancellation (`⌘.`), and timing per statement.
+
+**History** — one durable record of everything the app did: statements, commits, imports
+and exports alike, with how long each took, what the server said on the side, and its own
+words when it refused. Grouped by day, filterable down to just this window.
 
 **Structure & DDL** — column, index, constraint and trigger lists; a structure editor that
 stages changes and shows the `alter table` before it sends it; generated `CREATE`
@@ -204,7 +208,7 @@ everything above the drivers is written against it. Adding an engine is a varian
 ## Developing
 
 ```sh
-cargo test --workspace          # 602 tests
+cargo test --workspace          # 609 tests
 cargo build --workspace --examples
 ```
 

@@ -10,12 +10,13 @@ use std::time::Duration;
 use gpui::{div, prelude::*, px, Context, IntoElement, ParentElement, Window};
 use ui::{
     region, v_flex, ActiveTheme, Button, ButtonSize, ButtonVariant, Disclosure, EmptyState,
-    IconColor, IconName, Label, LabelSize, ListItem, SectionHeader, Tab, TabBar, Toolbar, Tooltip,
+    IconColor, IconName, Label, LabelSize, ListItem, SectionHeader, Segmented, Tab, TabBar,
+    Toolbar, Tooltip,
 };
 
 use crate::session::Activity;
 use crate::tree::{NodeKind, Target, TreeNode};
-use crate::workspace::{day_of, format_duration, now_ms, SidebarTab, Workspace};
+use crate::workspace::{day_of, format_duration, now_ms, HistoryScope, SidebarTab, Workspace};
 
 impl Workspace {
     pub(crate) fn render_sidebar(
@@ -87,6 +88,12 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_schema(cx))),
                     ),
             )
+            // The scope switch sits above the scroll rather than in it: it is
+            // what decides the list, and a control that scrolls away with the
+            // list it governs is one nobody finds twice.
+            .when(tab == SidebarTab::History, |panel| {
+                panel.child(self.render_history_scope(cx))
+            })
             .child(
                 v_flex()
                     .id("sidebar-body")
@@ -397,6 +404,42 @@ impl Workspace {
         rows
     }
 
+    /// The scope switch above the History list.
+    ///
+    /// The log is durable and shared between windows, which is the whole
+    /// reason it is worth keeping and also the reason "what have I just been
+    /// doing" got hard to see in it once commits, imports and exports moved in
+    /// beside the statements. Everything is the default, because a window that
+    /// has run nothing yet would otherwise open on an empty list and look
+    /// broken.
+    fn render_history_scope(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(6.))
+            .border_b_1()
+            .border_color(cx.colors().border)
+            .child(
+                Segmented::new("history-scope", ["Everything", "This window"])
+                    .no_wrap()
+                    .selected(match self.history_scope {
+                        HistoryScope::Everything => 0,
+                        HistoryScope::ThisWindow => 1,
+                    })
+                    .on_select({
+                        let workspace = cx.entity();
+                        move |index, _, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.history_scope = match index {
+                                    0 => HistoryScope::Everything,
+                                    _ => HistoryScope::ThisWindow,
+                                };
+                                cx.notify();
+                            });
+                        }
+                    }),
+            )
+    }
+
     /// The History tab.
     ///
     /// Grouped by day, newest first, because "what did I run this morning" is
@@ -405,25 +448,47 @@ impl Workspace {
     fn render_history(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let c = cx.colors().clone();
 
-        if self.history.is_empty() {
+        let shown: Vec<&store::HistoryEntry> = self
+            .history
+            .iter()
+            .filter(|entry| match self.history_scope {
+                HistoryScope::Everything => true,
+                HistoryScope::ThisWindow => self.history_mine.contains(&entry.id),
+            })
+            .collect();
+
+        if shown.is_empty() {
+            let (title, description) = match self.history_scope {
+                HistoryScope::ThisWindow => (
+                    "Nothing yet in this window",
+                    "Statements, commits, imports and exports show up here as you make them.",
+                ),
+                HistoryScope::Everything => (
+                    "No history yet",
+                    "Every statement you run is recorded here, along with every commit, import and export.",
+                ),
+            };
             return vec![div()
                 .p(px(12.))
                 // The scrolling body sizes to its content, so the state cannot
                 // fill the panel and centre in it; this is the gap that keeps
                 // it from sitting directly under the filter field instead.
                 .pt(px(56.))
-                .child(
-                    EmptyState::new(IconName::History, "No history yet")
-                        .description("Every statement you run is recorded here."),
-                )
+                .child(EmptyState::new(IconName::History, title).description(description))
                 .into_any_element()];
         }
 
+        // Only worth saying which connection a row belongs to when the list
+        // holds more than one — which it does exactly when no tab is open, and
+        // then it is the only thing telling two identical statements apart.
+        let connections: HashSet<_> = shown.iter().map(|entry| entry.connection).collect();
+        let name_them = connections.len() > 1;
+
         let today = day_of(now_ms());
-        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.history.len() + 4);
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(shown.len() + 4);
         let mut current_day = None;
 
-        for (i, entry) in self.history.iter().enumerate() {
+        for (i, entry) in shown.iter().enumerate() {
             let day = day_of(entry.started_at);
             if current_day != Some(day) {
                 current_day = Some(day);
@@ -438,22 +503,22 @@ impl Workspace {
                 );
             }
 
-            let ok = entry.succeeded();
+            // A statement still in flight has no outcome to draw yet, and a
+            // clock is the difference between one that is taking a while and
+            // one that came back instantly.
+            let (icon, tint) = match (entry.pending(), entry.outcome) {
+                (true, _) => (IconName::Clock, c.text_muted),
+                (_, store::Outcome::Ok) => (IconName::CircleCheck, c.success),
+                (_, store::Outcome::Failed) => (IconName::CircleXmark, c.danger),
+                (_, store::Outcome::Canceled) => (IconName::Ban, c.warning),
+            };
             let sql = entry.sql.clone();
             rows.push(
                 ListItem::new(("history", i), entry.one_line())
                     .mono()
                     .height(px(26.))
-                    .icon(if ok {
-                        IconName::CircleCheck
-                    } else {
-                        IconName::CircleXmark
-                    })
-                    .icon_color(if ok {
-                        IconColor::Custom(c.success)
-                    } else {
-                        IconColor::Custom(c.danger)
-                    })
+                    .icon(icon)
+                    .icon_color(IconColor::Custom(tint))
                     // An em dash for a statement that never reported back, so a
                     // hung query is visibly different from an instant one.
                     .meta(match entry.duration_ms {
@@ -463,8 +528,75 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, _, cx| this.load_sql(&sql, cx)))
                     .into_any_element(),
             );
+
+            // Under the row rather than beside it: what a failure said and
+            // what the server volunteered are both about the statement above
+            // them, and a log of either detached from what provoked it is
+            // unreadable.
+            rows.extend(self.render_history_aside(entry, name_them, cx));
         }
         rows
+    }
+
+    /// The second line, when there is one: which connection, what went wrong,
+    /// and anything the server said on the side.
+    fn render_history_aside(
+        &self,
+        entry: &store::HistoryEntry,
+        name_connection: bool,
+        cx: &Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let c = cx.colors().clone();
+        let mut lines: Vec<gpui::AnyElement> = Vec::new();
+
+        if name_connection {
+            let name = entry
+                .connection
+                .and_then(|id| self.connections.iter().find(|config| config.id == id))
+                .map(|config| config.name.clone())
+                .unwrap_or_else(|| "unsaved".to_string());
+            lines.push(
+                Label::new(name)
+                    .size(LabelSize::Small)
+                    .color(IconColor::Subtle)
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = entry.error.as_deref() {
+            lines.push(
+                Label::new(error.to_string())
+                    .size(LabelSize::Small)
+                    .color(IconColor::Custom(c.danger))
+                    .wrap()
+                    .into_any_element(),
+            );
+        }
+        // The severity is the server's own word for it, which is worth more
+        // than a rank this app would have had to invent.
+        lines.extend(entry.notices.iter().map(|notice| {
+            Label::new(notice.clone())
+                .size(LabelSize::Small)
+                .color(match notice.starts_with("WARNING") {
+                    true => IconColor::Custom(c.warning),
+                    false => IconColor::Muted,
+                })
+                .wrap()
+                .into_any_element()
+        }));
+
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        vec![v_flex()
+            .w_full()
+            .gap(px(1.))
+            .pb(px(4.))
+            // Indented to where the row above starts its text, so the aside
+            // hangs off the statement rather than starting a new column.
+            .pl(px(28.))
+            .pr(px(10.))
+            .children(lines)
+            .into_any_element()]
     }
 }
 

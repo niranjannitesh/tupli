@@ -443,7 +443,7 @@ impl Workspace {
             // about encodings for a file that opens fine everywhere else.
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(error) => {
-                self.report_import(format!("{}: {error}", file_name(&path)), false, cx);
+                self.report_import(format!("{}: {error}", file_name(&path)), cx);
                 return;
             }
         };
@@ -530,22 +530,18 @@ impl Workspace {
         self.import_target(cx).is_some()
     }
 
-    fn report_import(&mut self, text: String, ok: bool, cx: &mut Context<Self>) {
-        use crate::results::{MessageTone, RunMessage};
-        self.messages.push(RunMessage {
-            at_ms: crate::workspace::now_ms(),
-            sql: "import".into(),
-            elapsed: std::time::Duration::ZERO,
-            tone: match ok {
-                true => MessageTone::Ok,
-                false => MessageTone::Failed,
-            },
-            text: text.into(),
-            notices: Vec::new(),
-        });
-        if !ok {
-            self.select_results_tab(crate::results::ResultsTab::Messages, cx);
-        }
+    /// An import that never reached the server — a file that would not read,
+    /// a table whose columns would not match. The ones that did reach it are
+    /// recorded by the commit that carried them, so this only ever has bad
+    /// news, and the log is where the file name survives being dismissed.
+    fn report_import(&mut self, text: String, cx: &mut Context<Self>) {
+        self.log_event(
+            store::HistoryKind::Import,
+            "import".to_string(),
+            store::Finished::failed(0, text),
+            cx,
+        );
+        self.show_sidebar_tab(crate::workspace::SidebarTab::History, cx);
         cx.notify();
     }
 }

@@ -10,64 +10,6 @@ use gpui::SharedString;
 
 pub use crate::tree::{NodeKind, TreeNode};
 
-use crate::results::{MessageTone, RunMessage};
-
-/// A sample Messages log, for judging the layout of a tab that is empty until
-/// somebody has actually run something. `at_ms` is fixed rather than relative
-/// to now, so two screenshots taken a minute apart are byte-identical.
-pub fn messages() -> Vec<RunMessage> {
-    use std::time::Duration;
-    let base = 1_755_600_000_000i64; // a fixed wall clock, not `now`.
-                                     // The last field is what the server said on the side, as `severity` and
-                                     // `message` — one statement here has a `WARNING` because a log with none
-                                     // of them never gets its layout looked at.
-    let rows: &[(i64, &str, u64, MessageTone, &str, &[(&str, &str)])] = &[
-        (0, "select * from users order by created_at desc limit 500", 41, MessageTone::Ok, "500 rows", &[]),
-        (
-            7_000,
-            "update users set is_active = false where last_seen_at < now() - interval '1 year'",
-            812,
-            MessageTone::Ok,
-            "1,204 affected",
-            &[("WARNING", "1204 rows deactivated by a statement with no explicit transaction")],
-        ),
-        (
-            31_000,
-            "select u.id, u.email, o.name\n  from users u\n  join organisations o on o.id = u.organization_id",
-            12,
-            MessageTone::Failed,
-            "relation \"organisations\" does not exist · Perhaps you meant to reference the table \"organizations\".",
-            &[],
-        ),
-        (
-            44_000,
-            "select count(*) from webhook_deliveries where status = 'failed'",
-            2_310,
-            MessageTone::Ok,
-            "1 row",
-            &[("NOTICE", "index scan skipped: \"webhook_deliveries_status_idx\" is not valid")],
-        ),
-    ];
-    rows.iter()
-        .map(|(offset, sql, ms, tone, text, notices)| RunMessage {
-            at_ms: base + offset,
-            sql: (*sql).into(),
-            elapsed: Duration::from_millis(*ms),
-            tone: *tone,
-            text: (*text).into(),
-            notices: notices
-                .iter()
-                .map(|(severity, message)| db::Notice {
-                    severity: (*severity).into(),
-                    message: (*message).into(),
-                    detail: None,
-                    hint: None,
-                })
-                .collect(),
-        })
-        .collect()
-}
-
 pub fn tree() -> Vec<TreeNode> {
     let rows: &[(usize, NodeKind, &str, Option<&str>, bool)] = &[
         (0, NodeKind::Connection, "local · postgres@16", None, true),

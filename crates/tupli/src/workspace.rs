@@ -28,7 +28,7 @@ use crate::palette::{
     Command, ItemKind, Palette, PaletteAction, PaletteEvent, PaletteItem, PaletteMode,
 };
 use crate::pane::{Layout, Pane, PaneGroup, PaneId};
-use crate::results::{one_line, MessageTone, ResultsTab, RunMessage, MESSAGES_KEPT};
+use crate::results::{one_line, ResultsTab};
 use crate::save_sheet::{SaveQuerySheet, SaveSheetEvent};
 use crate::session::{Activity, Session, SessionEvent, SessionState};
 use crate::titlebar::{RunAction, Titlebar};
@@ -44,6 +44,14 @@ pub enum SidebarTab {
     Database,
     Queries,
     History,
+}
+
+/// How much of the shared log the History tab is showing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum HistoryScope {
+    #[default]
+    Everything,
+    ThisWindow,
 }
 
 /// Which face of the current selection the right panel is showing.
@@ -139,13 +147,6 @@ pub struct Workspace {
     booted: bool,
 
     // ---- results ---------------------------------------------------------
-    /// The Messages tab's log, oldest first, capped at [`MESSAGES_KEPT`]. Held
-    /// in memory rather than in SQLite because it is about *this window's*
-    /// session — the durable record of what was run is the History tab. One
-    /// log for the window, not one per pane: it is a record of what this
-    /// connection was asked, and which editor did the asking is not the
-    /// question anyone brings to it.
-    pub messages: Vec<RunMessage>,
     /// The DDL tab's viewer: the same editor as the console, read-only, so
     /// generated SQL is highlighted, selectable and scrollable exactly the way
     /// typed SQL is. One for the window, like the dock it lives in.
@@ -165,6 +166,15 @@ pub struct Workspace {
     /// The History tab's rows, read from SQLite rather than re-queried on every
     /// frame. Refreshed when a statement finishes and when the tab is opened.
     pub history: Vec<store::HistoryEntry>,
+    /// Which history rows this window is the one that wrote.
+    ///
+    /// The log is durable and shared, which is what makes it worth keeping —
+    /// and also what makes "what have *I* just been doing" hard to see in it.
+    /// The ids come back from the store as each row is written, so this is the
+    /// answer without a column for it.
+    pub history_mine: std::collections::HashSet<i64>,
+    /// Whether the History tab is showing only those.
+    pub(crate) history_scope: HistoryScope,
     /// The Queries tab's rows, on the same terms.
     pub saved: Vec<store::SavedQuery>,
     /// The connection the *active tab* is looking at, which is what the
@@ -937,7 +947,6 @@ impl Workspace {
             group_boxes: Rc::new(RefCell::new(HashMap::new())),
             booted: false,
 
-            messages: Vec::new(),
             ddl_view,
             ddl_source: None,
 
@@ -947,6 +956,8 @@ impl Workspace {
             saved,
             session: None,
             pending_history: None,
+            history_mine: std::collections::HashSet::new(),
+            history_scope: HistoryScope::Everything,
             save_sheet: None,
             export_sheet: None,
             import_sheet: None,
@@ -2019,7 +2030,6 @@ impl Workspace {
             Command::ShowData => self.show_results_tab(ResultsTab::Data, cx),
             Command::ShowStructure => self.show_results_tab(ResultsTab::Structure, cx),
             Command::ShowDdl => self.show_results_tab(ResultsTab::Ddl, cx),
-            Command::ShowMessages => self.show_results_tab(ResultsTab::Messages, cx),
             Command::OpenSettings => self.open_settings(cx),
         }
     }
@@ -2162,7 +2172,6 @@ impl Workspace {
             m::ShowData => Command::ShowData,
             m::ShowStructure => Command::ShowStructure,
             m::ShowDdl => Command::ShowDdl,
-            m::ShowMessages => Command::ShowMessages,
             m::ShowDatabaseTree => Command::ShowDatabaseTree,
             m::ShowSavedQueries => Command::ShowSavedQueries,
             m::ShowHistory => Command::ShowHistory,
@@ -3983,41 +3992,50 @@ impl Workspace {
     /// changes nothing at all: the transaction rolled back, so the staged
     /// edits are still exactly what is not saved yet, and they stay on screen.
     fn absorb_apply(&mut self, session: Entity<Session>, cx: &mut Context<Self>) {
-        let Some((summary, elapsed, error)) = ({
+        let Some((summary, rows, elapsed, error)) = ({
             let session = session.read(cx);
-            session
-                .last_apply
-                .as_ref()
-                .map(|applied| (applied.summary(), applied.elapsed, applied.error.clone()))
+            session.last_apply.as_ref().map(|applied| {
+                (
+                    applied.summary(),
+                    applied.counts.total(),
+                    applied.elapsed,
+                    applied.error.clone(),
+                )
+            })
         }) else {
             return;
         };
 
         let target = self.active_pane;
         let note = self.import_note.take();
-        self.messages.push(RunMessage {
-            at_ms: now_ms(),
-            sql: match &note {
-                Some(_) => format!("import ({summary})").into(),
-                None => format!("commit ({summary})").into(),
+        // A commit is already over by the time it gets here, so it goes into
+        // the log in one piece. What was done is the row's own line — there is
+        // no statement to quote, because there were several and the summary is
+        // the only honest name for all of them at once.
+        let kind = match &note {
+            Some(_) => store::HistoryKind::Import,
+            None => store::HistoryKind::Commit,
+        };
+        self.log_event(
+            kind,
+            match &note {
+                Some(note) => format!("import ({note})"),
+                None => format!("commit ({summary})"),
             },
-            elapsed,
-            tone: match &error {
-                Some(_) => MessageTone::Failed,
-                None => MessageTone::Ok,
+            store::Finished {
+                duration_ms: elapsed.as_millis() as i64,
+                // A commit that rolled back changed nothing, whatever it
+                // was going to change.
+                affected: error.is_none().then_some(rows as i64),
+                error: error.as_ref().map(|error| error.full_text()),
+                outcome: match &error {
+                    Some(_) => store::Outcome::Failed,
+                    None => store::Outcome::Ok,
+                },
+                ..Default::default()
             },
-            text: match (&error, &note) {
-                (Some(error), _) => error.full_text().into(),
-                (None, Some(note)) => format!("Imported {note}.").into(),
-                (None, None) => format!("Committed {summary}.").into(),
-            },
-            // A commit's own notices go with the statements inside it, and
-            // those are not shown one by one. Nothing to attach here.
-            notices: Vec::new(),
-        });
-        if self.messages.len() > MESSAGES_KEPT {
-            self.messages.drain(..self.messages.len() - MESSAGES_KEPT);
-        }
+            cx,
+        );
 
         if let Some(pane) = self.pane_by_mut(target) {
             pane.error = error.clone();
@@ -4035,8 +4053,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Write one finished statement into the Messages log and the history
-    /// table.
+    /// Attach a finished statement's outcome to the history row that was
+    /// written when it was sent.
     ///
     /// Separate from delivering the rows because the two do not always both
     /// happen: a statement whose tab has been switched away from still ran,
@@ -4045,55 +4063,81 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     fn record_run(
         &mut self,
-        ran: SharedString,
         elapsed: std::time::Duration,
-        truncated: bool,
         affected: Option<u64>,
         error: &Option<db::DbError>,
         notices: Vec<db::Notice>,
         row_count: usize,
         cx: &mut Context<Self>,
     ) {
-        // The Messages log gets the same facts the status bar gets, plus the
-        // ones it has no room for. Recorded here rather than at submit time so
-        // a row can never claim an outcome that has not happened.
-        let summary = match (&error, affected) {
-            (Some(error), _) => error.full_text(),
-            (None, Some(count)) => format!("{} affected", count_of(count as usize, "row")),
-            (None, None) if truncated => {
-                format!("{}+ rows (row cap reached)", thousands(row_count))
-            }
-            (None, None) => count_of(row_count, "row"),
+        let (Some(store), Some(id)) = (self.store.clone(), self.pending_history.take()) else {
+            return;
         };
-        self.messages.push(RunMessage {
-            at_ms: now_ms(),
-            sql: ran,
-            elapsed,
-            tone: match &error {
-                Some(error) if error.is_canceled() => MessageTone::Canceled,
-                Some(_) => MessageTone::Failed,
-                None => MessageTone::Ok,
+        // One column or the other, never both: a statement that returned three
+        // rows and one that changed three are different statements, and a log
+        // that spells both "3 rows" is one nobody can read backwards.
+        let outcome = store::Finished {
+            duration_ms: elapsed.as_millis() as i64,
+            row_count: affected.is_none().then_some(row_count as i64),
+            affected: affected.map(|count| count as i64),
+            error: error.as_ref().map(|error| error.full_text()),
+            outcome: match error {
+                Some(error) if error.is_canceled() => store::Outcome::Canceled,
+                Some(_) => store::Outcome::Failed,
+                None => store::Outcome::Ok,
             },
-            text: summary.into(),
-            notices,
-        });
-        if self.messages.len() > MESSAGES_KEPT {
-            self.messages.drain(..self.messages.len() - MESSAGES_KEPT);
+            notices: notices.iter().map(|notice| notice.full_text()).collect(),
+        };
+        self.record_history(&store, id, Some(&outcome), cx);
+    }
+
+    /// Write something that is already over into the log: a commit, an import,
+    /// an export.
+    ///
+    /// The verb is public because export and import both reach for it from
+    /// their own files, and because it is the one way anything but a statement
+    /// gets into the record at all.
+    pub(crate) fn log_event(
+        &mut self,
+        kind: store::HistoryKind,
+        line: String,
+        outcome: store::Finished,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let connection = self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).config.id);
+        // Stamped with when it started rather than when it landed, so it sorts
+        // beside the statements it ran alongside.
+        let started = now_ms() - outcome.duration_ms;
+        match store.record_event(connection, kind, &line, started, &outcome) {
+            Ok(id) => self.record_history(&store, id, None, cx),
+            Err(error) => log::warn!("could not record what was done: {error:#}"),
         }
-        if let (Some(store), Some(id)) = (self.store.clone(), self.pending_history.take()) {
-            let count = if affected.is_some() {
-                affected.map(|n| n as i64)
-            } else {
-                Some(row_count as i64)
-            };
-            let message = error.as_ref().map(|error| error.full_text());
-            if let Err(error) =
-                store.finish_query(id, elapsed.as_millis() as i64, count, message.as_deref())
-            {
-                log::warn!("could not record the query outcome: {error:#}");
+    }
+
+    /// File a history row as this window's and put the list back in step.
+    ///
+    /// `outcome` is `None` for a row that was written complete, which is every
+    /// kind but a statement.
+    fn record_history(
+        &mut self,
+        store: &store::Store,
+        id: i64,
+        outcome: Option<&store::Finished>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(outcome) = outcome {
+            if let Err(error) = store.finish_query(id, outcome) {
+                log::warn!("could not record the outcome: {error:#}");
             }
-            self.reload_lists(cx);
         }
+        self.history_mine.insert(id);
+        self.reload_lists(cx);
     }
 
     /// Move a finished statement's result into the window: rows to the grid,
@@ -4127,9 +4171,7 @@ impl Workspace {
         if self.nowhere_to_land(target, &session) {
             log::info!("a run finished for a tab that is no longer showing; logging it only");
             let row_count = rows.as_ref().map(|rows| rows.row_count()).unwrap_or(0);
-            self.record_run(
-                sql, elapsed, truncated, affected, &error, notices, row_count, cx,
-            );
+            self.record_run(elapsed, affected, &error, notices, row_count, cx);
             cx.notify();
             return;
         }
@@ -4192,12 +4234,12 @@ impl Workspace {
         }
         // A failure stays where you are looking. The Data tab carries the
         // server's message in a banner above the grid, so the error is already
-        // in front of you; switching to Messages on top of that takes away the
-        // rows you were reading — and on a typo in the filter box, the rows are
-        // exactly what you want to still see while you fix it. Messages remains
-        // the log, for when you want the history rather than the last word.
+        // in front of you; jumping somewhere else on top of that takes away
+        // the rows you were reading — and on a typo in the filter box, the
+        // rows are exactly what you want to still see while you fix it. The
+        // History tab keeps the record, for when you want more than the last
+        // word.
         let row_count = pane.row_count;
-        let ran = pane.last_sql.clone().unwrap_or_default();
 
         // Under the character the server named, and the cursor put there, so
         // the next thing typed is a fix rather than a hunt.
@@ -4242,10 +4284,8 @@ impl Workspace {
             }
         }
 
-        self.record_run(
-            ran, elapsed, truncated, affected, &error, notices, row_count, cx,
-        );
-        // A rename, truncate or drop has consequences past the message log —
+        self.record_run(elapsed, affected, &error, notices, row_count, cx);
+        // A rename, truncate or drop has consequences past the log —
         // tabs that were pointing at the old name, rows that are no longer
         // there — and this is the first moment it is known whether the server
         // actually did it.
@@ -4275,7 +4315,6 @@ impl Workspace {
     /// `TUPLI_OPEN` a `schema.table` to browse once the catalog arrives, and
     /// `TUPLI_SIDEBAR` one of `database`, `queries`, `history`,
     /// `TUPLI_RESULTS_TAB` one of `data`, `structure`, `ddl`, `privileges`,
-    /// `messages`,
     /// `TUPLI_INSPECTOR` one of `cell`, `row`, `TUPLI_CELL` a `row,column` for
     /// the cursor to land on once rows arrive, `TUPLI_MENU` a `schema.table` to
     /// open the object menu on, `TUPLI_SHEET` one of `rename`, `truncate`,
@@ -4312,7 +4351,6 @@ impl Workspace {
                 "structure" => self.pane_mut().results_tab = ResultsTab::Structure,
                 "ddl" => self.pane_mut().results_tab = ResultsTab::Ddl,
                 "privileges" => self.pane_mut().results_tab = ResultsTab::Privileges,
-                "messages" => self.pane_mut().results_tab = ResultsTab::Messages,
                 other => log::warn!("TUPLI_RESULTS_TAB={other:?} is not a tab"),
             }
         }
@@ -4885,20 +4923,6 @@ impl Workspace {
 pub(crate) fn day_of(ms: i64) -> i64 {
     let seconds = ms.div_euclid(1000) + local_offset_seconds();
     seconds.div_euclid(86_400)
-}
-
-/// A timestamp as a log reads it: `14:03:27`, local time, no date. The date is
-/// the same for every row anyone will ever scroll past in one session, and the
-/// History tab is where a date actually matters.
-pub(crate) fn format_clock(ms: i64) -> String {
-    let seconds = ms.div_euclid(1000) + local_offset_seconds();
-    let in_day = seconds.rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}:{:02}",
-        in_day / 3600,
-        (in_day % 3600) / 60,
-        in_day % 60
-    )
 }
 
 /// Seconds east of UTC, as the OS currently has it, read once.

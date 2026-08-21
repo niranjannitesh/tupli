@@ -14,10 +14,10 @@
 //! in full: who owns the table, who has been granted what, and — the line
 //! everybody actually came for — what the role you are logged in as may do.
 //!
-//! **Messages** is the log the status bar cannot be: the status bar shows the
-//! last statement, this shows the last two hundred, with the server's own words
-//! attached to the ones that failed. It is the tab you open when something went
-//! wrong three statements ago.
+//! What used to be a fourth tab here — Messages, the log of what this window
+//! had run — is the sidebar's History tab now. Two records of the same thing
+//! that disagreed about which statements counted was one more than anybody
+//! needed, and the durable one is the one worth keeping.
 
 use gpui::{
     div, prelude::*, px, AnyElement, ClipboardItem, Context, IntoElement, ParentElement,
@@ -28,7 +28,7 @@ use ui::{
     IconSize, Label, LabelSize, SectionHeader, StyledExt, Toolbar,
 };
 
-use crate::workspace::{count_of, format_clock, format_duration, Workspace};
+use crate::workspace::{count_of, Workspace};
 
 /// Which of the result dock's tabs is showing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -40,43 +40,7 @@ pub enum ResultsTab {
     Ddl,
     /// Who may do what to the object, and what you yourself may do.
     Privileges,
-    Messages,
 }
-
-/// Whether a statement worked. Kept separate from `Option<DbError>` because the
-/// list only needs the colour, and holding the whole error alive for two hundred
-/// rows to read one field would be silly.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum MessageTone {
-    Ok,
-    Failed,
-    /// Stopped on purpose. Not a failure: nothing is wrong with a statement
-    /// somebody decided they no longer wanted, and colouring it red teaches
-    /// people to ignore red.
-    Canceled,
-}
-
-/// One line in the Messages tab: a statement, when it ran, and what came back.
-#[derive(Clone, Debug)]
-pub struct RunMessage {
-    /// Wall-clock time the result landed, milliseconds since the epoch.
-    pub at_ms: i64,
-    pub sql: SharedString,
-    pub elapsed: std::time::Duration,
-    pub tone: MessageTone,
-    /// `20,000 rows`, `UPDATE 3`, or the server's error text.
-    pub text: SharedString,
-    /// What the server said on the side while this ran: `RAISE NOTICE` from a
-    /// function, the `WARNING` a `create ... if not exists` produces. Under the
-    /// statement rather than beside it, because a notice is about a statement
-    /// and a log of them detached from what provoked them is unreadable.
-    pub notices: Vec<db::Notice>,
-}
-
-/// How many statements the Messages tab remembers. Beyond this it stops being a
-/// log you read and starts being one you search, and the History tab already
-/// exists — with a durable file behind it — for that.
-pub const MESSAGES_KEPT: usize = 200;
 
 /// Widths of the structure table's fixed columns. Names and defaults take what
 /// is left, because those are the two that are genuinely unbounded.
@@ -571,116 +535,6 @@ impl Workspace {
                         ),
                     )
                     .into_any_element()
-            }))
-            .into_any_element()
-    }
-
-    // ---- messages --------------------------------------------------------
-
-    pub(crate) fn render_messages(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if self.messages.is_empty() {
-            return EmptyState::new(IconName::Terminal, "No messages yet")
-                .description("Every statement this window runs is logged here with what came back.")
-                .into_any_element();
-        }
-
-        let c = cx.colors().clone();
-        v_flex()
-            .id("messages")
-            .size_full()
-            .min_h_0()
-            .overflow_y_scroll()
-            .py(px(2.))
-            // Newest first: the message you want is almost always the last one,
-            // and scrolling to the bottom of two hundred rows to find it is the
-            // kind of small tax that makes a log feel hostile.
-            .children(self.messages.iter().rev().map(|message| {
-                let (icon, tone) = match message.tone {
-                    MessageTone::Ok => (IconName::Check, IconColor::Success),
-                    MessageTone::Failed => (IconName::CircleXmark, IconColor::Danger),
-                    MessageTone::Canceled => (IconName::Ban, IconColor::Warning),
-                };
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .items_start()
-                    .px(px(8.))
-                    .py(px(3.))
-                    .gap(px(8.))
-                    .border_b_1()
-                    .border_color(c.border)
-                    .child(
-                        cell(px(64.)).child(
-                            Label::new(format_clock(message.at_ms))
-                                .mono()
-                                .size(LabelSize::Small)
-                                .color(IconColor::Subtle),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .pt(px(2.))
-                            .child(Icon::new(icon).size(IconSize::XSmall).color(tone)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(1.))
-                            .child(
-                                Label::new(one_line(&message.sql))
-                                    .mono()
-                                    .size(LabelSize::Code)
-                                    .color(IconColor::Muted),
-                            )
-                            .child(
-                                Label::new(message.text.clone())
-                                    .size(LabelSize::Small)
-                                    .color(match message.tone {
-                                        MessageTone::Failed => IconColor::Danger,
-                                        _ => IconColor::Subtle,
-                                    })
-                                    .wrap(),
-                            )
-                            // Indented under the statement and marked with the
-                            // severity the server used, so `psql`'s output and
-                            // this one say the same thing.
-                            .children(message.notices.iter().map(|notice| {
-                                h_flex()
-                                    .items_start()
-                                    .gap(px(6.))
-                                    .pt(px(1.))
-                                    .child(
-                                        Label::new(notice.severity.to_string())
-                                            .mono()
-                                            .size(LabelSize::Small)
-                                            .color(match notice.is_warning() {
-                                                true => IconColor::Warning,
-                                                false => IconColor::Subtle,
-                                            }),
-                                    )
-                                    .child(
-                                        Label::new(notice.full_text_without_severity())
-                                            .size(LabelSize::Small)
-                                            .color(IconColor::Muted)
-                                            .wrap()
-                                            .flex_1()
-                                            .min_w_0(),
-                                    )
-                            })),
-                    )
-                    .child(
-                        cell(px(72.)).justify_end().child(
-                            Label::new(format_duration(message.elapsed))
-                                .size(LabelSize::Small)
-                                .color(IconColor::Subtle),
-                        ),
-                    )
             }))
             .into_any_element()
     }

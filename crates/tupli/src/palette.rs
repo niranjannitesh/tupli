@@ -145,7 +145,6 @@ pub enum Command {
     ShowData,
     ShowStructure,
     ShowDdl,
-    ShowMessages,
     OpenSettings,
 }
 
@@ -180,7 +179,6 @@ impl Command {
         Command::ShowData,
         Command::ShowStructure,
         Command::ShowDdl,
-        Command::ShowMessages,
         Command::ShowDatabaseTree,
         Command::ShowSavedQueries,
         Command::ShowHistory,
@@ -224,7 +222,6 @@ impl Command {
             Self::ShowData => "Show Data",
             Self::ShowStructure => "Show Structure",
             Self::ShowDdl => "Show DDL",
-            Self::ShowMessages => "Show Messages",
             Self::OpenSettings => "Open Settings…",
         }
     }
@@ -259,7 +256,6 @@ impl Command {
             Self::ShowData => IconName::Table,
             Self::ShowStructure => IconName::Columns,
             Self::ShowDdl => IconName::Code,
-            Self::ShowMessages => IconName::BulletList,
             Self::OpenSettings => IconName::Gear,
         }
     }
@@ -1041,7 +1037,7 @@ mod tests {
         }
         assert_eq!(
             Command::ALL.len(),
-            34,
+            33,
             "add the new command to ALL, not just to the enum"
         );
     }

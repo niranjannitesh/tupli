@@ -694,23 +694,6 @@ impl Workspace {
             _ => (SharedString::from("Result"), None),
         };
         let tab = self.results_tab(cx);
-        // Messages carries a count once there is anything in it, because the
-        // whole point of the tab is that you can ignore it until you cannot.
-        let message_count = self.messages.len();
-        let failures = self
-            .messages
-            .iter()
-            .filter(|m| m.tone == crate::results::MessageTone::Failed)
-            .count();
-        // A server `WARNING` is the server saying something happened that you
-        // did not ask for. Nothing else in the window says so — the statement
-        // succeeded — so the tab has to, or a migration that half-worked looks
-        // like one that worked.
-        let warnings = self
-            .messages
-            .iter()
-            .any(|m| m.notices.iter().any(db::Notice::is_warning));
-
         // A script's answers each get a tab. One answer keeps the single tab
         // named after whatever produced it, because "Result 1" of one is a
         // count nobody needs.
@@ -777,23 +760,6 @@ impl Workspace {
                     })),
             );
         }
-        tabs.push(
-            Tab::new("results-messages", "Messages")
-                .icon(IconName::Terminal)
-                .icon_color(match (failures > 0, warnings) {
-                    (true, _) => IconColor::Danger,
-                    (false, true) => IconColor::Warning,
-                    (false, false) => IconColor::Muted,
-                })
-                .when_some(
-                    (message_count > 0).then(|| thousands(message_count)),
-                    |t, n| t.detail(n),
-                )
-                .active(tab == ResultsTab::Messages)
-                .on_click(
-                    cx.listener(|this, _, _, cx| this.select_results_tab(ResultsTab::Messages, cx)),
-                ),
-        );
         tabs
     }
 
@@ -875,11 +841,6 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_privileges(_window, cx))
-                    .into_any_element(),
-                ResultsTab::Messages => v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_messages(_window, cx))
                     .into_any_element(),
             })
             .child(

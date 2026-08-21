@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use gpui::{px, size, AppContext as _, HeadlessAppContext};
-use tupli::{mock, workspace::Workspace};
+use tupli::workspace::Workspace;
 use ui::{Appearance, Assets, Theme, ThemeRegistry};
 
 fn main() {
@@ -117,7 +117,7 @@ fn main() {
                     || cx.update(|cx| {
                         window
                             .read(cx)
-                            .map(|workspace| workspace.messages.len() >= 2)
+                            .map(|workspace| workspace.history_mine.len() >= 2)
                             .unwrap_or(false)
                     });
                 if ready && opened && followed {
@@ -254,12 +254,12 @@ fn main() {
             // window may already be showing an answer — `TUPLI_OPEN` browses a
             // table, and the sample data is there from the first frame — so
             // "has a result" is not a signal that *this* statement has one.
-            // Every finished run appends to the message log, so the log's
-            // length is.
+            // Every finished run files a history row under this window, so
+            // the count of those is.
             let before = cx.update(|cx| {
                 window
                     .read(cx)
-                    .map(|workspace| workspace.messages.len())
+                    .map(|workspace| workspace.history_mine.len())
                     .unwrap_or(0)
             });
             cx.update(|cx| {
@@ -304,7 +304,7 @@ fn main() {
                         .map(|workspace| {
                             // A script is not done until the queue behind it
                             // is, or the failure that emptied it has landed.
-                            workspace.messages.len() > before && !workspace.is_running(cx)
+                            workspace.history_mine.len() > before && !workspace.is_running(cx)
                         })
                         .unwrap_or(false)
                 });
@@ -472,26 +472,6 @@ fn main() {
                 window
                     .update(cx, |workspace, _window, cx| workspace.preview_commit(cx))
                     .expect("open the commit sheet")
-            });
-        }
-
-        // `TUPLI_RESULTS_TAB` is honoured by the workspace itself. Messages is
-        // empty until something has run, so it gets the sample log here — the
-        // one thing a never-connected window cannot produce for itself.
-        if std::env::var("TUPLI_RESULTS_TAB").as_deref() == Ok("messages") {
-            cx.update(|cx| {
-                window
-                    .update(cx, |workspace, _window, cx| {
-                        // Only when there is nothing real to show. `TUPLI_RUN`
-                        // has already logged its statement by now, and
-                        // overwriting that with the sample log would hide the
-                        // one thing the flag was asked to photograph.
-                        if workspace.messages.is_empty() {
-                            workspace.messages = mock::messages();
-                        }
-                        cx.notify();
-                    })
-                    .expect("seed the message log")
             });
         }
 

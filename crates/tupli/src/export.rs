@@ -22,8 +22,7 @@ use ui::{
     Sheet as SheetView,
 };
 
-use crate::results::{MessageTone, RunMessage};
-use crate::workspace::{count_of, now_ms, thousands, Workspace};
+use crate::workspace::{count_of, Workspace};
 
 /// The formats offered, in the order the control lists them. CSV first because
 /// it is what a spreadsheet wants and a spreadsheet is where most exported rows
@@ -325,7 +324,7 @@ impl Workspace {
     }
 
     /// Report what happened, in the one place this app keeps a record of what
-    /// it did: the Messages tab. On success Finder is also opened on the file —
+    /// it did: the History tab. On success Finder is also opened on the file —
     /// an export is done for the sake of the file, and the fastest way to say
     /// "it is there" is to show it. Not when the caller named the path itself,
     /// though: it already knows where the file is and did not ask to be shown.
@@ -341,28 +340,28 @@ impl Workspace {
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
-        let (tone, text) = match &written {
-            Ok(()) => (
-                MessageTone::Ok,
-                format!("Wrote {} to {name}.", count_of(count, "row")),
-            ),
-            Err(error) => (MessageTone::Failed, format!("{name}: {error}")),
-        };
-        self.messages.push(RunMessage {
-            at_ms: now_ms(),
-            sql: format!("export {}", thousands(count)).into(),
-            elapsed: std::time::Duration::ZERO,
-            tone,
-            text: text.into(),
-            notices: Vec::new(),
-        });
+        // The file is the point, so the file is what the row names — and an
+        // export took no time worth reporting, because the rows were already
+        // in hand before it started.
+        self.log_event(
+            store::HistoryKind::Export,
+            format!("export {} → {name}", count_of(count, "row")),
+            match &written {
+                Ok(()) => store::Finished {
+                    row_count: Some(count as i64),
+                    ..store::Finished::ok(0)
+                },
+                Err(error) => store::Finished::failed(0, format!("{name}: {error}")),
+            },
+            cx,
+        );
         match written {
             Ok(()) if reveal => cx.reveal_path(&path),
             Ok(()) => {}
             // A failed write is the one case worth interrupting for: the file
             // somebody asked for does not exist, and they are about to go
             // looking for it.
-            Err(_) => self.select_results_tab(crate::results::ResultsTab::Messages, cx),
+            Err(_) => self.show_sidebar_tab(crate::workspace::SidebarTab::History, cx),
         }
         cx.notify();
     }
