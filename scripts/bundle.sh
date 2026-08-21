@@ -95,6 +95,10 @@ cp "$binary" "$app/Contents/MacOS/tupli"
 # it is: the file that was copied here is the channel.
 cp "$icon_src" "$app/Contents/Resources/tupli.icns"
 
+# LSMinimumSystemVersion is 13.0 rather than the 11.0 the linker stamps on the
+# binary, because the linker is reporting a default and not a claim: nothing has
+# ever been run on 11 or 12. Refusing to launch there is the honest failure. The
+# README says 13+ and this is the half of that promise macOS enforces.
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -123,7 +127,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>11.0</string>
+	<string>13.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
