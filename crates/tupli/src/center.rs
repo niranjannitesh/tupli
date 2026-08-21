@@ -60,25 +60,36 @@ impl Workspace {
     /// `render_results`, which shortens the Data tab's name because the pane's
     /// strip above is already showing it; and from the status bar, which drops
     /// the caret position because there is no editor left on screen to have
-    /// one. Nothing is `designing` while everything is browsing — a structure
-    /// tab is not a table tab — so that half of the dock's condition is not
-    /// repeated here.
+    /// one. A pane with everything browsing has a tab in front and it is not
+    /// a structure tab, so the other half of the dock's condition is already
+    /// implied and is not repeated here.
     pub(crate) fn collapsed(&self) -> bool {
         self.browsing_all() && self.dock_open
     }
 
-    /// The dock is on screen, so its own footer is reporting the last run.
+    /// The dock is on screen — there is a tab whose results it belongs to,
+    /// and it is not a structure tab — so its own footer is reporting the last
+    /// run.
     ///
     /// The status bar asks before it repeats a duration and a row count. The
     /// two numbers belong to the grid and sit under it; said again forty
     /// pixels lower they stop reading as the same measurement and start
     /// reading as a second one that happens to agree.
     pub(crate) fn results_showing(&self) -> bool {
-        self.dock_open
-            && !self
-                .pane()
-                .active()
-                .is_some_and(|tab| tab.kind == CenterKind::Structure)
+        self.dock_open && dock_belongs_to(self.pane().active().map(|tab| tab.kind))
+    }
+
+    /// Whether the status bar should be the one reporting the last run's
+    /// duration and row count.
+    ///
+    /// The two numbers live under the grid, in the dock's own footer, and are
+    /// repeated in the bar only when that footer is not on screen — the dock
+    /// closed, or a structure tab in front of it. Both at once is how a window
+    /// ends up stating the same two facts three times and reading like a
+    /// dashboard. Neither, when the strip is empty: with no tab there was no
+    /// run, and "— 0 rows" is a measurement of nothing.
+    pub(crate) fn run_numbers_here(&self) -> bool {
+        self.pane().active().is_some() && !self.results_showing()
     }
 
     pub(crate) fn render_center(
@@ -89,19 +100,19 @@ impl Workspace {
         let hit = cx.metrics().splitter_hit_width;
         // A structure tab hides the dock: the rows under it would belong to
         // whatever this pane ran last, which is not the table being designed,
-        // and the editor is the one thing on screen worth the height. The
-        // dock's own switch is left alone, so a query tab brings it back.
-        let designing = self
-            .pane()
-            .active()
-            .is_some_and(|tab| tab.kind == CenterKind::Structure);
-        debug_assert_eq!(self.dock_open && !designing, self.results_showing());
+        // and the editor is the one thing on screen worth the height. An empty
+        // strip hides it for the same reason with nothing left to argue about
+        // — a grid under "No tabs open" is the pane still answering a question
+        // that has been closed. The dock's own switch is left alone in both
+        // cases, so a query tab brings it back.
+        let unowned = !dock_belongs_to(self.pane().active().map(|tab| tab.kind));
+        debug_assert_eq!(self.dock_open && !unowned, self.results_showing());
         // Browsing does the opposite. A table tab's console is empty and stays
         // empty — the rows *are* the tab — so the panes give up everything but
         // their tab strip and the dock takes the height. Only when every pane
         // agrees: a split with a query in it still needs somewhere to type.
         let browsing = self.browsing_all();
-        let dock_open = self.dock_open && !designing;
+        let dock_open = self.dock_open && !unowned;
         // The collapse is what browsing *starts* as, not what it is locked
         // into: closing the dock on a table tab gives the console back at full
         // height, which is where you write the query the table made you think
@@ -1478,5 +1489,39 @@ fn length_label(kind: &db::KeyType) -> &'static str {
         db::KeyType::Set | db::KeyType::SortedSet => "Members",
         db::KeyType::Stream => "Entries",
         db::KeyType::String | db::KeyType::Other(_) => "Length",
+    }
+}
+
+/// Whether the tab in front of a pane is one whose results the dock would be
+/// showing.
+///
+/// Nothing in front is the case that matters: the dock is one per window and
+/// the pane's own state outlives its tabs, so a `select` that came back after
+/// its tab was closed used to leave a grid, a row count and a duration sitting
+/// under "No tabs open".
+fn dock_belongs_to(active: Option<CenterKind>) -> bool {
+    matches!(active, Some(kind) if kind != CenterKind::Structure)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dock_belongs_to;
+    use crate::pane::CenterKind;
+
+    #[test]
+    fn a_pane_with_every_tab_closed_has_no_results_to_show() {
+        assert!(!dock_belongs_to(None));
+    }
+
+    #[test]
+    fn a_structure_tab_is_looking_at_the_shape_and_not_at_rows() {
+        assert!(!dock_belongs_to(Some(CenterKind::Structure)));
+    }
+
+    #[test]
+    fn every_other_tab_has_a_dock_under_it() {
+        assert!(dock_belongs_to(Some(CenterKind::Query)));
+        assert!(dock_belongs_to(Some(CenterKind::Table)));
+        assert!(dock_belongs_to(Some(CenterKind::Key)));
     }
 }

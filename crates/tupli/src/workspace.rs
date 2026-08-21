@@ -3054,6 +3054,10 @@ impl Workspace {
         pane.last_sql = None;
         pane.error = None;
         pane.unsorted = None;
+        // Including a script's earlier answers, which are the dock's own tab
+        // strip: leaving them would empty the grid and keep the tabs over it.
+        pane.results.clear();
+        pane.result_index = 0;
         let grid = pane.grid.clone();
         grid.update(cx, |grid, cx| {
             grid.set_data_arc(std::sync::Arc::new(db::ResultSet::new(Vec::new())), cx)
@@ -3908,6 +3912,25 @@ impl Workspace {
         }
     }
 
+    /// Whether an answer that has just come back has anywhere to be drawn.
+    ///
+    /// Two ways it has not. Tabs carry their own session, so switching tabs
+    /// while a query runs is switching servers: the answer arrives addressed
+    /// to a table the tab now in front has never heard of. And a tab closed
+    /// while its rows were still in flight leaves nothing to address at all —
+    /// a `select` that took ten seconds would otherwise fill the dock
+    /// underneath "No tabs open", which is the pane answering a question that
+    /// was withdrawn.
+    fn nowhere_to_land(&self, target: PaneId, session: &Entity<Session>) -> bool {
+        match self.pane_by(target).and_then(|pane| pane.active()) {
+            None => true,
+            Some(tab) => tab
+                .session
+                .as_ref()
+                .is_some_and(|showing| showing != session),
+        }
+    }
+
     /// Move an opened key's contents into the pane that asked for it.
     ///
     /// [`Workspace::absorb_run`] without the half that is about statements —
@@ -3924,12 +3947,7 @@ impl Workspace {
             return;
         };
         let target = self.running_pane.take().unwrap_or(self.active_pane);
-        let elsewhere = self
-            .pane_by(target)
-            .and_then(|pane| pane.active())
-            .and_then(|tab| tab.session.clone())
-            .is_some_and(|showing| showing != session);
-        if elsewhere {
+        if self.nowhere_to_land(target, &session) {
             return;
         }
         let Some(pane) = self.pane_by_mut(target) else {
@@ -4103,17 +4121,10 @@ impl Workspace {
         // starts typing in the new pane while they wait has not asked for
         // their rows to land somewhere else.
         let target = self.running_pane.take().unwrap_or(self.active_pane);
-        // And only if that pane is still looking at the database the rows came
-        // from. Tabs hold their own connections, so switching tabs while a
-        // query runs is switching servers: the answer arrives addressed to a
-        // table that the tab now on screen has never heard of. It still ran, so
-        // it still goes in the log — it just has nowhere to be drawn.
-        let elsewhere = self
-            .pane_by(target)
-            .and_then(|pane| pane.active())
-            .and_then(|tab| tab.session.clone())
-            .is_some_and(|showing| showing != session);
-        if elsewhere {
+        // And only if there is still a tab there for the rows to belong to.
+        // It ran, so it still goes in the log — it just has nowhere to be
+        // drawn.
+        if self.nowhere_to_land(target, &session) {
             log::info!("a run finished for a tab that is no longer showing; logging it only");
             let row_count = rows.as_ref().map(|rows| rows.row_count()).unwrap_or(0);
             self.record_run(
@@ -4812,12 +4823,7 @@ impl Workspace {
                             ))
                     })),
             )
-            // The duration and the row count live under the grid, in the
-            // dock's own footer, and are repeated here only when that footer
-            // is not on screen — the dock closed, or a structure tab in front
-            // of it. Both at once is how a window ends up stating the same two
-            // facts three times and reading like a dashboard.
-            .when(!self.results_showing(), |bar| {
+            .when(self.run_numbers_here(), |bar| {
                 bar.end_child(
                     h_flex()
                         .gap(px(5.))
