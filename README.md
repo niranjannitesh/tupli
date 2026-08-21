@@ -32,8 +32,8 @@ Opens instantly. Scrolls a million rows without dropping a frame. Never blocks o
 > ### ⚠️ Alpha. In development.
 >
 > Tupli is being built in the open and is **not ready to be anyone's daily driver**. There
-> is no release build, no signed download, no update channel and no upgrade path for the
-> local store — it is `scripts/run.sh` or nothing. Things move, break and get renamed.
+> is nothing to download yet, no update channel and no upgrade path for the local store —
+> it is `scripts/run.sh` or nothing. Things move, break and get renamed.
 >
 > It reads and writes real databases. Point it at something you can afford to be wrong
 > about until it has more mileage on it.
@@ -117,8 +117,9 @@ question is never "is this Redis?" but "can these rows be edited?".
 
 ## Not there yet
 
-SSH tunnelling · writing to Redis · ClickHouse beyond reading well · a signed release, an
-update channel, or any upgrade path for the local store · anything that is not macOS.
+SSH tunnelling · writing to Redis · ClickHouse beyond reading well · a published
+download, an update channel, or any upgrade path for the local store · anything that is
+not macOS.
 
 ## Build it
 
@@ -224,6 +225,12 @@ cargo run -p tupli --example screenshot -- /tmp/shot
 Most of the interesting state is reachable through `TUPLI_*` environment variables for
 exactly this reason — the sidebar tab, the results tab, a staged edit, an open menu, a
 sheet, a split, the settings window — see `crates/tupli/examples/screenshot.rs`.
+
+`scripts/release.sh` builds the other kind of thing: both architectures joined into one
+binary, signed with a Developer ID, notarized, and stapled so a first launch works on a
+machine that is offline. It is what a download would be made of, and it refuses up front
+— naming the command that fixes it — if the certificate, the notary profile or the second
+toolchain is missing. Nothing is published by it without `--publish`.
 
 House rules, such as they are, are in [`CLAUDE.md`](CLAUDE.md): comments say *why*, tests
 are named as sentences, and the tree is deliberately not `rustfmt --all` clean.
