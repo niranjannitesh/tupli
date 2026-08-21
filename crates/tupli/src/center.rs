@@ -426,7 +426,7 @@ impl Workspace {
                 TabBar::new(pane_id("center-tabs", id, 0))
                     .tabs(tabs)
                     // Collapsed, the dock's own strip is directly below this
-                    // one and draws the line between them. See `TabBar::stacked`.
+                    // one. See `TabBar::stacked`.
                     .when(stacked, |bar| bar.stacked())
                     // The one strip in the window whose contents are unbounded:
                     // a pane can hold any number of tabs and a split pane can be
@@ -804,6 +804,9 @@ impl Workspace {
             .child(
                 TabBar::new("results-tabs")
                     .tabs(tabs)
+                    // The pane's strip is directly above and has drawn the line
+                    // between them. See `TabBar::nested`.
+                    .when(collapsed, |bar| bar.nested())
                     // Nothing to maximise while the panes are already collapsed
                     // to their tab strips: the dock *is* the centre, and a
                     // button whose only state is the one you are in is a button

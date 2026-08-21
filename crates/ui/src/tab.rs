@@ -313,14 +313,19 @@ pub struct TabBar {
     /// tab set is fixed — the sidebar's three, the dock's four — cannot overflow
     /// and does not need a scroll region to prove it.
     scroll: Option<gpui::ScrollHandle>,
-    /// Whether this strip draws the bottom run of the seam. Off when another
-    /// strip is stacked directly beneath it — the pane's tabs over the dock's,
-    /// while the centre has collapsed to nothing but strips. That one draws its
-    /// own top hairline, and two hairlines against each other is the two-pixel
-    /// edge this whole file exists to avoid. The notch goes with it: a notch is
-    /// a tab reaching down into its content, and what is below this strip is
-    /// not this tab's content but another strip.
-    seam_b: bool,
+    /// Whether another strip is stacked directly beneath this one — the pane's
+    /// tabs over the dock's, while the centre has collapsed to nothing but
+    /// strips. The seam is still this strip's to draw, which is what keeps it
+    /// the height of every other strip, but it is painted over the tabs rather
+    /// than under them and the active tab gets no notch: a notch is a tab
+    /// reaching down into its content, and what is below here is not that
+    /// tab's content but another strip.
+    stacked: bool,
+    /// Whether another strip is stacked directly above. That one drew the line
+    /// between them, so this one has no top hairline of its own — and is a
+    /// pixel shorter for the pixel it did not have to spend on one, which is
+    /// what puts its tabs at the height of everybody else's.
+    nested: bool,
     style: StyleRefinement,
 }
 
@@ -332,15 +337,23 @@ impl TabBar {
             start: SmallVec::new(),
             end: SmallVec::new(),
             scroll: None,
-            seam_b: true,
+            stacked: false,
+            nested: false,
             style: StyleRefinement::default(),
         }
     }
 
-    /// Another strip follows directly below, so this one gives up its bottom
-    /// seam and lets that strip's top hairline be the single line between them.
+    /// Another strip follows directly below, so the line between them is this
+    /// one's to draw — the same line, in the same row, that this strip would
+    /// draw against a panel. See [`TabBar::nested`] for the other half.
     pub fn stacked(mut self) -> Self {
-        self.seam_b = false;
+        self.stacked = true;
+        self
+    }
+
+    /// Another strip sits directly above, and has drawn the line between them.
+    pub fn nested(mut self) -> Self {
+        self.nested = true;
         self
     }
 
@@ -389,7 +402,15 @@ impl Styled for TabBar {
 impl RenderOnce for TabBar {
     fn render(mut self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let c = cx.colors();
-        let height = cx.metrics().tab_strip_height;
+        // The metric is the band between one hairline and the next, and a
+        // nested strip inherits the first of those from the strip above. So it
+        // spends nothing on a top border and stands a pixel shorter, which
+        // leaves its tabs exactly as tall as the tabs in a strip that drew its
+        // own. Measured line to line the two bands are the same.
+        let height = match self.nested {
+            false => cx.metrics().tab_strip_height,
+            true => cx.metrics().tab_strip_height - px(1.),
+        };
 
         // Where the tab row reaches the end of the strip, the strip's end is a
         // region divider that some neighbour already draws — the sidebar's
@@ -406,10 +427,10 @@ impl RenderOnce for TabBar {
                 last.seam_r = false;
             }
         }
-        // No bottom run means no detour around the active tab, and therefore
-        // no two verticals for that detour to leave and rejoin the line by.
-        // Drawn anyway they would be a pair of ticks hanging off nothing.
-        if !self.seam_b {
+        // The seam runs unbroken under a stacked strip, so there is no detour
+        // for a vertical to leave and rejoin it by. Drawn anyway they would be
+        // a pair of ticks hanging off a straight line.
+        if self.stacked {
             for tab in self.tabs.iter_mut() {
                 tab.seam_l = false;
                 tab.seam_r = false;
@@ -417,6 +438,7 @@ impl RenderOnce for TabBar {
         }
 
         let strip = self.id.clone();
+        let border = c.border;
         // The tabs fill the strip's height and the controls beside them stay
         // centred in it, so the two slots align differently and the strip
         // itself takes no position at all.
@@ -434,67 +456,73 @@ impl RenderOnce for TabBar {
             // editor, whatever it happens to be. Runs the full width, active
             // tab included: the notch is cut out of the bottom of the strip,
             // not out of both ends of it.
-            .border_t_1()
-            .border_color(c.border)
+            .when(!self.nested, |el| el.border_t_1().border_color(c.border))
             .overflow_hidden();
         el.style().refine(&self.style);
 
-        // The bottom run of the seam, painted before the tabs so that the
-        // active one covers its own stretch of it. A `border_b` on this
-        // container would be painted after its children instead, and would
-        // draw a line straight across the bottom of the tab.
-        el.children(self.seam_b.then(|| {
+        // The bottom run of the seam. Painted before the tabs, so that the
+        // active one covers its own stretch of it and the notch has no bottom
+        // edge — except under a stacked strip, where the line is between two
+        // strips rather than between a tab and its content and has to survive
+        // the tab that happens to be lit. A `border_b` would do neither: it is
+        // painted after the children either way.
+        let seam = || {
             div()
                 .absolute()
                 .bottom_0()
                 .left_0()
                 .right_0()
                 .h(px(1.))
-                .bg(c.border)
-        }))
-        .when(!self.start.is_empty(), |el| {
-            el.child(
-                h_flex()
-                    .flex_none()
-                    .gap(px(2.))
-                    .px(px(4.))
-                    .children(self.start),
+                .bg(border)
+        };
+        let stacked = self.stacked;
+
+        el.children((!stacked).then(seam))
+            .when(!self.start.is_empty(), |el| {
+                el.child(
+                    h_flex()
+                        .flex_none()
+                        .gap(px(2.))
+                        .px(px(4.))
+                        .children(self.start),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    // Bottom-aligned: whatever the tabs' own height turns out to
+                    // be, the edge they share with the content is the one that has
+                    // to line up.
+                    .items_end()
+                    .flex_1()
+                    .min_w_0()
+                    // No gap at all: tabs are adjacent faces of one surface, not
+                    // separate objects, and the only thing that should ever come
+                    // between two of them is the seam's detour down the side of the
+                    // active one. An earlier version left a pixel of chrome
+                    // showing through, which is invisible between two idle tabs and
+                    // a mess next to a lit one — hover a tab beside the active one
+                    // and that pixel became a third tone wedged between the two,
+                    // reading as a gap rather than as an edge.
+                    .gap_0()
+                    .children(self.tabs)
+                    .map(|el| match self.scroll {
+                        // A scroll region needs an id of its own, and it has to be
+                        // this strip's — two panes side by side are two strips, and
+                        // one shared id would give them one shared scroll position.
+                        Some(scroll) => el
+                            .id(ElementId::Name(format!("{strip:?}-scroll").into()))
+                            .overflow_x_scroll()
+                            .track_scroll(&scroll)
+                            .into_any_element(),
+                        None => el.overflow_hidden().into_any_element(),
+                    }),
             )
-        })
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                // Bottom-aligned: whatever the tabs' own height turns out to
-                // be, the edge they share with the content is the one that has
-                // to line up.
-                .items_end()
-                .flex_1()
-                .min_w_0()
-                // No gap at all: tabs are adjacent faces of one surface, not
-                // separate objects, and the only thing that should ever come
-                // between two of them is the seam's detour down the side of the
-                // active one. An earlier version left a pixel of chrome
-                // showing through, which is invisible between two idle tabs and
-                // a mess next to a lit one — hover a tab beside the active one
-                // and that pixel became a third tone wedged between the two,
-                // reading as a gap rather than as an edge.
-                .gap_0()
-                .children(self.tabs)
-                .map(|el| match self.scroll {
-                    // A scroll region needs an id of its own, and it has to be
-                    // this strip's — two panes side by side are two strips, and
-                    // one shared id would give them one shared scroll position.
-                    Some(scroll) => el
-                        .id(ElementId::Name(format!("{strip:?}-scroll").into()))
-                        .overflow_x_scroll()
-                        .track_scroll(&scroll)
-                        .into_any_element(),
-                    None => el.overflow_hidden().into_any_element(),
-                }),
-        )
-        .when(!self.end.is_empty(), |el| {
-            el.child(h_flex().flex_none().gap(px(2.)).px(px(4.)).children(self.end))
-        })
+            .when(!self.end.is_empty(), |el| {
+                el.child(h_flex().flex_none().gap(px(2.)).px(px(4.)).children(self.end))
+            })
+            // Last, so that it runs under the lit tab as well as the idle ones.
+            .children(stacked.then(seam))
     }
 }
