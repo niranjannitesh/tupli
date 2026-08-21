@@ -105,6 +105,10 @@ pub struct Workspace {
     pub sidebar_tab: SidebarTab,
     pub tree: Vec<TreeNode>,
     pub collapsed: HashSet<usize>,
+    /// Every node id the tree has ever had, which is how a branch that starts
+    /// closed is told from one the reader closed. Only a row nobody has seen
+    /// gets an opinion imposed on it — see [`Workspace::settle_collapse`].
+    known_nodes: HashSet<usize>,
     pub selected_node: Option<usize>,
     /// The sidebar's filter field. A real editor in single-line configuration,
     /// like every other field in the app.
@@ -176,7 +180,7 @@ pub struct Workspace {
     /// rather than a reconnect. Keyed by nothing — the list is short, and the
     /// key is the pair (connection, database) that
     /// [`Workspace::session_for`] matches on.
-    sessions: Vec<Entity<Session>>,
+    pub(crate) sessions: Vec<Entity<Session>>,
     /// The history row the in-flight statement is being recorded into.
     pending_history: Option<i64>,
     /// The name-this-query sheet, while it is up.
@@ -917,6 +921,7 @@ impl Workspace {
                 false => mock::tree(),
             },
             collapsed: HashSet::new(),
+            known_nodes: HashSet::new(),
             selected_node: match connecting {
                 true => None,
                 false => Some(12),
@@ -1757,7 +1762,26 @@ impl Workspace {
             .shortcut(":"),
         );
 
+        // The tree holds every connection the window has open; the palette is
+        // about the one in front. A list with three servers' tables in it
+        // would need a column saying which — and `Open` carries a schema and a
+        // name, which mean different tables on different servers.
+        let here = self.session.as_ref().map(|session| {
+            let config = &session.read(cx).config;
+            (config.id, config.database.clone())
+        });
         for node in &self.tree {
+            if let Some((id, database)) = &here {
+                let mine = node.origin.connection == *id
+                    && node
+                        .origin
+                        .database
+                        .as_ref()
+                        .is_none_or(|name| **name == *database);
+                if !mine {
+                    continue;
+                }
+            }
             // Relations only. A keyspace has no fixed list of objects to search
             // — the tree holds whatever the last scan happened to reach — so a
             // palette full of keys would be a palette that answers differently
@@ -2385,10 +2409,34 @@ impl Workspace {
             None => None,
         };
         self.rebuild_tree(cx);
-        self.collapsed = tree::initially_collapsed(&self.tree).into_iter().collect();
-        self.selected_node = None;
         self.catalog.set(snapshot);
         cx.notify();
+    }
+
+    /// Make the session a sidebar row belongs to the one the window is on,
+    /// so that whatever the click does next happens on the right server.
+    ///
+    /// Falls back to any session on that connection when the row's own
+    /// database has none: clicking `analytics` under a connection that is open
+    /// on `app` has to reach the server somehow, and `app`'s session is the
+    /// only thing that knows where the server is and how to log in to it.
+    pub(crate) fn focus_origin(&mut self, origin: &tree::Origin, cx: &mut Context<Self>) {
+        let exact = self.sessions.iter().find(|session| {
+            let held = &session.read(cx).config;
+            held.id == origin.connection
+                && origin
+                    .database
+                    .as_ref()
+                    .is_some_and(|name| held.database == **name)
+        });
+        let session = exact.or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.read(cx).config.id == origin.connection)
+        });
+        if let Some(session) = session.cloned() {
+            self.adopt_session(Some(session), cx);
+        }
     }
 
     /// What the connection in front can do.
@@ -2475,33 +2523,142 @@ impl Workspace {
         }
     }
 
-    /// Redraw the sidebar tree from whatever the window's session is holding.
+    /// Redraw the sidebar tree: every saved connection, and everything open
+    /// under each of them.
     ///
-    /// There are two kinds of catalog — a schema and a keyspace — and this is
-    /// the only place that knows it. Everything that needs a tree asks for one
-    /// rather than deciding which builder to call, so adding a third kind of
-    /// server is a third arm here and no branches anywhere else.
+    /// The whole sidebar and not the active session's corner of it. A window
+    /// holds a session per database already — that is what `session_for`
+    /// pools — and drawing only one of them was the sidebar throwing away
+    /// what the window knew: the database you were in five seconds ago lost
+    /// its disclosure triangle, and the other server lost its rows entirely.
     fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.session.clone() else {
-            self.tree = Vec::new();
-            return;
-        };
-        let session = session.read(cx);
-        let name = session.config.display_name();
-        let capabilities = session.config.capabilities();
-        self.tree = match (&session.snapshot, &session.keyspace) {
-            (Some(snapshot), _) => {
-                tree::from_snapshot(&name, snapshot, session.roles.as_deref(), capabilities)
+        let nodes = tree::from_servers(&self.servers(cx));
+        self.tree = nodes;
+        self.settle_collapse();
+    }
+
+    /// One root per connection, saved ones first and in the order they are
+    /// saved, so the sidebar does not reorder itself as connections open.
+    fn servers<'a>(&'a self, cx: &'a App) -> Vec<tree::Server<'a>> {
+        let mut servers: Vec<tree::Server<'a>> = Vec::new();
+        for config in &self.connections {
+            servers.push(self.server(config, cx));
+        }
+        // A session the saved list has never heard of — `TUPLI_CONNECT`, or a
+        // connection deleted while it was open. It is open, so it is on
+        // screen; it goes after the saved ones rather than nowhere.
+        for session in &self.sessions {
+            let config = &session.read(cx).config;
+            if servers.iter().any(|server| server.id == config.id) {
+                continue;
             }
-            (None, Some(keyspace)) => tree::from_keyspace(
-                &name,
-                &session.server_version(),
-                keyspace,
-                &session.keys,
-                session.keys_complete,
-            ),
-            (None, None) => Vec::new(),
+            servers.push(self.server(config, cx));
+        }
+        servers
+    }
+
+    /// One connection, and every session the window is holding on it.
+    fn server<'a>(&'a self, config: &'a db::ConnectionConfig, cx: &'a App) -> tree::Server<'a> {
+        let capabilities = config.capabilities();
+        let sessions: Vec<&'a Session> = self
+            .sessions
+            .iter()
+            .map(|session| session.read(cx))
+            .filter(|session| session.config.id == config.id)
+            .collect();
+
+        let databases = match (capabilities.dialect, capabilities.databases) {
+            // A keyspace draws its own databases further down, out of
+            // `INFO keyspace`. Listing them here as well would put a `0` row
+            // above `DB 0`: the same database twice, one of them empty.
+            (db::Dialect::Commands, _) => Vec::new(),
+            // Every database the server told us about, plus any that is open
+            // and it did not — a `TUPLI_CONNECT` against a database that
+            // `pg_database` would not list is still a database in front of
+            // you. Each carries its catalog if a session on it has one, and
+            // that is what makes it expandable: several open at once is the
+            // ordinary case, not a state to be collapsed out of.
+            (_, true) => {
+                let mut names: Vec<&'a str> = Vec::new();
+                for snapshot in sessions.iter().filter_map(|s| s.snapshot.as_deref()) {
+                    for name in &snapshot.databases {
+                        if !names.contains(&&**name) {
+                            names.push(name);
+                        }
+                    }
+                }
+                for session in &sessions {
+                    if !names.contains(&session.config.database.as_str()) {
+                        names.push(&session.config.database);
+                    }
+                }
+                names
+                    .into_iter()
+                    .map(|name| tree::Database {
+                        name,
+                        snapshot: sessions
+                            .iter()
+                            .find(|session| session.config.database == name)
+                            .and_then(|session| session.snapshot.as_deref()),
+                    })
+                    .collect()
+            }
+            // An engine whose schemas are its databases has one row per
+            // session and no level above them.
+            (_, false) => sessions
+                .iter()
+                .map(|session| tree::Database {
+                    name: &session.config.database,
+                    snapshot: session.snapshot.as_deref(),
+                })
+                .collect(),
         };
+        let keyspace = sessions.iter().find_map(|session| {
+            session.keyspace.as_deref().map(|keyspace| tree::Keys {
+                version: session.server_version().to_string().into(),
+                keyspace,
+                keys: &session.keys,
+                complete: session.keys_complete,
+            })
+        });
+
+        tree::Server {
+            id: config.id,
+            name: config.display_name().into(),
+            capabilities,
+            database: sessions.first().map(|session| &*session.config.database),
+            databases,
+            keyspace,
+            roles: sessions.iter().find_map(|session| session.roles.as_deref()),
+            // Where it would connect to until it has, and how far it has got
+            // once it is trying. A row that says nothing while a handshake is
+            // in flight is the sidebar pretending it did not hear the click.
+            state: match sessions.first().map(|session| session.state()) {
+                // Not the server's own words, which are a sentence: this
+                // column is forty pixels wide and the name is what has to
+                // survive in it. The sentence is in the status bar and in the
+                // console, which both have room for it.
+                Some(SessionState::Failed(_)) => Some("Could not connect".into()),
+                Some(state) => Some(state.label()),
+                None => Some(config.endpoint().into()),
+            },
+        }
+    }
+
+    /// Fold the branches that have never been on screen, and leave every
+    /// branch the reader has touched exactly as they left it.
+    ///
+    /// The alternative — recomputing the whole collapse set on every rebuild —
+    /// is what made opening a second database fold the first one: a catalog
+    /// arriving is not a reason to undo somebody's clicking.
+    fn settle_collapse(&mut self) {
+        for id in tree::initially_collapsed(&self.tree) {
+            if !self.known_nodes.contains(&id) {
+                self.collapsed.insert(id);
+            }
+        }
+        self.known_nodes
+            .extend(self.tree.iter().map(|node| node.id));
     }
 
     /// The titlebar's switcher: every database on this server, the open one
@@ -2734,10 +2891,20 @@ impl Workspace {
         let detail: SharedString = relation.schema.to_string().into();
 
         // Reuse the tab if this table is already open; otherwise add one.
+        // On the same server, though: two connections both have a `public.users`
+        // and they are not the same table, so the name alone is not enough to
+        // say the tab in front is the one being asked for. A tab that has not
+        // been bound yet — restored from the last session, seeded by
+        // `TUPLI_OPEN` — is exactly the tab this browse is meant to fill.
+        let open = self.session.clone();
         match self.pane().tabs.iter().position(|tab| {
             tab.kind == CenterKind::Table
                 && tab.title == title
                 && tab.detail.as_ref() == Some(&detail)
+                && tab
+                    .session
+                    .as_ref()
+                    .is_none_or(|held| Some(held) == open.as_ref())
         }) {
             Some(index) => {
                 // The seeded tabs are named after a table without knowing one:
@@ -3539,9 +3706,11 @@ impl Workspace {
         }
         if self.session.as_ref().is_some_and(|s| closed.contains(s)) {
             self.session = None;
-            self.tree.clear();
             self.catalog.set(None);
         }
+        // The other connections are still open and still have rows. Rebuilt
+        // rather than cleared: what went is one root out of several.
+        self.rebuild_tree(cx);
         cx.notify();
     }
 
@@ -3552,7 +3721,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SessionEvent::StateChanged => cx.notify(),
+            // The connection's row says how far it has got, so a handshake
+            // that finished — or failed — is a row that has to be redrawn.
+            SessionEvent::StateChanged => {
+                self.rebuild_tree(cx);
+                cx.notify();
+            }
             // The privileges pane redraws, and so does the grid: what the
             // connected role may do here is one of the reasons it is read-only.
             SessionEvent::PrivilegesChanged => {
@@ -3571,19 +3745,20 @@ impl Workspace {
                         .as_ref()
                         .map(|s| s.read(cx).config.database.clone())
                 );
-                // A catalog can arrive for a tab nobody is looking at — the
-                // one in the next tab along, still connecting while you read
-                // this one. It is kept on its own session and put on screen
-                // when that tab is activated; the window describes exactly one
-                // connection at a time, and this is not it.
-                if self.session.as_ref() != Some(&session) {
+                let mine = self.session.as_ref() == Some(&session);
+                let snapshot = session.read(cx).snapshot.clone();
+                // Every catalog goes into the tree, including one that arrived
+                // for a tab nobody is looking at: the sidebar draws every
+                // connection this window is holding, and a server that
+                // answered is a server with rows under it whether or not it is
+                // the one in front.
+                self.rebuild_tree(cx);
+                // The rest of the window is about one connection at a time,
+                // and this is not it.
+                if !mine {
                     cx.notify();
                     return;
                 }
-                let snapshot = session.read(cx).snapshot.clone();
-                self.rebuild_tree(cx);
-                self.collapsed = tree::initially_collapsed(&self.tree).into_iter().collect();
-                self.selected_node = None;
                 // And the consoles complete against the catalog they can now
                 // see. The editors hold a handle on this, so there is nothing
                 // to re-install: one write reaches every one of them, including

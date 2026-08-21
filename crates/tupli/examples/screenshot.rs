@@ -131,6 +131,41 @@ fn main() {
             }
         }
 
+        // `TUPLI_ALSO=<database>` opens a second database on the same server,
+        // which is the only way to photograph the sidebar holding two catalogs
+        // at once — and the state that used to fold the first one up.
+        if let Ok(database) = std::env::var("TUPLI_ALSO") {
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        workspace.open_database(&database, cx)
+                    })
+                    .expect("open a second database")
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                cx.run_until_parked();
+                let ready = cx.update(|cx| {
+                    window
+                        .read(cx)
+                        .map(|workspace| {
+                            // Its own row appears the moment the session is
+                            // made; what is being waited for is the catalog
+                            // under it.
+                            workspace.tree.iter().any(|node| {
+                                node.depth > 1
+                                    && node.origin.database.as_deref() == Some(&*database)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                if ready || std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
         // `TUPLI_RUN=<sql>` types a statement into the console and runs it, so
         // a frame can show what a failure looks like — the squiggle under the
         // character the server named — without a hand on the keyboard. Needs

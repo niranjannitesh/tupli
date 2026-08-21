@@ -4,7 +4,7 @@
 //! "where things live" and splitting it into separate panels would waste the
 //! narrowest, most contested space in the window.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{div, prelude::*, px, Context, IntoElement, ParentElement, Window};
@@ -102,103 +102,23 @@ impl Workspace {
             )
     }
 
-    /// Every saved connection, with the one the window is on opened into its
-    /// tree.
+    /// Every saved connection, each opened into its own tree.
     ///
-    /// The other connections stay on screen while one is open. Hiding them was
-    /// the sidebar saying a connection stops existing the moment you use
-    /// another one, and the only way back to the second server was Settings.
+    /// One list and not two. The sidebar used to draw the saved connections
+    /// itself and splice the tree in where the open one was, which made the
+    /// open connection a special case in a list of ordinary ones — and there
+    /// is more than one of them open now. The tree carries every connection,
+    /// so a connection with nothing under it is a row with no disclosure
+    /// triangle and nothing more to explain.
     fn render_database_tab(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         if self.connections.is_empty() && self.session.is_none() {
             return self.render_connections(cx);
         }
-        let open = self
-            .session
-            .as_ref()
-            .map(|session| session.read(cx).config.id);
-        // A session the saved list has never heard of — `TUPLI_CONNECT`, or a
-        // connection deleted while it was open. It is still what the window is
-        // showing, so it goes at the top rather than nowhere.
-        let adopted = open.is_some_and(|id| self.connections.iter().any(|c| c.id == id));
-        let mut rows = Vec::new();
-        if !adopted && self.session.is_some() {
-            rows.extend(self.render_open(cx));
-        }
-        let connecting = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.read(cx).activity() == Activity::Connecting);
-        for (index, config) in self.connections.iter().enumerate() {
-            if adopted && Some(config.id) == open {
-                rows.extend(self.render_open(cx));
-            } else {
-                rows.push(self.render_saved_connection(index, config, connecting, cx));
-            }
-        }
+        let mut rows = self.render_tree(cx);
         if rows.is_empty() {
             rows.push(no_matches());
         }
         rows
-    }
-
-    /// One closed connection: a row that opens it. The colour it was tagged
-    /// with is on the icon, which is the only mark a row this small has room
-    /// for and the one that survives being scanned rather than read.
-    fn render_saved_connection(
-        &self,
-        index: usize,
-        config: &db::ConnectionConfig,
-        connecting: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let config = config.clone();
-        let tint = crate::tint::tint(config.color, cx);
-        ListItem::new(("connection", index), config.display_name())
-            .icon(IconName::Plug)
-            .icon_color(match tint {
-                Some(tint) => IconColor::Custom(tint),
-                None => IconColor::Muted,
-            })
-            .meta(config.endpoint())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !connecting {
-                    this.open_connection(config.clone(), cx);
-                }
-            }))
-            .into_any_element()
-    }
-
-    /// The open connection: its tree, or the row the tree will grow out of.
-    ///
-    /// There is no tree until the snapshot lands, and the open connection's
-    /// saved row has already been given up to make space for it — so for as
-    /// long as the handshake took, the connection you had just clicked was the
-    /// one thing missing from the sidebar. A server that is slow to answer is
-    /// exactly when you are looking.
-    fn render_open(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        // `self.tree`, not the rows it rendered: a filter that matches nothing
-        // is a search with no hits, and answering it with the connection row
-        // would be the sidebar arguing with the box you just typed in.
-        if !self.tree.is_empty() {
-            return self.render_tree(cx);
-        }
-        let Some(session) = self.session.clone() else {
-            return Vec::new();
-        };
-        let (config, state) = {
-            let session = session.read(cx);
-            (session.config.clone(), session.state().label())
-        };
-        let tint = crate::tint::tint(config.color, cx);
-        vec![ListItem::new("connection-opening", config.display_name())
-            .icon(IconName::Plug)
-            .icon_color(match tint {
-                Some(tint) => IconColor::Custom(tint),
-                None => IconColor::Muted,
-            })
-            .meta(state)
-            .selected(true)
-            .into_any_element()]
     }
 
     fn render_tree(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -206,11 +126,19 @@ impl Workspace {
         // The tag a connection was given is the whole point of tagging it, so
         // it stays on the row once the connection is open — a red server that
         // turns accent-blue the moment you connect to it is a guardrail that
-        // works only while you do not need it.
-        let tint = self
-            .session
-            .as_ref()
-            .and_then(|session| crate::tint::tint(session.read(cx).config.color, cx));
+        // works only while you do not need it. Looked up per row, because
+        // there is more than one server on screen and the guardrail is worth
+        // nothing if every root wears the colour of the one in front.
+        let mut tints: HashMap<uuid::Uuid, Option<gpui::Hsla>> = HashMap::new();
+        for config in &self.connections {
+            tints.insert(config.id, crate::tint::tint(config.color, cx));
+        }
+        for session in &self.sessions {
+            let config = &session.read(cx).config;
+            tints
+                .entry(config.id)
+                .or_insert_with(|| crate::tint::tint(config.color, cx));
+        }
         let query = self.tree_filter.read(cx).text(cx);
         let query = query.trim();
         // While filtering, the disclosure state is ignored: a match five levels
@@ -243,8 +171,8 @@ impl Workspace {
             let id = node.id;
             let (icon, mut color) = icon_for(node, cx);
             if node.kind == NodeKind::Connection {
-                if let Some(tint) = tint {
-                    color = IconColor::Custom(tint);
+                if let Some(Some(tint)) = tints.get(&node.origin.connection) {
+                    color = IconColor::Custom(*tint);
                 }
             }
             rows.push(
@@ -304,14 +232,34 @@ impl Workspace {
                         // select, because there is nothing to open.
                         let node = this.tree.iter().find(|node| node.id == id).cloned();
                         match node {
+                            // A connection with nothing under it is a door:
+                            // the click is the one that connects.
+                            Some(node) if node.kind == NodeKind::Connection && !node.expandable => {
+                                let config = this
+                                    .connections
+                                    .iter()
+                                    .find(|config| config.id == node.origin.connection)
+                                    .cloned();
+                                if let Some(config) = config {
+                                    this.open_connection(config, cx);
+                                }
+                            }
                             Some(node) if node.kind == NodeKind::Database => {
                                 // The one already open is the row you clicked
                                 // to select it; `open_database` knows that and
                                 // does nothing.
+                                this.focus_origin(&node.origin, cx);
                                 this.open_database(&node.name.clone(), cx);
                             }
                             Some(node) => match node.target.clone() {
-                                Some(target) => this.open_target(&target, cx),
+                                Some(target) => {
+                                    // Which server this row came out of, before
+                                    // anything is opened on it: the tab about to
+                                    // be made binds to whatever the window is
+                                    // describing.
+                                    this.focus_origin(&node.origin, cx);
+                                    this.open_target(&target, cx)
+                                }
                                 // A schema or a folder has nothing to open, so
                                 // the click does the only thing it could have
                                 // meant: opens the row. Aiming for the eight

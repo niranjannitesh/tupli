@@ -84,6 +84,12 @@ impl Target {
 
 #[derive(Clone)]
 pub struct TreeNode {
+    /// A hash of the path from the connection down to this row, and not its
+    /// position: the sidebar holds several servers at once, each of which
+    /// gains and loses rows as catalogs land, and collapse state is remembered
+    /// by id. A positional id means opening a database three rows above
+    /// renumbers everything below it, and every branch the reader had open
+    /// folds onto a different branch.
     pub id: usize,
     pub depth: usize,
     pub kind: NodeKind,
@@ -94,14 +100,28 @@ pub struct TreeNode {
     /// What to open when the row is activated. `None` for the grouping rows,
     /// which exist only to be collapsed.
     pub target: Option<Target>,
+    /// Which session's row this is. Every row in the tree belongs to a
+    /// connection now that there is more than one of them on screen, and a
+    /// click has to say which server it meant before it says what it wanted.
+    pub origin: Origin,
+}
+
+/// The session a row belongs to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Origin {
+    pub connection: uuid::Uuid,
+    /// The database this row is under. `None` above the level where databases
+    /// are chosen — the connection row itself, and the roles beside them.
+    pub database: Option<SharedString>,
 }
 
 impl TreeNode {
     fn new(depth: usize, kind: NodeKind, name: impl Into<SharedString>) -> Self {
         Self {
-            // Assigned in one pass at the end: a node's identity is its
-            // position, and threading a counter through the builder would only
-            // make it easier to get wrong.
+            // Both filled in by a pass over the finished subtree — see
+            // [`identify`] and [`stamp`]. Neither is knowable here: an id is a
+            // hash of the path down to the row, and an origin is the same
+            // answer for every row under one root.
             id: 0,
             depth,
             kind,
@@ -109,6 +129,10 @@ impl TreeNode {
             meta: None,
             expandable: false,
             target: None,
+            origin: Origin {
+                connection: uuid::Uuid::nil(),
+                database: None,
+            },
         }
     }
 
@@ -140,55 +164,177 @@ impl TreeNode {
     }
 }
 
-/// Build the tree for one connected server.
+/// One connection as a root of the sidebar: the row, and whatever is open
+/// under it.
+///
+/// Borrowed rather than owned because the caller is already holding every
+/// session open, and the tree is rebuilt every time a catalog lands. Copying
+/// the catalogs in order to describe them would be the largest allocation in
+/// the app, made the most often.
+pub struct Server<'a> {
+    /// The saved connection's own id, which is what makes this root's node ids
+    /// its own. The id and not the name: two saved connections may both be
+    /// called `dev`, and a folded branch is remembered by node id.
+    pub id: uuid::Uuid,
+    pub name: SharedString,
+    pub capabilities: Capabilities,
+    /// The database the connection row itself stands for — the one a click on
+    /// the row, or on the roles beside it, should act on. A database row below
+    /// overrides it for its own subtree.
+    pub database: Option<&'a str>,
+    /// Every database on the server, in the order to draw them, each carrying
+    /// its catalog if a session on it has one yet.
+    pub databases: Vec<Database<'a>>,
+    pub keyspace: Option<Keys<'a>>,
+    pub roles: Option<&'a RoleSet>,
+    /// What the row says on the right while there is nothing under it yet:
+    /// where it would connect to, or how far it has got trying.
+    pub state: Option<SharedString>,
+}
+
+/// A database on a server, and its catalog if it has been read.
+pub struct Database<'a> {
+    pub name: &'a str,
+    /// `None` for a database that is on the server but that nobody has opened.
+    /// It is a name with nothing under it until it is clicked.
+    pub snapshot: Option<&'a SchemaSnapshot>,
+}
+
+/// A key-value server's keyspace, as far as it has been walked.
+pub struct Keys<'a> {
+    pub version: SharedString,
+    pub keyspace: &'a Keyspace,
+    pub keys: &'a [KeyInfo],
+    /// Whether the walk that produced `keys` reached the end.
+    pub complete: bool,
+}
+
+/// Build the whole sidebar: every connection, in the order they are saved.
 ///
 /// Grouping rows — "tables", "views", "functions" — appear only when they have
 /// something in them. A schema with no views should not make the reader check.
+pub fn from_servers(servers: &[Server]) -> Vec<TreeNode> {
+    let mut nodes = Vec::new();
+    for server in servers {
+        let from = nodes.len();
+        push_server(&mut nodes, server);
+        identify(&mut nodes[from..], seed(server.id));
+        stamp(&mut nodes[from..], server);
+    }
+    nodes
+}
+
+/// Build the tree for one connected server.
 pub fn from_snapshot(
     connection: &str,
     snapshot: &SchemaSnapshot,
     roles: Option<&RoleSet>,
     capabilities: Capabilities,
 ) -> Vec<TreeNode> {
-    let mut nodes = Vec::new();
+    let names = databases(snapshot);
+    let databases = match capabilities.databases {
+        true => names
+            .iter()
+            .map(|name| Database {
+                name,
+                // Only the open one has a catalog: a Postgres session sees one
+                // database and nothing else on the server.
+                snapshot: (**name == *snapshot.database).then_some(snapshot),
+            })
+            .collect(),
+        false => vec![Database {
+            name: &snapshot.database,
+            snapshot: Some(snapshot),
+        }],
+    };
+    from_servers(&[Server {
+        id: uuid::Uuid::nil(),
+        name: connection.to_string().into(),
+        capabilities,
+        database: Some(&snapshot.database),
+        databases,
+        keyspace: None,
+        roles,
+        state: None,
+    }])
+}
 
-    nodes.push(
-        TreeNode::new(0, NodeKind::Connection, connection.to_string())
-            .meta(short_version(&snapshot.server_version))
-            .expandable(),
-    );
-    match capabilities.databases {
-        // Every database on the server, not only the one that is open. A
-        // Postgres session sees exactly one database and nothing else on the
-        // server, so the others are names with nothing under them until one is
-        // clicked and the app connects again — which is why only the open one
-        // is expandable.
+/// Build the tree for one connected key-value server.
+pub fn from_keyspace(
+    connection: &str,
+    version: &str,
+    keyspace: &Keyspace,
+    keys: &[KeyInfo],
+    complete: bool,
+) -> Vec<TreeNode> {
+    from_servers(&[Server {
+        id: uuid::Uuid::nil(),
+        name: connection.to_string().into(),
+        capabilities: Capabilities::REDIS,
+        database: None,
+        databases: Vec::new(),
+        keyspace: Some(Keys {
+            version: version.to_string().into(),
+            keyspace,
+            keys,
+            complete,
+        }),
+        roles: None,
+        state: None,
+    }])
+}
+
+/// The rows of one connection, from its own row down.
+fn push_server(nodes: &mut Vec<TreeNode>, server: &Server) {
+    let root = nodes.len();
+    let version = server
+        .databases
+        .iter()
+        .filter_map(|db| db.snapshot)
+        .map(|snapshot| short_version(&snapshot.server_version))
+        .next()
+        .or_else(|| server.keyspace.as_ref().map(|k| short_version(&k.version)))
+        .or_else(|| server.state.as_ref().map(SharedString::to_string));
+    nodes.push(TreeNode::new(0, NodeKind::Connection, server.name.clone()).when_some(version));
+
+    match server.capabilities.databases {
+        // Every database on the server, not only the open one — and every one
+        // that has a catalog opens, not only the one the app is pointed at.
+        // Two databases open at once is the ordinary case: a schema in one and
+        // the table it is being compared against in the other.
         true => {
-            for database in databases(snapshot) {
-                let current = database == snapshot.database;
-                let mut node = TreeNode::new(1, NodeKind::Database, database.to_string());
-                if current {
+            for database in &server.databases {
+                let mut node = TreeNode::new(1, NodeKind::Database, database.name.to_string());
+                if let Some(snapshot) = database.snapshot {
                     node = node
                         .meta(plural(snapshot.schemas.len(), "schema", "schemas"))
                         .expandable();
                 }
                 nodes.push(node);
-                if current {
-                    push_schemas(&mut nodes, snapshot, 2);
+                if let Some(snapshot) = database.snapshot {
+                    push_schemas(nodes, snapshot, 2);
                 }
             }
         }
         // ClickHouse calls a schema a database and has nothing above it. The
         // level would be a row named `analytics` above a list that also
         // contains `analytics`, opening onto itself.
-        false => push_schemas(&mut nodes, snapshot, 1),
+        false => {
+            for snapshot in server.databases.iter().filter_map(|db| db.snapshot) {
+                push_schemas(nodes, snapshot, 1);
+            }
+        }
+    }
+
+    if let Some(keys) = &server.keyspace {
+        push_key_databases(nodes, keys, 1);
     }
 
     // After every database, because it is about all of them. Only when there
     // is more than one role: a server with nothing but `postgres` on it has no
     // access story to tell, and a folder that opens onto the name you are
     // already logged in as is a row that costs more than it says.
-    if let Some(roles) = roles.filter(|roles| roles.roles.len() > 1) {
+    if let Some(roles) = server.roles.filter(|roles| roles.roles.len() > 1) {
         nodes.push(
             TreeNode::new(1, NodeKind::RoleGroup, "roles")
                 .meta(roles.roles.len().to_string())
@@ -206,10 +352,65 @@ pub fn from_snapshot(
         }
     }
 
-    for (id, node) in nodes.iter_mut().enumerate() {
-        node.id = id;
+    // A connection with nothing under it is a door, not a folder: clicking it
+    // connects, and a disclosure triangle over an empty branch would promise
+    // rows that are not there yet. Decided by what was actually built rather
+    // than by predicting it, because there are four things that can put a row
+    // under a connection and every one of them can be absent.
+    nodes[root].expandable = nodes.len() > root + 1;
+}
+
+/// Give every row an id that is a hash of the path down to it.
+///
+/// The path and not the position, so that a branch the reader folded stays
+/// folded when a catalog arrives three rows above it — see [`TreeNode::id`].
+/// One pass, using the fact that the list is in visit order: the stack of
+/// ancestor ids is the prefix of the list at each depth.
+fn identify(nodes: &mut [TreeNode], seed: u64) {
+    use std::hash::{Hash, Hasher};
+    let mut stack: Vec<u64> = Vec::new();
+    for node in nodes {
+        stack.truncate(node.depth);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        stack.last().copied().unwrap_or(seed).hash(&mut hasher);
+        (node.kind as u8).hash(&mut hasher);
+        node.name.hash(&mut hasher);
+        let id = hasher.finish();
+        node.id = id as usize;
+        stack.push(id);
     }
-    nodes
+}
+
+/// Which session each row belongs to.
+///
+/// A pass afterwards rather than an argument to the six builders above,
+/// because it is the same answer for every row under one root and threading it
+/// through would only be six chances to forget.
+fn stamp(nodes: &mut [TreeNode], server: &Server) {
+    let base: Option<SharedString> = server.database.map(|name| name.to_string().into());
+    let mut database = base.clone();
+    for node in nodes {
+        // A database row and everything under it belongs to that database's
+        // session; the connection row and the roles beside it do not.
+        if node.depth <= 1 {
+            database = base.clone();
+        }
+        if node.kind == NodeKind::Database {
+            database = Some(node.name.clone());
+        }
+        node.origin = Origin {
+            connection: server.id,
+            database: database.clone(),
+        };
+    }
+}
+
+/// The connection id, as somewhere for the hashes to start.
+fn seed(id: uuid::Uuid) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Every schema in the snapshot, starting at `depth`.
@@ -318,35 +519,27 @@ fn role_meta(role: &Role, mine: bool) -> Option<String> {
     }
 }
 
-/// Build the tree for one connected key-value server.
+/// The `DB n` rows of a key-value server.
 ///
-/// The shape is a lie that everybody tells: Redis has one flat namespace and
-/// no folders at all, but every keyspace in the world is named `user:1:cart`
-/// and read as though the colons were slashes. So the colons are treated as
-/// slashes here, and the folders are labelled with what is actually under them
-/// rather than with a promise — see [`scanned`].
+/// The shape below them is a lie that everybody tells: Redis has one flat
+/// namespace and no folders at all, but every keyspace in the world is named
+/// `user:1:cart` and read as though the colons were slashes. So the colons are
+/// treated as slashes here, and the folders are labelled with what is actually
+/// under them rather than with a promise — see [`scanned`].
 ///
-/// `complete` is whether the walk that produced `keys` reached the end. It
+/// `Keys::complete` is whether the walk that produced them reached the end. It
 /// decides the wording and nothing else: a browser that has seen eight
 /// thousand of ten million keys must not draw a tree that looks like the
 /// keyspace.
-pub fn from_keyspace(
-    connection: &str,
-    version: &str,
-    keyspace: &Keyspace,
-    keys: &[KeyInfo],
-    complete: bool,
-) -> Vec<TreeNode> {
-    let mut nodes = vec![
-        TreeNode::new(0, NodeKind::Connection, connection.to_string())
-            .meta(short_version(version))
-            .expandable(),
-    ];
-
-    for database in &keyspace.databases {
-        let current = database.index == keyspace.current;
-        let mut node = TreeNode::new(1, NodeKind::KeyDatabase, format!("DB {}", database.index))
-            .meta(plural(database.keys as usize, "key", "keys"));
+fn push_key_databases(nodes: &mut Vec<TreeNode>, keys: &Keys, depth: usize) {
+    for database in &keys.keyspace.databases {
+        let current = database.index == keys.keyspace.current;
+        let mut node = TreeNode::new(
+            depth,
+            NodeKind::KeyDatabase,
+            format!("DB {}", database.index),
+        )
+        .meta(plural(database.keys as usize, "key", "keys"));
         // Only the open database has keys to show. Switching to another one
         // is a `SELECT` on the connection, which is what clicking it does.
         if current {
@@ -354,26 +547,25 @@ pub fn from_keyspace(
         }
         nodes.push(node);
         if current {
-            push_keys(&mut nodes, keys, 2);
+            push_keys(nodes, keys.keys, depth + 1);
         }
     }
 
     // A server that would not answer `INFO keyspace`, or one whose databases
     // are all empty: the connection is open and there is nothing under it, and
     // a tree with no database in it at all would read as a failure to connect.
-    if keyspace.databases.is_empty() {
+    if keys.keyspace.databases.is_empty() {
         nodes.push(
-            TreeNode::new(1, NodeKind::KeyDatabase, format!("DB {}", keyspace.current))
-                .meta(scanned(keys.len(), complete))
-                .expandable(),
+            TreeNode::new(
+                depth,
+                NodeKind::KeyDatabase,
+                format!("DB {}", keys.keyspace.current),
+            )
+            .meta(scanned(keys.keys.len(), keys.complete))
+            .expandable(),
         );
-        push_keys(&mut nodes, keys, 2);
+        push_keys(nodes, keys.keys, depth + 1);
     }
-
-    for (id, node) in nodes.iter_mut().enumerate() {
-        node.id = id;
-    }
-    nodes
 }
 
 /// The keys, folded into folders on their colons.
@@ -473,7 +665,34 @@ fn ttl_meta(ttl: Option<i64>) -> Option<String> {
 /// through `public` → `tables` to reach the only tables on the server is two
 /// clicks charged for no information. Its folders open with it; what is inside
 /// them does not, because that is where the row counts get large.
+///
+/// Judged one catalog at a time. "One schema, so open it" is a fact about a
+/// single database, and with several of them on screen at once a count over
+/// the whole tree would let one connection decide how another one opens.
 pub fn initially_collapsed(nodes: &[TreeNode]) -> Vec<usize> {
+    let mut ids = Vec::new();
+    let mut rest: Vec<&TreeNode> = Vec::new();
+    let mut index = 0;
+    while index < nodes.len() {
+        if nodes[index].kind == NodeKind::Database {
+            let end = extent(nodes, index);
+            // The database row itself is not part of the scope it heads: it
+            // stays open either way, and counting it in would put the floor a
+            // level too high.
+            rest.push(&nodes[index]);
+            collapse(&nodes[index + 1..end].iter().collect::<Vec<_>>(), &mut ids);
+            index = end;
+            continue;
+        }
+        rest.push(&nodes[index]);
+        index += 1;
+    }
+    collapse(&rest, &mut ids);
+    ids
+}
+
+/// One catalog's worth of rows, judged on its own.
+fn collapse(nodes: &[&TreeNode], ids: &mut Vec<usize>) {
     let schemas = nodes
         .iter()
         .filter(|node| node.kind == NodeKind::Schema)
@@ -492,11 +711,22 @@ pub fn initially_collapsed(nodes: &[TreeNode]) -> Vec<usize> {
         true => level + 2,
         false => level,
     };
-    nodes
-        .iter()
-        .filter(|node| node.expandable && node.depth >= floor)
-        .map(|node| node.id)
-        .collect()
+    ids.extend(
+        nodes
+            .iter()
+            .filter(|node| node.expandable && node.depth >= floor)
+            .map(|node| node.id),
+    );
+}
+
+/// Where the subtree rooted at `start` ends.
+fn extent(nodes: &[TreeNode], start: usize) -> usize {
+    let depth = nodes[start].depth;
+    let mut end = start + 1;
+    while end < nodes.len() && nodes[end].depth > depth {
+        end += 1;
+    }
+    end
 }
 
 /// The database names to list, current one included.
@@ -661,12 +891,148 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_is_flat_and_ids_are_positions() {
+    fn the_tree_is_flat_and_in_visit_order() {
         let nodes = from_snapshot("local", &snapshot(), None, Capabilities::POSTGRES);
-        assert!(nodes.iter().enumerate().all(|(i, node)| node.id == i));
         assert_eq!(nodes[0].kind, NodeKind::Connection);
         assert_eq!(nodes[0].meta.as_deref(), Some("16.4"));
         assert_eq!(nodes[1].kind, NodeKind::Database);
+        assert_eq!(nodes[1].depth, 1);
+        let ids: std::collections::HashSet<usize> = nodes.iter().map(|node| node.id).collect();
+        assert_eq!(ids.len(), nodes.len(), "every row is its own key");
+    }
+
+    #[test]
+    fn a_rows_id_is_its_path_and_survives_another_database_opening() {
+        let snapshot = snapshot();
+        let server = |databases| Server {
+            id: uuid::Uuid::from_u128(7),
+            name: "local".into(),
+            capabilities: Capabilities::POSTGRES,
+            database: Some("app"),
+            databases,
+            keyspace: None,
+            roles: None,
+            state: None,
+        };
+        let one = from_servers(&[server(vec![Database {
+            name: "app",
+            snapshot: Some(&snapshot),
+        }])]);
+        // `app_test` opens too, and sorts *before* `app` — so every row of
+        // `app` moves down the list. Positional ids would renumber all of
+        // them, and the reader's folded branches would land somewhere else.
+        let two = from_servers(&[server(vec![
+            Database {
+                name: "app_test",
+                snapshot: Some(&snapshot),
+            },
+            Database {
+                name: "app",
+                snapshot: Some(&snapshot),
+            },
+        ])]);
+        let users = |nodes: &[TreeNode]| {
+            nodes
+                .iter()
+                .find(|node| {
+                    node.kind == NodeKind::Table
+                        && node.name == "users"
+                        && node.origin.database.as_deref() == Some("app")
+                })
+                .map(|node| node.id)
+                .expect("app.public.users")
+        };
+        assert_eq!(users(&one), users(&two));
+    }
+
+    #[test]
+    fn two_connections_with_the_same_name_do_not_share_a_single_id() {
+        let snapshot = snapshot();
+        let server = |id| Server {
+            id,
+            name: "dev".into(),
+            capabilities: Capabilities::POSTGRES,
+            database: Some("app"),
+            databases: vec![Database {
+                name: "app",
+                snapshot: Some(&snapshot),
+            }],
+            keyspace: None,
+            roles: None,
+            state: None,
+        };
+        let nodes = from_servers(&[
+            server(uuid::Uuid::from_u128(1)),
+            server(uuid::Uuid::from_u128(2)),
+        ]);
+        let ids: std::collections::HashSet<usize> = nodes.iter().map(|node| node.id).collect();
+        assert_eq!(ids.len(), nodes.len());
+        // …and each row knows which of the two it came out of, which is the
+        // only way a click on the second `app` reaches the second server.
+        let roots: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Connection)
+            .map(|node| node.origin.connection)
+            .collect();
+        assert_eq!(
+            roots,
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)]
+        );
+    }
+
+    #[test]
+    fn a_database_nobody_has_opened_is_a_name_and_a_click() {
+        let snapshot = snapshot();
+        let nodes = from_servers(&[Server {
+            id: uuid::Uuid::nil(),
+            name: "local".into(),
+            capabilities: Capabilities::POSTGRES,
+            database: None,
+            databases: vec![
+                Database {
+                    name: "app",
+                    snapshot: Some(&snapshot),
+                },
+                Database {
+                    name: "app_test",
+                    snapshot: None,
+                },
+            ],
+            keyspace: None,
+            roles: None,
+            state: None,
+        }]);
+        let databases: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Database)
+            .collect();
+        assert!(databases[0].expandable);
+        assert!(!databases[1].expandable);
+        // Both open at once is the case this whole tree exists for: the second
+        // one's rows are under it, not instead of the first one's.
+        assert!(nodes
+            .iter()
+            .any(|node| node.origin.database.as_deref() == Some("app")
+                && node.kind == NodeKind::Schema));
+    }
+
+    #[test]
+    fn a_connection_with_nothing_open_says_where_it_would_go() {
+        let nodes = from_servers(&[Server {
+            id: uuid::Uuid::nil(),
+            name: "staging".into(),
+            capabilities: Capabilities::POSTGRES,
+            database: None,
+            databases: Vec::new(),
+            keyspace: None,
+            roles: None,
+            state: Some("db.internal:5432".into()),
+        }]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].meta.as_deref(), Some("db.internal:5432"));
+        // No triangle: there is nothing behind it until the click that
+        // connects, and an empty branch would promise rows that are not there.
+        assert!(!nodes[0].expandable);
     }
 
     #[test]

@@ -108,6 +108,10 @@ pub fn tree() -> Vec<TreeNode> {
             target: kind.is_relation().then(|| {
                 crate::tree::Target::Relation(db::RelationRef::new("public", name))
             }),
+            origin: crate::tree::Origin {
+                connection: uuid::Uuid::nil(),
+                database: None,
+            },
         })
         .collect()
 }

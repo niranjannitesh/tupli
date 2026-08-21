@@ -58,8 +58,9 @@ test with server version and latency, colour tag per connection that tints the w
 window. New Connection is a window of its own, like Settings, rather than a dialog over
 the work.
 
-**Browsing** — schema tree over multiple databases, schemas, tables, views, materialized
-views; virtualized grid with frozen gutter, resizable columns, NULL and type-aware
+**Browsing** — a schema tree that holds every connection at once, each with as many of its
+databases open as you have been into; tables, views and materialized views under every one
+of them; virtualized grid with frozen gutter, resizable columns, NULL and type-aware
 rendering; keyset paging over large tables; per-column filters.
 
 **Editing** — double-click a cell to edit it, type-checked against the column; inserts,
@@ -112,9 +113,8 @@ question is never "is this Redis?" but "can these rows be edited?".
 
 ## Not there yet
 
-SSH tunnelling · more than one connection open at a time (the sidebar shows the active one)
-· writing to Redis · ClickHouse beyond reading well · a signed release, an update channel,
-or any upgrade path for the local store · anything that is not macOS.
+SSH tunnelling · writing to Redis · ClickHouse beyond reading well · a signed release, an
+update channel, or any upgrade path for the local store · anything that is not macOS.
 
 ## Build it
 
@@ -204,7 +204,7 @@ everything above the drivers is written against it. Adding an engine is a varian
 ## Developing
 
 ```sh
-cargo test --workspace          # 595 tests
+cargo test --workspace          # 602 tests
 cargo build --workspace --examples
 ```
 
