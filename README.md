@@ -121,7 +121,7 @@ update channel, or any upgrade path for the local store · anything that is not 
 Rust 1.97 or newer, Xcode command line tools, macOS 13+.
 
 ```sh
-git clone git@github.com:anuvaya/tupli.git
+git clone git@github.com:niranjannitesh/tupli.git
 cd tupli
 scripts/dev-identity.sh   # once — see below
 scripts/run.sh
