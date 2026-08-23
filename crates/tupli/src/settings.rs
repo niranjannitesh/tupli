@@ -285,7 +285,16 @@ impl Settings {
         // its greens and its selection are, and every one of them was chosen
         // against that accent. Overriding it from a picker would leave the
         // rest of the palette answering to a colour that is no longer there.
-        ThemeRegistry::resolve(self.theme_name(appearance), appearance, cx)
+        self.theme_named(self.theme_name(appearance), appearance, cx)
+    }
+
+    /// A named theme, dressed in the settings that are not part of a theme.
+    ///
+    /// Split out for the palette's preview, which is showing a theme nobody
+    /// has chosen yet — the code face and its size still have to survive it,
+    /// or arrowing down the theme list would resize the editor on every row.
+    pub fn theme_named(&self, name: &str, appearance: Appearance, cx: &gpui::App) -> Theme {
+        ThemeRegistry::resolve(name, appearance, cx)
             .with_mono_family(self.mono_family().to_string())
             .with_mono_size(gpui::px(self.mono_size()))
     }

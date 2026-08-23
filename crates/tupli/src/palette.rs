@@ -87,6 +87,18 @@ impl PaletteMode {
     }
 }
 
+/// A theme row: which theme, and which of the two appearances it is.
+///
+/// One value rather than two arguments everywhere, because to a person it is
+/// one decision — choosing Ayu Light *is* choosing to be in light mode, which
+/// is why the palette lists dark and light themes in one flat list instead of
+/// behind a mode switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThemeChoice {
+    pub name: SharedString,
+    pub appearance: Appearance,
+}
+
 /// What choosing a row does.
 ///
 /// The palette carries these to the workspace rather than acting on them,
@@ -100,7 +112,7 @@ pub enum PaletteAction {
     Open(db::RelationRef),
     /// Load a saved query into the editor.
     LoadQuery(uuid::Uuid),
-    Theme(Appearance),
+    Theme(ThemeChoice),
     /// One-based, as it is typed and as the status bar reports it.
     GoToLine(usize),
     /// Re-enter the palette in another mode. Never leaves the palette.
@@ -365,8 +377,9 @@ pub enum PaletteEvent {
     Dismissed,
     /// The arrow keys landed on a theme. Applied at once and taken back if the
     /// palette is dismissed, which is the only way to choose a theme by looking
-    /// at it rather than by reading its name.
-    Preview(Appearance),
+    /// at it rather than by reading its name. Applied, not saved: nothing is
+    /// written down until a row is actually chosen.
+    Preview(ThemeChoice),
     Chose(PaletteAction),
 }
 
@@ -390,9 +403,9 @@ pub struct Palette {
     selected: usize,
     scroll: ScrollHandle,
     matcher: Matcher,
-    /// The appearance the window had when the palette opened, restored if the
-    /// palette is dismissed after previewing another one.
-    original: Appearance,
+    /// The theme the window was wearing when the palette opened, restored if
+    /// the palette is dismissed after previewing another one.
+    original: ThemeChoice,
     previewing: bool,
     _subscription: Subscription,
 }
@@ -439,7 +452,10 @@ impl Palette {
             selected: 0,
             scroll: ScrollHandle::new(),
             matcher: Matcher::new(Config::DEFAULT),
-            original: cx.theme().appearance,
+            original: ThemeChoice {
+                name: cx.theme().name.clone(),
+                appearance: cx.theme().appearance,
+            },
             previewing: false,
             _subscription,
         };
@@ -473,6 +489,14 @@ impl Palette {
         self.candidates = self.build_candidates(cx);
         self.set_placeholder(cx);
         self.filter(cx);
+        // Typing a filter moves the highlight as surely as an arrow key does,
+        // so it previews too — otherwise `#gruv` would leave the top row lit
+        // but unapplied, and only the arrow *back* onto it would show it. Not
+        // on an empty needle, though: opening the palette must not repaint the
+        // window before the reader has asked for anything.
+        if !self.needle(cx).is_empty() {
+            self.preview_selection(cx);
+        }
     }
 
     fn set_placeholder(&self, cx: &mut Context<Self>) {
@@ -482,7 +506,6 @@ impl Palette {
     }
 
     fn build_candidates(&self, cx: &gpui::App) -> Vec<PaletteItem> {
-        let appearance = cx.theme().appearance;
         match self.mode {
             // Commands first: someone who typed nothing is far more likely to
             // be looking for a verb than for a particular table, and the tables
@@ -505,22 +528,43 @@ impl Palette {
                 .filter(|item| item.kind == ItemKind::Object)
                 .cloned()
                 .collect(),
-            PaletteMode::Themes => [Appearance::Dark, Appearance::Light]
-                .into_iter()
-                .map(|which| {
-                    PaletteItem::new(
-                        ItemKind::Theme,
-                        PaletteAction::Theme(which),
-                        ui::Theme::of(which).name,
-                    )
-                    .icon(if which.is_dark() {
-                        IconName::Moon
-                    } else {
-                        IconName::Sun
+            // Every installed theme, dark and light in one list, in the same
+            // order the Settings window shows them: two lists of the same
+            // thing in two different orders is how someone learns that one of
+            // them is lying.
+            PaletteMode::Themes => {
+                // The theme on screen, not the one saved for this
+                // appearance: those differ mid-preview, and the tick belongs
+                // against what the reader is looking at.
+                let current = cx.theme().name.clone();
+                ui::ThemeRegistry::global(cx)
+                    .map(|registry| {
+                        registry
+                            .all()
+                            .into_iter()
+                            .map(|theme| {
+                                let choice = ThemeChoice {
+                                    name: theme.name.clone(),
+                                    appearance: theme.appearance,
+                                };
+                                PaletteItem::new(
+                                    ItemKind::Theme,
+                                    PaletteAction::Theme(choice),
+                                    theme.name.clone(),
+                                )
+                                // No swatches here — a palette row is one line
+                                // of text — so the moon and the sun carry the
+                                // whole of which half of the list this is.
+                                .icon(match theme.appearance.is_dark() {
+                                    true => IconName::Moon,
+                                    false => IconName::Sun,
+                                })
+                                .current(theme.name == current)
+                            })
+                            .collect()
                     })
-                    .current(which == appearance)
-                })
-                .collect(),
+                    .unwrap_or_default()
+            }
             // The line number is typed, not chosen, so the list is however many
             // rows the number is valid for: one, or none.
             PaletteMode::Line => Vec::new(),
@@ -651,10 +695,11 @@ impl Palette {
         let Some(item) = self.selected_item() else {
             return;
         };
-        if let PaletteAction::Theme(appearance) = item.action {
-            self.previewing = true;
-            cx.emit(PaletteEvent::Preview(appearance));
-        }
+        let PaletteAction::Theme(choice) = item.action.clone() else {
+            return;
+        };
+        self.previewing = true;
+        cx.emit(PaletteEvent::Preview(choice));
     }
 
     fn selected_item(&self) -> Option<&PaletteItem> {
@@ -686,7 +731,7 @@ impl Palette {
 
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         if self.previewing {
-            cx.emit(PaletteEvent::Preview(self.original));
+            cx.emit(PaletteEvent::Preview(self.original.clone()));
         }
         cx.emit(PaletteEvent::Dismissed);
     }
@@ -1026,6 +1071,34 @@ mod tests {
         let label = "Ärger Query";
         assert_eq!(char_ranges(label, &[0]), vec![0..2]);
         assert_eq!(char_ranges(label, &[1]), vec![2..3]);
+    }
+
+    /// The bug this replaced: the `#` list was two hard-coded rows, so a build
+    /// that ships four theme families offered two of them and the Settings
+    /// window offered ten.
+    #[gpui::test]
+    fn the_theme_list_is_every_installed_theme(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            ui::Theme::set_global(ui::Theme::dark(), cx);
+            ui::ThemeRegistry::init(&[], cx);
+        });
+        let palette = cx.update(|cx| cx.new(|cx| Palette::new(Vec::new(), "#", cx)));
+        let (installed, listed) = cx.update(|cx| {
+            let installed = ui::ThemeRegistry::global(cx).unwrap().all().len();
+            let listed: Vec<String> = palette
+                .read(cx)
+                .candidates
+                .iter()
+                .map(|item| item.label.to_string())
+                .collect();
+            (installed, listed)
+        });
+
+        assert_eq!(listed.len(), installed);
+        assert!(listed.len() > 2, "only the built-ins: {listed:?}");
+        // Both halves in one list, which is the whole point of it being flat.
+        assert!(listed.iter().any(|name| name == "Ayu Dark"), "{listed:?}");
+        assert!(listed.iter().any(|name| name == "Ayu Light"), "{listed:?}");
     }
 
     #[test]

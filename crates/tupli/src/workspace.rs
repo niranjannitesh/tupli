@@ -1848,7 +1848,7 @@ impl Workspace {
     ) {
         match event {
             PaletteEvent::Dismissed => self.close_palette(cx),
-            PaletteEvent::Preview(appearance) => self.apply_appearance(*appearance, cx),
+            PaletteEvent::Preview(choice) => self.preview_theme(choice.clone(), cx),
             PaletteEvent::Chose(action) => {
                 let action = action.clone();
                 self.close_palette(cx);
@@ -1867,7 +1867,10 @@ impl Workspace {
                     self.load_saved_query(index, cx);
                 }
             }
-            PaletteAction::Theme(appearance) => self.set_appearance(appearance, cx),
+            PaletteAction::Theme(choice) => self.update_settings(
+                |settings| settings.choose_theme(&choice.name, choice.appearance),
+                cx,
+            ),
             PaletteAction::GoToLine(line) => {
                 self.pane()
                     .editor
@@ -1880,18 +1883,20 @@ impl Workspace {
         }
     }
 
-    /// Show an appearance without committing to it. What the palette's `#`
-    /// mode does while you arrow through the list — it may yet be escaped out
-    /// of, and a preview that wrote to disk would be a choice.
+    /// Show a theme without committing to it. What the palette's `#` mode does
+    /// while you arrow through the list — it may yet be escaped out of, and a
+    /// preview that wrote to disk would be a choice.
     ///
-    /// The theme is built from the settings rather than from `Theme::of`, or
-    /// flipping to light would quietly throw away the accent and the code size
-    /// on the way past.
-    fn apply_appearance(&mut self, appearance: ui::Appearance, cx: &mut Context<Self>) {
-        if cx.theme().appearance == appearance {
+    /// The theme is dressed by the settings rather than taken raw, or arrowing
+    /// past a row would quietly throw away the code face and its size.
+    fn preview_theme(&mut self, choice: crate::palette::ThemeChoice, cx: &mut Context<Self>) {
+        let theme = self
+            .settings
+            .theme_named(&choice.name, choice.appearance, cx);
+        if cx.theme().name == theme.name {
             return;
         }
-        ui::Theme::set_global(self.settings.theme(appearance, cx), cx);
+        ui::Theme::set_global(theme, cx);
         self.refresh_everything(cx);
     }
 
@@ -1985,12 +1990,6 @@ impl Workspace {
                 Err(error) => log::warn!("could not open the settings window: {error:#}"),
             },
         );
-    }
-
-    /// Pick an appearance and keep it. A chosen palette row and the Settings
-    /// window both land here.
-    fn set_appearance(&mut self, appearance: ui::Appearance, cx: &mut Context<Self>) {
-        self.update_settings(|settings| settings.set_appearance(appearance), cx);
     }
 
     /// The one place a named command runs. The palette, the shortcuts and the
