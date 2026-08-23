@@ -16,6 +16,17 @@ const names = files
   .map((f) => f.slice(0, -4))
   .sort();
 
+// The one arm in the generated file that wants explaining. Kept here because
+// the file it lands in is overwritten on every run, so a comment written into
+// the output survives only until somebody adds an icon.
+const duoNotes = {
+  "panel-bottom":
+    "            // The panel toggles shade the region they open, which is the\n" +
+    "            // second layer; drawn `.flat()` they are the same outline with\n" +
+    "            // nothing in it, and that is exactly what \"closed\" should look\n" +
+    "            // like.\n",
+};
+
 const variant = (n) =>
   n
     .split("-")
@@ -56,7 +67,10 @@ ${names.map((n) => `            Self::${variant(n)} => "icons/${n}.svg",`).join(
         Some(SharedString::new_static(match self {
 ${names
   .filter((n) => duo.has(n))
-  .map((n) => `            Self::${variant(n)} => "icons/${n}.duo.svg",`)
+  .map(
+    (n) =>
+      `${duoNotes[n] ?? ""}            Self::${variant(n)} => "icons/${n}.duo.svg",`
+  )
   .join("\n")}
             _ => return None,
         }))
