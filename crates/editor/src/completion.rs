@@ -38,6 +38,20 @@ impl CompletionKind {
         }
     }
 
+    /// What to call it in prose. The hover panel writes it out beside the
+    /// name, because an icon alone does not distinguish a view from a table to
+    /// anyone who has not learned the icons yet.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Column => "column",
+            Self::Table => "table",
+            Self::View => "view",
+            Self::Function => "function",
+            Self::Schema => "schema",
+            Self::Keyword => "keyword",
+        }
+    }
+
     pub fn color(self) -> IconColor {
         match self {
             Self::Column => IconColor::Accent,

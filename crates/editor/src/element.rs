@@ -155,6 +155,8 @@ struct Frame {
     placeholder: Option<ShapedLine>,
     /// Rows spanned by the statement ⌘⏎ would run.
     statement_rows: Option<Range<usize>>,
+    /// The word the open hover panel is describing.
+    hovered: Option<Range<usize>>,
 }
 
 impl Frame {
@@ -185,6 +187,28 @@ impl Frame {
                 }
             }
         }
+    }
+
+    /// Char offset the pointer is *over*, as opposed to nearest to.
+    ///
+    /// A click to the right of a line puts the caret at the end of it; a
+    /// pointer there is over nothing at all, and a panel describing the last
+    /// word of the line would be describing something nobody is pointing at.
+    fn offset_over(&self, p: Point<Pixels>) -> Option<usize> {
+        if !self.text_bounds.contains(&p) {
+            return None;
+        }
+        let y = p.y - self.text_bounds.origin.y + self.scroll.y;
+        if y < px(0.) {
+            return None;
+        }
+        let row = (f32::from(y) / f32::from(self.line_height)).floor() as usize;
+        let line = self.lines.iter().find(|l| l.row == row)?;
+        let x = p.x - self.text_bounds.origin.x + self.scroll.x;
+        if x < px(0.) || x > line.shaped.width {
+            return None;
+        }
+        Some(line.start + line.column_for_x(x))
     }
 }
 
@@ -335,6 +359,7 @@ impl Element for EditorElement {
                 mode: editor.mode,
                 show_line_numbers: editor.show_line_numbers && editor.mode == EditorMode::Full,
                 statement_rows,
+                hovered: editor.hover.as_ref().map(|open| open.range.clone()),
                 texts,
                 spans,
                 errors,
@@ -415,6 +440,7 @@ impl Element for EditorElement {
             show_line_numbers: frame_seed.show_line_numbers,
             placeholder,
             statement_rows: frame_seed.statement_rows,
+            hovered: frame_seed.hovered,
         };
 
         PrepaintState { hitbox, frame }
@@ -559,6 +585,31 @@ impl Element for EditorElement {
                 let row_end = line.start + line.len;
                 let text_x = f.text_bounds.origin.x - f.scroll.x;
 
+                // Under the selection, so that selecting the word the panel
+                // describes still looks like a selection and not like a third
+                // colour nobody chose.
+                if let Some(word) = &f.hovered {
+                    if word.end >= row_start && word.start <= row_end {
+                        let a = word.start.clamp(row_start, row_end) - row_start;
+                        let b = word.end.clamp(row_start, row_end) - row_start;
+                        let x0 = text_x + line.x_for_column(a);
+                        let x1 = text_x + line.x_for_column(b);
+                        if x1 > x0 {
+                            window.paint_quad(gpui::quad(
+                                Bounds {
+                                    origin: point(x0, y),
+                                    size: size(x1 - x0, f.line_height),
+                                },
+                                px(2.),
+                                c.active,
+                                px(0.),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::Solid,
+                            ));
+                        }
+                    }
+                }
+
                 for sel in &f.selections {
                     if sel.is_empty() {
                         continue;
@@ -670,6 +721,7 @@ struct FrameSeed {
     mode: EditorMode,
     show_line_numbers: bool,
     statement_rows: Option<Range<usize>>,
+    hovered: Option<Range<usize>>,
     texts: Vec<(usize, usize, String)>,
     /// Colours for each entry of `texts`, in the same order. Empty when there
     /// is no highlighter at all.
@@ -725,6 +777,7 @@ impl EditorElement {
                         // Clicking somewhere else is an answer of "none of
                         // these" to whatever the popup was offering.
                         editor.close_completions(cx);
+                        editor.close_hover(cx);
                         editor.dragging = true;
                         editor.place_cursor(offset, e.modifiers.shift, cx);
                     }
@@ -736,17 +789,29 @@ impl EditorElement {
         }
 
         {
+            let hitbox = hitbox.clone();
             let editor = editor.clone();
             let f = f.clone();
-            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble || !e.dragging() {
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
                     return;
                 }
-                if !editor.read(cx).dragging {
+                if e.dragging() {
+                    if !editor.read(cx).dragging {
+                        return;
+                    }
+                    let offset = f.offset_at(e.position);
+                    editor.update(cx, |editor, cx| editor.place_cursor(offset, true, cx));
                     return;
                 }
-                let offset = f.offset_at(e.position);
-                editor.update(cx, |editor, cx| editor.place_cursor(offset, true, cx));
+                // Resting on a name is the whole gesture: no click, no
+                // modifier. Off the end of a line and outside the editor both
+                // come back `None`, and both mean the same thing to the panel.
+                let over = match hitbox.is_hovered(window) {
+                    true => f.offset_over(e.position),
+                    false => None,
+                };
+                editor.update(cx, |editor, cx| editor.hover_at(over, cx));
             });
         }
 

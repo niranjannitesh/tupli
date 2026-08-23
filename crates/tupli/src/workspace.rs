@@ -425,6 +425,9 @@ fn build_pane(
         // pane built before the connection was made still completes against the
         // schema once it arrives.
         editor.set_completions(catalog.clone());
+        // The same catalog answers both questions, which is the point of them
+        // being two traits on one type: what could go here, and what is that.
+        editor.set_hover(catalog.clone());
         editor
     });
     // The clause is SQL, so it is highlighted and set in mono like the console

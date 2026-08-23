@@ -9,8 +9,8 @@ use std::ops::Range;
 
 use gpui::{
     div, point, px, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, SharedString,
-    Size, Styled, Task, UTF16Selection, Window,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, ScrollHandle,
+    SharedString, Size, Styled, Task, UTF16Selection, Window,
 };
 use gpui::StatefulInteractiveElement as _;
 use ui::{ActiveTheme, SyntaxTheme};
@@ -18,6 +18,7 @@ use ui::{ActiveTheme, SyntaxTheme};
 use crate::buffer::{Buffer, Point};
 use crate::completion::{self, CompletionContext, CompletionSource};
 use crate::history::{Edit, EditKind, History};
+use crate::hover::{HoverContext, HoverInfo, HoverSource};
 use crate::movement;
 use crate::selection::{Selection, SelectionSet};
 
@@ -171,6 +172,26 @@ pub struct Editor {
     pub(crate) source: Option<Box<dyn crate::completion::CompletionSource>>,
     /// The open popup, if there is one.
     pub(crate) completion: Option<CompletionState>,
+
+    // ---- hover -----------------------------------------------------------
+    /// Where "what is that?" gets answered. `None` — the default — means this
+    /// editor explains nothing, which is right for every field that is not SQL.
+    pub(crate) hover_source: Option<Box<dyn HoverSource>>,
+    /// The open panel, if there is one.
+    pub(crate) hover: Option<HoverState>,
+    /// The word the pointer is over that has not yet been rested on long
+    /// enough. Kept separately from `hover` so that drifting across a name
+    /// does not restart the wait on every pixel.
+    hover_pending: Option<Range<usize>>,
+    hover_task: Option<Task<()>>,
+}
+
+/// An open hover panel.
+pub(crate) struct HoverState {
+    /// The word it describes, so the pointer moving within that word leaves it
+    /// alone and moving out of it takes it away.
+    pub(crate) range: Range<usize>,
+    pub(crate) info: HoverInfo,
 }
 
 /// An open completion popup.
@@ -179,6 +200,10 @@ pub(crate) struct CompletionState {
     pub(crate) selected: usize,
     /// The chars an accepted offer replaces: the word that was being typed.
     pub(crate) range: Range<usize>,
+    /// The list scrolls, so the highlight has to be able to drag it: forty
+    /// offers is four times what fits, and an arrow key that moved a selection
+    /// out of sight would look like it had stopped working.
+    pub(crate) scroll: ScrollHandle,
 }
 
 /// How long the caret stays in each state.
@@ -224,6 +249,10 @@ impl Editor {
             history: History::default(),
             source: None,
             completion: None,
+            hover_source: None,
+            hover: None,
+            hover_pending: None,
+            hover_task: None,
         }
     }
 
@@ -327,6 +356,14 @@ impl Editor {
         self.completion.is_some()
     }
 
+    /// Install the thing that answers "what is that?". Separate from
+    /// [`Self::set_completions`] because they are separate questions: a field
+    /// may want offers and no explanations, and the console wants both from
+    /// the same catalog.
+    pub fn set_hover(&mut self, source: impl HoverSource) {
+        self.hover_source = Some(Box::new(source));
+    }
+
     /// Rebuild the popup for wherever the cursor is now.
     ///
     /// `explicit` is ⌃Space: it opens the list even where nothing has been
@@ -384,10 +421,18 @@ impl Editor {
             .and_then(|open| open.items.get(open.selected))
             .and_then(|was| items.iter().position(|item| item == was))
             .unwrap_or(0);
+        let scroll = match self.completion.take() {
+            // Narrowing the same popup keeps its scroll, so a list that grew
+            // shorter under the cursor does not also jump.
+            Some(open) => open.scroll,
+            None => ScrollHandle::new(),
+        };
+        scroll.scroll_to_item(selected);
         self.completion = Some(CompletionState {
             items,
             selected,
             range,
+            scroll,
         });
         cx.notify();
     }
@@ -406,6 +451,7 @@ impl Editor {
         // Wraps, because a list this short is faster to walk round than to walk
         // back through.
         open.selected = (open.selected as isize + delta).rem_euclid(len) as usize;
+        open.scroll.scroll_to_item(open.selected);
         cx.notify();
     }
 
@@ -419,13 +465,35 @@ impl Editor {
             return;
         };
         let range = open.range;
-        let text = item.text().to_string();
+        let mut text = item.text().to_string();
+
+        // A function is a thing you call, so it completes as a call and leaves
+        // the caret between the brackets — accepting `coalesce` and then
+        // reaching for shift-9 is two gestures for one word. Not when the
+        // brackets are already there, either in the offer or in the text the
+        // cursor is sitting in front of: completing over `count(1)` must not
+        // make it `count()(1)`.
+        let cursor = self.selections.newest().head;
+        let call = item.kind == completion::CompletionKind::Function
+            && !text.ends_with('(')
+            && self.buffer.char_at(cursor) != Some('(');
+        if call {
+            text.push_str("()");
+        }
+
         self.edit_with(EditKind::Other, cx, move |_, sel| {
             // The word may have grown since the popup opened — the cursor is
             // always its end, so take the end from the cursor rather than from
             // what was recorded.
             Some((range.start..sel.head.max(range.start), text.clone()))
         });
+        if call {
+            // Between the brackets rather than after them. `edit_with` leaves
+            // every cursor at the end of what it inserted, which is the right
+            // default for everything else it does.
+            let head = self.selections.newest().head.saturating_sub(1);
+            self.selections.set(vec![Selection::cursor(head)]);
+        }
         cx.notify();
     }
 
@@ -1160,6 +1228,10 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Typing answers the question the panel was answering, and the text
+        // under it is about to move anyway.
+        self.close_hover(cx);
+
         let k = &event.keystroke;
         let m = k.modifiers;
         let extend = m.shift;
@@ -1357,6 +1429,96 @@ impl Editor {
     }
 }
 
+// ---- hover ---------------------------------------------------------------
+
+/// How long the pointer has to sit still on a name before the panel appears.
+///
+/// Long enough that crossing a query on the way somewhere else does not flash
+/// four panels, short enough that resting on a word feels like it answered
+/// rather than like it eventually got round to it.
+const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(320);
+
+impl Editor {
+    /// The pointer is over this offset, or over nothing.
+    ///
+    /// Public because posing a pointer is the only way to photograph the panel,
+    /// and the screenshot harness has no mouse. Called on every mouse move
+    /// otherwise, so the work up to the timer has to be cheap:
+    /// finding the word is a scan of a few characters, and asking the source
+    /// what it means — which may walk the whole statement — waits for the rest.
+    pub fn hover_at(&mut self, offset: Option<usize>, cx: &mut Context<Self>) {
+        if self.hover_source.is_none() {
+            return;
+        }
+        // Before the text is copied: this runs on every mouse move anywhere in
+        // the window, and most of those are over nothing.
+        let Some(offset) = offset else {
+            return self.close_hover(cx);
+        };
+        // Still inside the word already answered for, which is where the
+        // pointer spends most of its time once it has stopped.
+        let inside = |range: &Range<usize>| range.contains(&offset);
+        if self.hover.as_ref().is_some_and(|open| inside(&open.range))
+            || self.hover_pending.as_ref().is_some_and(inside)
+        {
+            return;
+        }
+
+        let text = self.buffer.text();
+        let Some((range, qualifier)) = crate::hover::word_around(&text, offset) else {
+            return self.close_hover(cx);
+        };
+        // Still the same word. Without this the wait would restart on every
+        // pixel of a slow drift and the panel would never arrive.
+        let showing = self.hover.as_ref().map(|open| &open.range) == Some(&range);
+        if showing || self.hover_pending.as_ref() == Some(&range) {
+            return;
+        }
+
+        self.close_hover(cx);
+        self.hover_pending = Some(range.clone());
+        let word: String = text.chars().skip(range.start).take(range.len()).collect();
+        let wanted = range.clone();
+        self.hover_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_DELAY).await;
+            this.update(cx, |this, cx| {
+                // The pointer has moved on in the meantime, and the answer it
+                // waited for is about a word nobody is looking at any more.
+                if this.hover_pending.as_ref() != Some(&wanted) {
+                    return;
+                }
+                let context = HoverContext {
+                    text,
+                    offset: range.start,
+                    word,
+                    qualifier,
+                };
+                let info = this
+                    .hover_source
+                    .as_ref()
+                    .and_then(|source| source.hover(&context));
+                // Nothing to say is the common case — keywords, literals,
+                // names the catalog has never heard of — and it shows nothing
+                // rather than an empty box.
+                if let Some(info) = info {
+                    this.hover = Some(HoverState { range, info });
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Take the panel away, and forget any wait in flight.
+    pub fn close_hover(&mut self, cx: &mut Context<Self>) {
+        self.hover_pending = None;
+        self.hover_task = None;
+        if self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+}
+
 /// The closing half of a pair, if `c` opens one.
 ///
 /// Backticks are not here: Postgres does not use them, and a `` ` `` in a query
@@ -1435,6 +1597,9 @@ impl Editor {
         // top does not bank up a large positive number to unwind later.
         self.scroll.x = (self.scroll.x - delta.x).max(px(0.));
         self.scroll.y = (self.scroll.y - delta.y).max(px(0.));
+        // The panel is anchored to a word that has just moved out from under
+        // the pointer, so it is now pointing at whatever slid into its place.
+        self.close_hover(cx);
         cx.notify();
     }
 
@@ -1487,6 +1652,9 @@ impl Editor {
             // A popup belonging to an editor nobody is typing in is a menu
             // floating over the window with nothing behind it.
             self.completion = None;
+            self.hover = None;
+            self.hover_pending = None;
+            self.hover_task = None;
         }
         cx.notify();
     }
@@ -1692,6 +1860,7 @@ impl Render for Editor {
             .clone()
             .unwrap_or_else(|| crate::element::EditorStyle::mono(cx));
         let popup = self.render_completions(cx);
+        let hover = self.render_hover(cx);
         div()
             .id("editor")
             .track_focus(&self.focus)
@@ -1702,6 +1871,7 @@ impl Render for Editor {
             .on_key_down(cx.listener(Self::on_key))
             .child(crate::element::EditorElement::new(cx.entity(), style))
             .children(popup)
+            .children(hover)
     }
 }
 
@@ -1709,6 +1879,11 @@ impl Render for Editor {
 /// edge moves as the longest name in it changes reads as flicker, and the
 /// widest thing on offer is usually a type name nobody is aiming at.
 const POPUP_WIDTH: f32 = 320.;
+
+/// How wide the hover panel is. Wider than the completion popup, because a
+/// column's type and its default are read as sentences rather than scanned as
+/// a list, and wrapping them costs more than the width does.
+const HOVER_WIDTH: f32 = 380.;
 
 impl Editor {
     /// The completion popup, anchored under the word it is completing.
@@ -1791,11 +1966,136 @@ impl Editor {
                             .id("completions")
                             .max_h(px(height - 8.))
                             .overflow_y_scroll()
+                            .track_scroll(&open.scroll)
                             .children(rows),
                     ),
             )
             // Above the grid and the panel splitters, which are the only other
             // things in the window that draw over the editor.
+            .with_priority(1),
+        )
+    }
+
+    /// The hover panel, anchored over the word it describes.
+    ///
+    /// Above the line by preference, unlike the completion popup: the pointer
+    /// is sitting on the word, and a panel below it would be a panel the hand
+    /// is covering.
+    fn render_hover(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // One popup at a time. They answer different questions but they would
+        // be drawn in the same place, and the one the caret is driving wins.
+        if self.completion.is_some() {
+            return None;
+        }
+        let open = self.hover.as_ref()?;
+        let layout = self.layout?;
+        let c = cx.colors().clone();
+        let m = cx.metrics().clone();
+        let ty = cx.typography().clone();
+        let info = open.info.clone();
+
+        let word = self.approximate_bounds(open.range.clone())?;
+        let x = (word.origin.x - layout.bounds.origin.x).max(px(0.));
+        let x = x
+            .min(layout.bounds.size.width - px(HOVER_WIDTH) - px(8.))
+            .max(px(0.));
+        // Estimated rather than measured, and only to choose a side: an
+        // anchored overlay that has to be laid out first arrives a frame late,
+        // and being a few pixels out about which half of the pane has room is
+        // not a mistake anybody can see.
+        let height = 34.
+            + info.subtitle.is_some() as u8 as f32 * 20.
+            + info.rows.len() as f32 * 18.
+            + info.doc.is_some() as u8 as f32 * 34.;
+        let top = word.origin.y - layout.bounds.origin.y;
+        let y = match f32::from(top) < height + 6. {
+            true => top + layout.line_height + px(4.),
+            false => px(f32::from(top) - height - 6.),
+        };
+
+        let rows: Vec<_> = info
+            .rows
+            .iter()
+            .map(|(label, value)| {
+                div()
+                    .flex()
+                    .gap_2()
+                    // A column rather than free-running text: two or three of
+                    // these get scanned down the left edge, and a ragged one
+                    // has to be read.
+                    .child(
+                        div()
+                            .w(px(68.))
+                            .flex_none()
+                            .text_color(c.text_subtle)
+                            .child(label.clone()),
+                    )
+                    .child(div().text_color(c.text_muted).child(value.clone()))
+            })
+            .collect();
+
+        Some(
+            gpui::deferred(
+                div()
+                    .absolute()
+                    .left(px(f32::from(x)))
+                    .top(px(f32::from(y)))
+                    // Wide enough for the longest line and no wider: a fixed
+                    // width is right for the completion list, whose rows are
+                    // all the same shape, and wrong here, where three words
+                    // about a column would leave two thirds of the box empty.
+                    .max_w(px(HOVER_WIDTH))
+                    .rounded(m.radius)
+                    .bg(c.overlay)
+                    .border_1()
+                    .border_color(c.border_strong)
+                    .shadow_lg()
+                    .p(px(8.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(ty.ui_size_sm)
+                    .text_color(c.text)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                ui::Icon::new(info.kind.icon())
+                                    .size(ui::IconSize::XSmall)
+                                    .color(info.kind.color()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(ty.mono_family.clone())
+                                    .child(info.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_color(c.text_subtle)
+                                    .child(SharedString::from(info.kind.label())),
+                            ),
+                    )
+                    .children(info.subtitle.clone().map(|subtitle| {
+                        div()
+                            .font_family(ty.mono_family.clone())
+                            .text_color(c.text_muted)
+                            .child(subtitle)
+                    }))
+                    .children(match rows.is_empty() {
+                        true => None,
+                        false => Some(div().flex().flex_col().gap_0p5().children(rows)),
+                    })
+                    .children(info.doc.clone().map(|doc| {
+                        div()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(c.border)
+                            .text_color(c.text_muted)
+                            .child(doc)
+                    })),
+            )
             .with_priority(1),
         )
     }

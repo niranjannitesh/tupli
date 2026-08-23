@@ -249,6 +249,32 @@ fn main() {
             cx.run_until_parked();
         }
 
+        // `TUPLI_HOVER=<word>` rests the pointer on the first occurrence of a
+        // word in the console. There is no mouse here, so the offset is found
+        // in the text and handed to the editor directly; the clock then has to
+        // be pushed past the panel's own delay.
+        if let Ok(word) = std::env::var("TUPLI_HOVER") {
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        workspace.pane().editor.clone().update(cx, |editor, cx| {
+                            let text = editor.text();
+                            match text.find(&word) {
+                                Some(at) => {
+                                    let offset = text[..at].chars().count() + 1;
+                                    editor.hover_at(Some(offset), cx);
+                                }
+                                None => eprintln!("warning: no {word:?} in the console"),
+                            }
+                        });
+                    })
+                    .expect("hover the word")
+            });
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(500));
+            cx.run_until_parked();
+        }
+
         if let Ok(sql) = std::env::var("TUPLI_RUN") {
             // How many statements had finished before this one was sent. The
             // window may already be showing an answer — `TUPLI_OPEN` browses a
