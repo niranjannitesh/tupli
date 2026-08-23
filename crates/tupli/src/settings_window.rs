@@ -627,17 +627,17 @@ impl SettingsWindow {
                             .icon(IconName::Plug)
                             .meta(meta)
                             .on_click(move |_, _, cx| {
-                                // The sheet belongs to the main window — it is where a
-                                // connection is tested and opened — so editing one from
-                                // here brings that window forward rather than putting a
-                                // second copy of the form in this one.
+                                // The form is its own window, and there is only ever one
+                                // of it, so editing from here hands the existing window
+                                // another connection rather than putting a second copy
+                                // of the form in this one. It raises itself; raising the
+                                // main window here would land on top of it.
                                 let _ = workspace.update(cx, |workspace, cx| {
                                     if let Some(config) =
                                         workspace.connections.iter().find(|c| c.id == id).cloned()
                                     {
                                         workspace.edit_connection(config, cx);
                                     }
-                                    workspace.raise(cx);
                                 });
                             })
                     })),
@@ -653,7 +653,6 @@ impl SettingsWindow {
                             move |_, _, cx| {
                                 let _ = workspace.update(cx, |workspace, cx| {
                                     workspace.new_connection(cx);
-                                    workspace.raise(cx);
                                 });
                             }
                         }),

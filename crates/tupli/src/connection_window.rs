@@ -733,7 +733,7 @@ impl Render for ConnectionForm {
             )
             .children(match &self.test {
                 Test::Untried => None,
-                Test::Running => Some(Notice::new(NoticeTone::Info, "Connecting…")),
+                Test::Running => Some(Notice::new(NoticeTone::Info, "Connecting…").busy()),
                 Test::Reached(version) => {
                     Some(Notice::new(NoticeTone::Success, "Connected").detail(version.clone()))
                 }

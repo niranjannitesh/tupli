@@ -17,7 +17,7 @@ use gpui::{
 };
 use ui::{
     h_flex, v_flex, ActiveTheme, Axis, BadgeTone, Icon, IconColor, IconName, IconSize, Label,
-    LabelSize, ResizeHandle, StatusBar,
+    LabelSize, ResizeHandle, Spinner, StatusBar,
 };
 
 use editor::{Editor, EditorMode, Input};
@@ -2368,13 +2368,48 @@ impl Workspace {
             held.id == config.id && held.database == config.database
         });
         if let Some(session) = open {
-            return session.clone();
+            let session = session.clone();
+            // A session whose last attempt failed is not an open one, and
+            // handing it back is what left a connection that went down with no
+            // way back up: every route to the server ends here. Reconnecting
+            // the entity rather than making a second one keeps the tabs that
+            // are already bound to it, so a retry brings the server back to
+            // where it was rather than beside itself.
+            if session.read(cx).state().is_failed() {
+                session.update(cx, |session, cx| session.retry(config, password, cx));
+            }
+            return session;
         }
         let session = cx.new(|_| Session::with_password(config, password));
         cx.subscribe(&session, Self::on_session_event).detach();
         session.update(cx, |session, cx| session.connect(cx));
         self.sessions.push(session.clone());
         session
+    }
+
+    /// Whether an attempt on this connection is in flight right now.
+    ///
+    /// A connect can take as long as the network takes, and until it lands the
+    /// row the reader clicked looks exactly like the row they clicked — which
+    /// is indistinguishable from a click that missed.
+    pub(crate) fn connection_connecting(&self, id: uuid::Uuid, cx: &App) -> bool {
+        self.sessions.iter().any(|session| {
+            let session = session.read(cx);
+            session.config.id == id && session.activity() == Activity::Connecting
+        })
+    }
+
+    /// Whether the last attempt on this connection ended in an error.
+    ///
+    /// A failed row keeps whatever the tree had under it before the server
+    /// went away, so "nothing under it" is not enough to tell a door from a
+    /// room — which is what left a `Could not connect` row with no gesture
+    /// that would try again.
+    pub(crate) fn connection_failed(&self, id: uuid::Uuid, cx: &App) -> bool {
+        self.sessions.iter().any(|session| {
+            let session = session.read(cx);
+            session.config.id == id && session.state().is_failed()
+        })
     }
 
     /// Point the active tab at a connection, and the window with it.
@@ -4830,7 +4865,18 @@ impl Workspace {
             .start_child(
                 h_flex()
                     .gap(px(5.))
-                    .child(div().size(px(7.)).rounded_full().bg(dot))
+                    // While connecting the dot turns into a spinner: it is
+                    // the same indicator in the same place, and a still amber
+                    // dot cannot say whether the attempt is under way or has
+                    // quietly stopped.
+                    .map(|el| match &state {
+                        SessionState::Connecting => el.child(
+                            Spinner::new("status-connecting")
+                                .size(IconSize::XSmall)
+                                .color(IconColor::Warning),
+                        ),
+                        _ => el.child(div().size(px(7.)).rounded_full().bg(dot)),
+                    })
                     .child(
                         Label::new(server)
                             .size(LabelSize::Small)

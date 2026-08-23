@@ -10,8 +10,8 @@ use std::time::Duration;
 use gpui::{div, prelude::*, px, Context, IntoElement, ParentElement, Window};
 use ui::{
     region, v_flex, ActiveTheme, Button, ButtonSize, ButtonVariant, Disclosure, EmptyState,
-    IconColor, IconName, Label, LabelSize, ListItem, SectionHeader, Segmented, Tab, TabBar,
-    Toolbar, Tooltip,
+    IconColor, IconName, IconSize, Label, LabelSize, ListItem, SectionHeader, Segmented, Spinner,
+    Tab, TabBar, Toolbar, Tooltip,
 };
 
 use crate::session::Activity;
@@ -146,6 +146,15 @@ impl Workspace {
                 .entry(config.id)
                 .or_insert_with(|| crate::tint::tint(config.color, cx));
         }
+        // Which servers are being dialled, gathered once rather than asked per
+        // row: the answer is the same for every row and the tree is long.
+        let connecting: HashSet<uuid::Uuid> = self
+            .connections
+            .iter()
+            .map(|config| config.id)
+            .chain(self.sessions.iter().map(|s| s.read(cx).config.id))
+            .filter(|id| self.connection_connecting(*id, cx))
+            .collect();
         let query = self.tree_filter.read(cx).text(cx);
         let query = query.trim();
         // While filtering, the disclosure state is ignored: a match five levels
@@ -202,6 +211,15 @@ impl Workspace {
                     .icon(icon)
                     .icon_color(color)
                     .selected(selected == Some(id))
+                    .when(
+                        node.kind == NodeKind::Connection
+                            && connecting.contains(&node.origin.connection),
+                        |el| {
+                            el.end_child(
+                                Spinner::new(("tree-connecting", id)).size(IconSize::XSmall),
+                            )
+                        },
+                    )
                     .when_some(node.meta.clone(), |el, meta| el.meta(meta))
                     .on_toggle(cx.listener(move |this, _, _, cx| {
                         if !this.collapsed.remove(&id) {
@@ -240,8 +258,15 @@ impl Workspace {
                         let node = this.tree.iter().find(|node| node.id == id).cloned();
                         match node {
                             // A connection with nothing under it is a door:
-                            // the click is the one that connects.
-                            Some(node) if node.kind == NodeKind::Connection && !node.expandable => {
+                            // the click is the one that connects. So is one
+                            // whose last attempt failed — the row still has
+                            // yesterday's databases under it, and without this
+                            // there is nothing anywhere that tries again.
+                            Some(node)
+                                if node.kind == NodeKind::Connection
+                                    && (!node.expandable
+                                        || this.connection_failed(node.origin.connection, cx)) =>
+                            {
                                 let config = this
                                     .connections
                                     .iter()
@@ -294,10 +319,10 @@ impl Workspace {
     /// open. This is the app's front door: on a first launch it is the only
     /// thing in the window with anything to say.
     fn render_connections(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let connecting = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.read(cx).activity() == Activity::Connecting);
+        let connecting = self.session.as_ref().and_then(|session| {
+            let session = session.read(cx);
+            (session.activity() == Activity::Connecting).then_some(session.config.id)
+        });
 
         if self.connections.is_empty() {
             return vec![div()
@@ -331,8 +356,15 @@ impl Workspace {
                         None => IconColor::Muted,
                     })
                     .meta(config.endpoint())
+                    // The spinner is the whole answer to "did my click land":
+                    // the list stays up for the length of the connect, so
+                    // without it the front door does nothing visible until the
+                    // tree replaces it.
+                    .when(connecting == Some(config.id), |el| {
+                        el.end_child(Spinner::new(("connecting", index)).size(IconSize::XSmall))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !connecting {
+                        if connecting.is_none() {
                             this.open_connection(config.clone(), cx);
                         }
                     }))

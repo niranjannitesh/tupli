@@ -17,6 +17,7 @@ mod list;
 mod menu;
 mod select;
 mod sheet;
+mod spinner;
 mod styled_ext;
 mod tab;
 mod theme;
@@ -39,6 +40,7 @@ pub use list::{Disclosure, ListItem};
 pub use menu::{ContextMenu, MenuItem};
 pub use select::Segmented;
 pub use sheet::{FormRow, Notice, NoticeTone, Sheet};
+pub use spinner::Spinner;
 pub use styled_ext::{h_flex, v_flex, StyledExt};
 pub use tab::{Tab, TabBar};
 pub use theme::{

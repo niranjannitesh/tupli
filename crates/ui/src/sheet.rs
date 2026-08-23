@@ -19,7 +19,7 @@ use crate::icon_name::IconName;
 use crate::label::{Label, LabelSize};
 use crate::styled_ext::{h_flex, v_flex, StyledExt};
 use crate::theme::ActiveTheme;
-use crate::{Button, ButtonSize, Icon};
+use crate::{Button, ButtonSize, Icon, Spinner};
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
@@ -318,6 +318,7 @@ pub struct Notice {
     tone: NoticeTone,
     message: SharedString,
     detail: Option<SharedString>,
+    busy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -334,11 +335,20 @@ impl Notice {
             tone,
             message: message.into(),
             detail: None,
+            busy: false,
         }
     }
 
     pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    /// Say that the notice is about something still happening: the tone's icon
+    /// becomes a spinner. Without it a notice reads as a verdict, and "Testing
+    /// the connection…" under a tidy blue circle looks like it has finished.
+    pub fn busy(mut self) -> Self {
+        self.busy = true;
         self
     }
 }
@@ -361,13 +371,19 @@ impl RenderOnce for Notice {
             .py(px(8.))
             .rounded(cx.metrics().radius_sm)
             .bg(bg)
-            .child(
-                div().flex_none().pt(px(1.)).child(
-                    Icon::new(icon)
-                        .size(IconSize::Small)
-                        .color(IconColor::Custom(fg)),
-                ),
-            )
+            .child(div().flex_none().pt(px(1.)).child(if self.busy {
+                // Keyed by the message, because two notices waiting at once
+                // would otherwise be one element as far as gpui is concerned.
+                Spinner::new(SharedString::from(format!("notice-{}", self.message)))
+                    .size(IconSize::Small)
+                    .color(IconColor::Custom(fg))
+                    .into_any_element()
+            } else {
+                Icon::new(icon)
+                    .size(IconSize::Small)
+                    .color(IconColor::Custom(fg))
+                    .into_any_element()
+            }))
             .child(
                 v_flex()
                     .flex_1()

@@ -43,6 +43,10 @@ impl SessionState {
         matches!(self, Self::Connected)
     }
 
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+
     /// The one-line summary the status bar shows.
     pub fn label(&self) -> SharedString {
         match self {
@@ -297,6 +301,23 @@ impl Session {
 
     pub fn is_busy(&self) -> bool {
         self.activity != Activity::Idle
+    }
+
+    /// Connect again, taking the connection's details afresh.
+    ///
+    /// The config and the password are replaced rather than kept, because the
+    /// usual reason a failed connection is retried is that something about it
+    /// was wrong and has just been corrected. A `None` password means "ask the
+    /// Keychain", which is what a password field left alone means as well.
+    pub fn retry(
+        &mut self,
+        config: ConnectionConfig,
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.config = config;
+        self.password = password;
+        self.connect(cx);
     }
 
     /// Open the connection and read the catalog, in one operation.
