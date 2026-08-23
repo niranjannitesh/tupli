@@ -32,23 +32,21 @@ Opens instantly. Scrolls a million rows without dropping a frame. Never blocks o
 > ### ⚠️ Alpha. In development.
 >
 > Tupli is being built in the open and is **not ready to be anyone's daily driver**. There
-> is nothing to download yet, no update channel and no upgrade path for the local store —
-> it is `scripts/run.sh` or nothing. Things move, break and get renamed.
+> is no update channel and no upgrade path for the local store — a new version is a new
+> download, and the settings it finds are whatever the last one left. Things move, break
+> and get renamed.
 >
 > It reads and writes real databases. Point it at something you can afford to be wrong
 > about until it has more mileage on it.
 
 ## Why
 
-TablePlus is fast and closed. pgAdmin is a web app in a wrapper. DataGrip is a JVM that
-takes a minute to think about it. All three make you wait — on launch, on a wide table, on
-a scroll to row 400,000.
+For fun. That's it, that's the why.
 
-GPUI is Zed's UI framework: GPU-composited, no DOM, no view hierarchy diffing. That buys a
-result grid that is genuinely virtualized and a window that is on screen before you have
-let go of the keys. Everything below the UI — connection pool, query execution,
-introspection — is off the main thread by construction, so a slow query slows the query
-and nothing else.
+It is built on GPUI, Zed's UI framework — GPU-composited, no DOM, no view hierarchy
+diffing — because writing a native Mac app in Rust is the fun part. Everything below the
+UI is off the main thread by construction, so a slow query slows the query and nothing
+else.
 
 ## What works today
 
@@ -117,9 +115,16 @@ question is never "is this Redis?" but "can these rows be edited?".
 
 ## Not there yet
 
-SSH tunnelling · writing to Redis · ClickHouse beyond reading well · a published
-download, an update channel, or any upgrade path for the local store · anything that is
-not macOS.
+SSH tunnelling · writing to Redis · ClickHouse beyond reading well · an update channel or
+any upgrade path for the local store · anything that is not macOS.
+
+## Download it
+
+[**Tupli 0.0.2**](https://github.com/niranjannitesh/tupli/releases/latest) — a universal
+disk image, signed and notarized, macOS 13 or newer. Drag it to Applications and open it;
+there is no first-launch warning to click through.
+
+Or build it yourself.
 
 ## Build it
 
