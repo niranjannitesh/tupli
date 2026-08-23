@@ -21,11 +21,12 @@ use gpui::{
     black, fill, point, px, relative, size, App, Bounds, ContentMask, Corners, CursorStyle,
     DispatchPhase, Element, ElementId, Entity, Font, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
     InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollWheelEvent, Style, TextAlign, TextRun, Window,
+    MouseUpEvent, Pixels, Point, ScrollWheelEvent, Style, TextAlign, TextRun, TransformationMatrix,
+    Window,
 };
 use smallvec::SmallVec;
 use sqlgen::{PendingChanges, RowRef};
-use ui::ActiveTheme;
+use ui::{ActiveTheme, IconName};
 
 use crate::state::{
     is_right_aligned, CellRect, ColumnLayout, Grid, GridEvent, Sort, SCROLLBAR, SCROLLBAR_INSET,
@@ -45,35 +46,55 @@ enum Region {
 /// Grab distance for a column edge, each side.
 const EDGE_GRAB: f32 = 4.;
 
-/// Space reserved at the right of every header cell for the sort arrow. Wide
-/// enough for the glyph plus the gap that keeps it off the column border.
-const SORT_ARROW_WIDTH: Pixels = px(14.);
+/// Space reserved at the right of every header cell for the sort chevron: the
+/// glyph, then the gap that keeps it off the column border. The glyph carries a
+/// margin of its own — the artwork fills about three quarters of its box — so
+/// the two pixels here are all that has to be added by hand.
+const SORT_ARROW_WIDTH: Pixels = px(16.);
 
-/// A sort arrow, drawn as three stacked bars rather than as a glyph.
+/// How big the chevron itself is drawn, inside [`SORT_ARROW_WIDTH`].
+const SORT_ARROW_GLYPH: Pixels = px(14.);
+
+/// The chevron that says which way a column is sorted.
 ///
-/// A triangle would need a path, and a font glyph would need the header to
-/// shape a second run for a shape that is four pixels tall. Three quads that
-/// step in width read as an arrowhead at this size and cost nothing.
+/// It is the same `chevron-up` / `chevron-down` file the disclosure triangles
+/// and the dropdowns use, so the header points the way the rest of the window
+/// points. This was three stacked quads once, on the theory that an arrowhead
+/// four pixels tall did not justify an asset; at that size the steps ran
+/// together and it read as a smudge rather than as a direction.
 fn paint_sort_arrow(
     bounds: Bounds<Pixels>,
     descending: bool,
-    color: gpui::Hsla,
+    color: Hsla,
     window: &mut Window,
+    cx: &App,
 ) {
-    const BAR: f32 = 1.5;
-    let widths = [px(7.), px(5.), px(3.)];
-    let top = bounds.origin.y + (bounds.size.height - px(BAR * 3. + 2.)) / 2.;
-    let center = bounds.origin.x + bounds.size.width / 2. - px(1.);
-    for (i, w) in widths.iter().enumerate() {
-        // Ascending points up, so the widest bar is at the bottom.
-        let step = if descending { i } else { widths.len() - 1 - i };
-        window.paint_quad(fill(
-            Bounds {
-                origin: point(center - *w / 2., top + px(BAR as f32 + 1.) * step as f32),
-                size: size(*w, px(BAR)),
-            },
-            color,
-        ));
+    let icon = if descending {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronUp
+    };
+    // Left of the slot, so the leftover falls between the chevron and the
+    // border rather than between the chevron and the name it belongs to.
+    let glyph = Bounds {
+        origin: point(
+            bounds.origin.x,
+            bounds.origin.y + (bounds.size.height - SORT_ARROW_GLYPH) / 2.,
+        ),
+        size: size(SORT_ARROW_GLYPH, SORT_ARROW_GLYPH),
+    };
+    // A missing or unparseable icon costs the column its arrow and nothing
+    // else; the header still sorts, and taking the frame down over it would be
+    // out of all proportion.
+    if let Err(error) = window.paint_svg(
+        glyph,
+        icon.path(),
+        None,
+        TransformationMatrix::unit(),
+        color,
+        cx,
+    ) {
+        log::warn!("sort chevron: {error:#}");
     }
 }
 /// Shortest a scrollbar thumb may get. Without a floor, a million rows produce
@@ -328,7 +349,7 @@ impl Element for GridElement {
             if std::mem::take(&mut grid.autoscroll) {
                 grid.scroll_cursor_into_view(body.size, cx);
             }
-            grid.clamp_scroll(bounds.size, gutter_width, cx);
+            grid.clamp_scroll(body.size, cx);
             grid.gutter = gutter_width;
 
             Frame {
@@ -341,7 +362,7 @@ impl Element for GridElement {
                 hover_header: grid.hover_header,
                 row_height,
                 scroll: grid.scroll,
-                max_scroll: grid.max_scroll(bounds.size, gutter_width, cx),
+                max_scroll: grid.max_scroll(body.size, cx),
                 rows: grid.visible_rows(grid.scroll.y, body.size.height, cx),
                 cols: visible_columns(grid, grid.scroll.x, body.size.width),
                 data: grid.data().clone(),
@@ -650,6 +671,7 @@ impl Element for GridElement {
                             descending,
                             color,
                             window,
+                            cx,
                         );
                     }
                     window.paint_quad(fill(
@@ -772,6 +794,17 @@ impl GridElement {
                 let extend = e.modifiers.shift;
                 let region = f.region(e.position);
                 let handle = grid.read(cx).focus().clone();
+                // An open editor belongs to the cell it was opened on, and a
+                // press anywhere else in the grid has left that cell — the
+                // editor cannot go on floating over one row while the selection
+                // is on another. Keeping what was typed rather than dropping it
+                // is what every spreadsheet does: Escape is the gesture for
+                // throwing an edit away, and a click that silently discarded it
+                // would be a trap. Nothing reaches the server either way; the
+                // value is staged like any other. A press inside the editor
+                // never reaches here, because the editor's own hitbox is over
+                // this one.
+                grid.update(cx, |grid, cx| grid.stage_edit(cx));
                 grid.update(cx, |grid, cx| match region {
                     Region::ColumnEdge(col) => {
                         grid.dragging_column = Some((col, e.position.x, grid.columns[col].width));
@@ -832,6 +865,10 @@ impl GridElement {
                 };
                 let handle = grid.read(cx).focus().clone();
                 grid.update(cx, |grid, cx| {
+                    // As on the left button: the menu is about to open over the
+                    // grid, and an editor left floating under it is neither
+                    // reachable nor honest about which cell it belongs to.
+                    grid.stage_edit(cx);
                     if !grid.selected_rows().contains(&row) {
                         grid.set_cursor(row, col, false, cx);
                     }

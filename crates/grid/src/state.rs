@@ -332,18 +332,37 @@ impl Grid {
     /// them, and copying a hundred thousand rows to show one of them again
     /// would be silly.
     pub fn set_data_arc(&mut self, data: Arc<ResultSet>, cx: &mut Context<Self>) {
-        self.columns = data
-            .columns
-            .iter()
-            .map(|_| ColumnLayout {
-                width: px(120.),
-                user_sized: false,
-                hidden: false,
-                pinned: false,
-            })
-            .collect();
+        // The same columns coming back is the ordinary case — a sort, the next
+        // page, a re-run of the statement being written — and everything the
+        // reader arranged *about the columns* is still about these columns:
+        // their widths, which are pinned, which are hidden, and how far right
+        // the view was dragged. Only the rows are new, so only the row-shaped
+        // state resets. Sorting a table forty columns wide by scrolling to
+        // column thirty and clicking would otherwise throw the reader back to
+        // column one every time.
+        let same_columns = self.columns.len() == data.columns.len()
+            && self
+                .data
+                .columns
+                .iter()
+                .zip(data.columns.iter())
+                .all(|(a, b)| a.meta.name == b.meta.name && a.meta.kind == b.meta.kind);
+        if !same_columns {
+            self.columns = data
+                .columns
+                .iter()
+                .map(|_| ColumnLayout {
+                    width: px(120.),
+                    user_sized: false,
+                    hidden: false,
+                    pinned: false,
+                })
+                .collect();
+            self.scroll.x = px(0.);
+            self.measured = false;
+        }
         self.data = data;
-        self.scroll = Point::default();
+        self.scroll.y = px(0.);
         self.cursor = (0, 0);
         self.anchor = None;
         // The first row, selected. The inspector beside the grid describes
@@ -354,7 +373,6 @@ impl Grid {
             true => vec![CellRect::rows(0, 0, self.data.column_count())],
             false => Vec::new(),
         };
-        self.measured = false;
         // Staged edits do not survive the rows they were staged against. A
         // change set is a list of row indexes, so carrying it over to another
         // result set does not merely look wrong in the next tab — it points an
@@ -376,7 +394,7 @@ impl Grid {
     /// and across the columns at different rates, so the pair does not repeat
     /// for a long time and the line-layout cache never gets a free frame.
     pub fn scroll_for_bench(&mut self, tick: u32, cx: &App) {
-        let max = self.max_scroll(self.viewport, px(0.), cx);
+        let max = self.max_scroll(self.viewport, cx);
         let sweep = |distance: f32, max: Pixels| {
             let max = f32::from(max);
             if max <= 0. {
@@ -646,7 +664,7 @@ impl Grid {
             editor
         });
         let events = cx.subscribe(&editor, |grid, _, event: &EditorEvent, cx| match event {
-            EditorEvent::Submit => grid.commit_edit(cx),
+            EditorEvent::Submit => grid.stage_edit(cx),
             EditorEvent::Cancel => grid.cancel_edit(cx),
             _ => {}
         });
@@ -670,8 +688,13 @@ impl Grid {
         self.editing.is_some()
     }
 
-    /// Take what was typed and stage it.
-    pub fn commit_edit(&mut self, cx: &mut Context<Self>) {
+    /// Close the editor, keeping what was typed.
+    ///
+    /// Staged, not written: the value joins [`Grid::changes`] and the cell
+    /// shows as dirty. Getting it to the server is the Commit button's job,
+    /// which is why this is not called `commit` — the two words would be the
+    /// same word for two very different amounts of consequence.
+    pub fn stage_edit(&mut self, cx: &mut Context<Self>) {
         let Some(editing) = self.editing.take() else {
             return;
         };
@@ -851,37 +874,19 @@ impl Grid {
 
     // ---- scrolling -------------------------------------------------------
 
-    pub(crate) fn max_scroll(
-        &self,
-        viewport: Size<Pixels>,
-        gutter: Pixels,
-        cx: &App,
-    ) -> Point<Pixels> {
-        let (mut height, mut width) = (self.content_height(cx), self.content_width());
-        let view = Size {
-            width: viewport.width - gutter,
-            height: viewport.height,
+    /// `body` is the area the rows are drawn in — not the whole element. The
+    /// header does not scroll, so counting its height here would hold the last
+    /// row a header below the bottom edge, out of reach.
+    pub(crate) fn max_scroll(&self, body: Size<Pixels>, cx: &App) -> Point<Pixels> {
+        let content = Size {
+            width: self.content_width(),
+            height: self.content_height(cx),
         };
-        // Overlay scrollbars float on top of the content rather than taking
-        // layout width, so where one lies the last row is read *through* it.
-        // Each axis that has a bar therefore gives the other that much more
-        // travel, which is what lets the final row be scrolled out from under
-        // it. Reserving the space instead would narrow the grid permanently to
-        // serve a control macOS hides by default.
-        if width > view.width {
-            height += SCROLLBAR_FOOTPRINT;
-        }
-        if height > view.height {
-            width += SCROLLBAR_FOOTPRINT;
-        }
-        Point {
-            x: (width - view.width).max(px(0.)),
-            y: (height - view.height).max(px(0.)),
-        }
+        max_scroll_of(content, body, self.density.row_height(cx))
     }
 
-    pub(crate) fn clamp_scroll(&mut self, viewport: Size<Pixels>, gutter: Pixels, cx: &App) {
-        let max = self.max_scroll(viewport, gutter, cx);
+    pub(crate) fn clamp_scroll(&mut self, body: Size<Pixels>, cx: &App) {
+        let max = self.max_scroll(body, cx);
         self.scroll.x = self.scroll.x.clamp(px(0.), max.x);
         self.scroll.y = self.scroll.y.clamp(px(0.), max.y);
     }
@@ -988,4 +993,178 @@ fn cell_style(cx: &App) -> editor::EditorStyle {
 /// Whether a column's values want to hug the right edge.
 pub(crate) fn is_right_aligned(kind: ValueKind) -> bool {
     kind.is_numeric()
+}
+
+/// How far `content` can be scrolled inside `view`, given how much blank the
+/// rows may be dragged past their own end.
+///
+/// Two things are added to the content before the view is taken off it.
+///
+/// The overlay scrollbars float on top of the content rather than taking
+/// layout width, so where one lies the row or column under it is read
+/// *through* it. Each axis that has a bar therefore gives the other that much
+/// more travel, which is what lets the last row be scrolled out from under the
+/// horizontal bar and the last column out from behind the vertical one.
+/// Reserving the space instead would narrow the grid permanently to serve a
+/// control macOS hides by default.
+///
+/// Then `overscroll`, which is slack rather than compensation: a table whose
+/// last row stops exactly at the bottom edge has that row wedged between the
+/// scrollbar floating over it and the status bar beginning immediately below,
+/// and the only way to read it is to know it is the last one. Being able to
+/// pull it up off the edge is what makes the end of a table feel like an end
+/// rather than a cut. Only downwards — blank to the right of the last column
+/// reads as a column that failed to load, so sideways still stops dead.
+///
+/// Neither applies to content that already fits: a four-row table must not
+/// scroll at all.
+fn max_scroll_of(content: Size<Pixels>, view: Size<Pixels>, overscroll: Pixels) -> Point<Pixels> {
+    let (mut width, mut height) = (content.width, content.height);
+    if width > view.width {
+        height += SCROLLBAR_FOOTPRINT;
+    }
+    // Asked of the content rather than of the running total, so that a table
+    // which overflows only because a bar lies across it gets exactly the travel
+    // that moves it out from under the bar and not a row of blank on top.
+    if content.height > view.height {
+        height += overscroll;
+    }
+    if height > view.height {
+        width += SCROLLBAR_FOOTPRINT;
+    }
+    Point {
+        x: (width - view.width).max(px(0.)),
+        y: (height - view.height).max(px(0.)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{max_scroll_of, SCROLLBAR_FOOTPRINT};
+    use gpui::{px, size, Pixels};
+
+    const ROW: Pixels = px(24.);
+
+    #[test]
+    fn content_that_fits_cannot_be_scrolled() {
+        // Neither the scrollbar allowance nor the overscroll may turn a table
+        // that fits into one that drifts under the pointer.
+        let max = max_scroll_of(size(px(300.), px(200.)), size(px(400.), px(300.)), ROW);
+        assert_eq!(max.x, px(0.));
+        assert_eq!(max.y, px(0.));
+    }
+
+    #[test]
+    fn the_rows_can_be_dragged_a_row_past_their_own_end() {
+        // Ten 24px rows in a 100px body: the six rows' worth that do not fit,
+        // and then one row of blank so the last one can be pulled off the edge.
+        let max = max_scroll_of(size(px(300.), px(240.)), size(px(400.), px(100.)), ROW);
+        assert_eq!(max.y, px(140.) + ROW);
+    }
+
+    #[test]
+    fn there_is_no_blank_past_the_last_column() {
+        let max = max_scroll_of(size(px(900.), px(240.)), size(px(400.), px(100.)), ROW);
+        assert_eq!(max.x, px(500.) + SCROLLBAR_FOOTPRINT);
+    }
+
+    #[test]
+    fn a_scrollbar_on_one_axis_buys_travel_on_the_other() {
+        // Wide enough to need a horizontal bar, which floats over the last row,
+        // so the vertical axis gets the bar's thickness back as travel.
+        let max = max_scroll_of(size(px(900.), px(240.)), size(px(400.), px(100.)), ROW);
+        assert_eq!(max.y, px(140.) + SCROLLBAR_FOOTPRINT + ROW);
+    }
+
+    /// The bar is the reason rows that *almost* fit still have to scroll: it
+    /// covers the bottom of the last one without making the content any taller.
+    #[test]
+    fn rows_that_fit_but_lie_under_the_horizontal_bar_can_still_be_moved() {
+        let max = max_scroll_of(size(px(900.), px(240.)), size(px(400.), px(244.)), ROW);
+        assert_eq!(max.y, SCROLLBAR_FOOTPRINT - px(4.));
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use db::{Column, ColumnData, ColumnMeta, NullMask, ResultSet, ValueKind};
+    use gpui::{px, AppContext as _, Entity, TestAppContext};
+
+    use super::Grid;
+
+    fn column(name: &str, rows: usize) -> Column {
+        let mut nulls = NullMask::with_capacity(rows);
+        for row in 0..rows {
+            nulls.push(false, row);
+        }
+        Column {
+            meta: ColumnMeta::new(name.to_string(), ValueKind::Int, "int8"),
+            nulls,
+            data: ColumnData::I64((0..rows as i64).collect()),
+        }
+    }
+
+    fn users(rows: usize) -> ResultSet {
+        ResultSet::new(vec![column("id", rows), column("age", rows)])
+    }
+
+    fn grid(cx: &mut TestAppContext) -> Entity<Grid> {
+        cx.update(|cx| ui::Theme::set_global(ui::Theme::of(ui::Appearance::Dark), cx));
+        cx.update(|cx| cx.new(|cx| Grid::new(users(4), cx)))
+    }
+
+    /// What a sort, a page turn and a re-run all look like from here: the same
+    /// columns, different rows.
+    #[gpui::test]
+    fn the_same_columns_coming_back_keep_their_width_and_the_view_on_them(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.columns[1].width = px(300.);
+            grid.columns[1].user_sized = true;
+            grid.columns[1].pinned = true;
+            grid.scroll.x = px(120.);
+            grid.scroll.y = px(80.);
+
+            grid.set_data(users(4), cx);
+
+            assert_eq!(grid.columns[1].width, px(300.));
+            assert!(grid.columns[1].pinned);
+            assert_eq!(grid.scroll.x, px(120.));
+            // The rows are new, so where you were down them is not.
+            assert_eq!(grid.scroll.y, px(0.));
+        });
+    }
+
+    /// What a click on another row does, in the order the press handler does
+    /// it. The edit has to be closed out *before* the cursor moves, or it
+    /// stages what was typed onto whichever cell the pointer landed on.
+    #[gpui::test]
+    fn ending_an_edit_stages_it_on_the_cell_it_was_opened_over(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_editable(true, cx);
+            grid.begin_edit(0, 1, Some("42"), cx);
+
+            grid.stage_edit(cx);
+            grid.set_cursor(3, 0, false, cx);
+
+            assert!(!grid.is_editing());
+            assert_eq!(grid.cell_value(0, 1), Some(db::Value::Int(42)));
+            assert_eq!(grid.cell_value(3, 1), Some(db::Value::Int(3)));
+        });
+    }
+
+    #[gpui::test]
+    fn a_different_answer_starts_the_columns_over(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.columns[1].width = px(300.);
+            grid.scroll.x = px(120.);
+
+            grid.set_data(ResultSet::new(vec![column("total", 4)]), cx);
+
+            assert_eq!(grid.columns.len(), 1);
+            assert_eq!(grid.scroll.x, px(0.));
+        });
+    }
 }
