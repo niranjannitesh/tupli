@@ -15,7 +15,7 @@ use ui::{
     NoticeTone, ResizeHandle, Tab, TabBar, Toolbar, Tooltip,
 };
 
-use crate::pane::{Layout, Member, PaneGroup, PaneId};
+use crate::pane::{FindTarget, Layout, Member, PaneGroup, PaneId};
 use crate::results::ResultsTab;
 use crate::workspace::{count_of, format_duration, thousands, CenterKind, DragTarget, Workspace};
 
@@ -550,6 +550,7 @@ impl Workspace {
             return v_flex().flex_1().min_h_0();
         };
         let editor = pane.editor.clone();
+        let finding = pane.find_target == Some(FindTarget::Console);
         let empty = editor.read(cx).is_empty();
         // The breadcrumb names where a statement would actually land, which is
         // the server's `search_path`, not a name someone typed into the sheet.
@@ -659,6 +660,7 @@ impl Workspace {
                         },
                     ),
             )
+            .children(finding.then(|| self.render_find_bar(id, cx)))
             // The editor is one custom element, not a div per line: see
             // crates/editor/src/element.rs. It owns its own scrolling, so there
             // is no scroll container around it.
@@ -1286,6 +1288,8 @@ impl Workspace {
             .pane()
             .active()
             .is_some_and(|tab| tab.kind == CenterKind::Key);
+        let id = self.pane().id;
+        let finding = self.pane().find_target == Some(FindTarget::Rows);
 
         v_flex()
             .flex_1()
@@ -1378,6 +1382,7 @@ impl Workspace {
                     .pb(px(6.))
                     .child(Notice::new(tone, message))
             }))
+            .children(finding.then(|| self.render_find_bar(id, cx)))
             .child(self.render_grid(cx))
             // Postgres' DETAIL and HINT are unusually good, so they are shown
             // verbatim rather than folded into one line. The banner sits under
@@ -1389,6 +1394,86 @@ impl Workspace {
                         .when_some(error_detail(&error), |n, d| n.detail(d)),
                 )
             }))
+            .into_any_element()
+    }
+
+    /// The find bar, above the console or above the rows.
+    ///
+    /// One function and two call sites, because it is the same control in both
+    /// places and the only thing that differs is what is underneath it.
+    fn render_find_bar(&mut self, id: PaneId, cx: &mut Context<Self>) -> AnyElement {
+        let c = cx.colors().clone();
+        let Some(pane) = self.pane_by(id) else {
+            return div().into_any_element();
+        };
+        let input = pane.find.clone();
+        let (case, word) = (pane.find_case, pane.find_word);
+        // Only the console can say which hit of how many. The grid does not
+        // scan a page it has not been asked to walk — see `Grid::set_search` —
+        // and a count that lied about a two-hundred-thousand-row page would be
+        // worse than no count.
+        let status: Option<SharedString> = match pane.find_target {
+            Some(FindTarget::Console) => {
+                let editor = pane.editor.read(cx);
+                editor.search().map(|_| match editor.find_status() {
+                    Some((at, total)) => format!("{at}/{total}").into(),
+                    None => SharedString::from("No results"),
+                })
+            }
+            _ => None,
+        };
+
+        // A toggle is a button that stays pressed. Two letters rather than an
+        // icon: `Aa` and `|ab|` are what every other find bar uses, and a
+        // glyph nobody recognises with a tooltip nobody hovers is worse.
+        let toggle = |name: &'static str, label: &'static str, tip: &'static str, on: bool| {
+            Button::new(pane_id(name, id, 0), label)
+                .size(ButtonSize::XSmall)
+                .selected(on)
+                .tooltip(Tooltip::text(tip))
+        };
+
+        h_flex()
+            .id(pane_id("find-bar", id, 0))
+            .flex_none()
+            .h(px(30.))
+            .px(px(8.))
+            .gap(px(6.))
+            .bg(c.surface)
+            .border_b_1()
+            .border_color(c.border)
+            .child(div().flex_1().min_w_0().child(input))
+            .children(status.map(|status| {
+                Label::new(status)
+                    .size(LabelSize::Small)
+                    .color(IconColor::Muted)
+            }))
+            .child(
+                toggle("find-case", "Aa", "Match Case", case)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_find_case(cx))),
+            )
+            .child(
+                toggle("find-word", "|ab|", "Whole Word", word)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_find_word(cx))),
+            )
+            .child(
+                Button::icon(pane_id("find-prev", id, 0), IconName::ChevronUp)
+                    .size(ButtonSize::XSmall)
+                    .tooltip(Tooltip::key("Previous Match", "\u{2318}\u{21e7}G"))
+                    .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
+            )
+            .child(
+                Button::icon(pane_id("find-next", id, 0), IconName::ChevronDown)
+                    .size(ButtonSize::XSmall)
+                    .tooltip(Tooltip::key("Next Match", "\u{2318}G"))
+                    .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
+            )
+            .child(
+                Button::icon(pane_id("find-close", id, 0), IconName::XmarkSm)
+                    .size(ButtonSize::XSmall)
+                    .tooltip(Tooltip::key("Close", "\u{238b}"))
+                    .on_click(cx.listener(|this, _, _, cx| this.close_find(cx))),
+            )
             .into_any_element()
     }
 

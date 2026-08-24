@@ -27,7 +27,7 @@ use crate::mock;
 use crate::palette::{
     Command, ItemKind, Palette, PaletteAction, PaletteEvent, PaletteItem, PaletteMode,
 };
-use crate::pane::{Layout, Pane, PaneGroup, PaneId};
+use crate::pane::{FindTarget, Layout, Pane, PaneGroup, PaneId};
 use crate::results::{one_line, ResultsTab};
 use crate::save_sheet::{SaveQuerySheet, SaveSheetEvent};
 use crate::session::{Activity, Session, SessionEvent, SessionState};
@@ -330,6 +330,13 @@ pub struct Workspace {
     /// The chip composer's column or operator list, while it is up, and where
     /// it was asked for.
     pub(crate) filter_menu: Option<(Point<Pixels>, FilterMenu)>,
+    /// The connection row's menu, while it is up, and which saved connection
+    /// it came out of.
+    pub(crate) connection_menu: Option<(Point<Pixels>, uuid::Uuid)>,
+    /// The connection Remove is waiting on. A saved connection is typed in
+    /// once and then used for a year, so the gesture that throws one away
+    /// asks first.
+    pub(crate) removing_connection: Option<uuid::Uuid>,
     /// The rename/truncate/drop sheet, while it is up.
     pub(crate) object_sheet: Option<Entity<crate::objects::ObjectSheet>>,
     /// An object statement that has been sent and not yet answered, and what
@@ -446,6 +453,37 @@ fn build_pane(
     // Bare, because the chip around it is already the box. See
     // `Input::bare`.
     let chip_value = cx.new(|cx| Input::new(cx).bare().placeholder("value", cx));
+    // Plain UI text, unlike the filter above it: this holds a string being
+    // looked for, not a fragment being written, and syntax-colouring `select`
+    // in it would be claiming otherwise.
+    let find = cx.new(|cx| {
+        Input::new(cx)
+            .icon(IconName::Magnifier)
+            .placeholder("Find", cx)
+    });
+
+    // Live on every keystroke — the console highlights as you type and the
+    // grid lights up the cells already on screen — with ⏎ for the one thing
+    // that is not live, which is walking to a hit that is off screen.
+    cx.subscribe(
+        &find,
+        move |this, _, event: &editor::EditorEvent, cx| match event {
+            editor::EditorEvent::Changed => {
+                this.active_pane = id;
+                this.apply_search(cx);
+            }
+            editor::EditorEvent::Submit => {
+                this.active_pane = id;
+                this.find_step(true, cx);
+            }
+            editor::EditorEvent::Cancel => {
+                this.active_pane = id;
+                this.close_find(cx);
+            }
+            _ => {}
+        },
+    )
+    .detach();
 
     // Enter in the composer commits the chip and re-asks the server, which is
     // the whole gesture: pick a column, type a value, press return.
@@ -499,12 +537,19 @@ fn build_pane(
                 this.active_pane = id;
                 this.save_query(cx);
             }
+            // Escape in the console closes a find bar that is open over it.
+            // The editor has no popup left to dismiss by then — completions
+            // swallow escape themselves — so this is what the key is for.
+            editor::EditorEvent::Cancel => {
+                this.active_pane = id;
+                this.close_find(cx);
+            }
             _ => {}
         },
     )
     .detach();
 
-    Pane::new(id, editor, grid, filter, chip_value)
+    Pane::new(id, editor, grid, filter, chip_value, find)
 }
 
 /// The settings a pane's widgets carry themselves rather than reading off the
@@ -993,6 +1038,8 @@ impl Workspace {
             tab_menu: None,
             database_menu: None,
             filter_menu: None,
+            connection_menu: None,
+            removing_connection: None,
             object_sheet: None,
             pending_object: None,
             structure_preview: None,
@@ -2069,6 +2116,11 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        if k.key == "escape" && self.connection_menu.is_some() {
+            self.close_connection_menu(cx);
+            cx.stop_propagation();
+            return;
+        }
         // ⌥⌘W, the one ⌥⌘ gesture the window has, and the browsers' binding
         // for it. Checked before the guard below rather than inside the match,
         // which is a ⌘-only list by construction.
@@ -2194,6 +2246,24 @@ impl Workspace {
         .on_action(cx.listener(|this, _: &m::OpenCommands, _, cx| {
             if this.accepts_commands() {
                 this.open_palette(">", cx)
+            }
+        }))
+        // Find is not a command either: choosing between the console and the
+        // rows means asking which of them has focus, and `run_command` has no
+        // window to ask with.
+        .on_action(cx.listener(|this, _: &m::Find, window, cx| {
+            if this.accepts_commands() {
+                this.open_find(Some(&*window), cx)
+            }
+        }))
+        .on_action(cx.listener(|this, _: &m::FindNext, _, cx| {
+            if this.accepts_commands() {
+                this.find_step(true, cx)
+            }
+        }))
+        .on_action(cx.listener(|this, _: &m::FindPrevious, _, cx| {
+            if this.accepts_commands() {
+                this.find_step(false, cx)
             }
         }))
         .on_action(cx.listener(|_, _: &m::Minimize, window, _| window.minimize_window()))
@@ -3439,6 +3509,135 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- find ------------------------------------------------------------
+
+    /// ⌘F. Opens the bar over whichever surface has focus, and puts the
+    /// selection in the field when there is one worth starting from.
+    pub fn open_find(&mut self, window: Option<&Window>, cx: &mut Context<Self>) {
+        let target = self.find_target(window, cx);
+        // The selection seeds the field, which folds macOS's ⌘E into ⌘F: the
+        // reason to press it with a word selected is almost always "find this".
+        // Only from the console — a grid selection is a row, not a string.
+        let seed = match target {
+            FindTarget::Console => self.pane().editor.read(cx).find_seed(),
+            FindTarget::Rows => None,
+        };
+        self.pane_mut().find_target = Some(target);
+        // The rows live in the dock, and a bar drawn above a grid nobody can
+        // see is a bar nobody can see either.
+        if target == FindTarget::Rows {
+            self.show_results_tab(ResultsTab::Data, cx);
+        }
+        let input = self.pane().find.clone();
+        if let Some(seed) = seed {
+            input.update(cx, |input, cx| input.set_text(&seed, cx));
+        }
+        self.apply_search(cx);
+        self.pending_focus = Some(input.read(cx).focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Which surface ⌘F means, asked at the one moment the answer is knowable.
+    fn find_target(&self, window: Option<&Window>, cx: &App) -> FindTarget {
+        let pane = self.pane();
+        if let Some(window) = window {
+            if pane
+                .grid
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+            {
+                return FindTarget::Rows;
+            }
+            if pane.editor.read(cx).focus().contains_focused(window, cx) {
+                return FindTarget::Console;
+            }
+        }
+        // Focus is somewhere else entirely — the sidebar, a tab strip, nothing
+        // at all. A pane browsing a table has no console to look through, so
+        // the rows are the only surface there is; anything else is a query
+        // someone is writing.
+        match pane
+            .active()
+            .is_some_and(|tab| tab.kind == CenterKind::Table)
+        {
+            true => FindTarget::Rows,
+            false => FindTarget::Console,
+        }
+    }
+
+    /// Hand the field's contents to the surface the bar is over, and take the
+    /// highlight off the other one.
+    fn apply_search(&mut self, cx: &mut Context<Self>) {
+        let target = self.pane().find_target;
+        let (case, word) = (self.pane().find_case, self.pane().find_word);
+        let (editor, grid) = (self.pane().editor.clone(), self.pane().grid.clone());
+        let query = self.pane().find.read(cx).text(cx);
+        let search = (!query.is_empty()).then(|| {
+            let mut search = editor::Search::new(query);
+            search.case_sensitive = case;
+            search.whole_word = word;
+            search
+        });
+        let console = match target {
+            Some(FindTarget::Console) => search.clone(),
+            _ => None,
+        };
+        let rows = match target {
+            Some(FindTarget::Rows) => search,
+            _ => None,
+        };
+        editor.update(cx, |editor, cx| editor.set_search(console, cx));
+        grid.update(cx, |grid, cx| grid.set_search(rows, cx));
+        cx.notify();
+    }
+
+    /// ⌘G, ⌘⇧G, ⏎ in the field, and the two arrows on the bar.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        match self.pane().find_target {
+            Some(FindTarget::Console) => {
+                let editor = self.pane().editor.clone();
+                editor.update(cx, |editor, cx| editor.find_step(forward, cx));
+            }
+            Some(FindTarget::Rows) => {
+                let grid = self.pane().grid.clone();
+                grid.update(cx, |grid, cx| grid.find_step(forward, cx));
+            }
+            // "Next" with nothing open is "find", because the field keeps its
+            // text between openings and stepping is what was actually asked
+            // for.
+            None => self.open_find(None, cx),
+        }
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.pane().find_target else {
+            return;
+        };
+        self.pane_mut().find_target = None;
+        self.apply_search(cx);
+        // Escape puts you back on the thing you were reading, not on a field
+        // that is no longer drawn.
+        self.pending_focus = Some(match target {
+            FindTarget::Console => self.pane().editor.read(cx).focus().clone(),
+            FindTarget::Rows => self.pane().grid.read(cx).focus_handle(cx),
+        });
+        cx.notify();
+    }
+
+    pub fn toggle_find_case(&mut self, cx: &mut Context<Self>) {
+        let on = self.pane().find_case;
+        self.pane_mut().find_case = !on;
+        self.apply_search(cx);
+    }
+
+    pub fn toggle_find_word(&mut self, cx: &mut Context<Self>) {
+        let on = self.pane().find_word;
+        self.pane_mut().find_word = !on;
+        self.apply_search(cx);
+    }
+
     /// Open the composer: on `Some(index)` to change a chip, on `None` to add
     /// one. A new chip starts on the first column of the table rather than on
     /// nothing, because "which column" is a question with an obvious first
@@ -3705,7 +3904,7 @@ impl Workspace {
     /// `None` when the field was left alone on an existing connection, which
     /// means "keep whatever is in the Keychain" — distinct from `Some("")`,
     /// which means "there is no password".
-    pub(crate) fn save_connection(
+    pub fn save_connection(
         &mut self,
         config: &db::ConnectionConfig,
         password: Option<String>,
@@ -3736,15 +3935,28 @@ impl Workspace {
             }
             self.connections = store.connections().unwrap_or_default();
         }
-        // Close every session on it — a connection deleted while three tabs
-        // are on three of its databases takes all three with it — and unbind
-        // the tabs that were pointing at them.
+        self.close_sessions_on(id, cx);
+    }
+
+    /// Close every session on one connection, leaving the saved connection
+    /// itself where it is.
+    ///
+    /// A connection closed while three tabs are on three of its databases
+    /// takes all three with it, so the tabs that were pointing at them are
+    /// unbound here as well. The disconnect is asked for rather than left to
+    /// the drop: what closes the socket is the driver task ending, and that is
+    /// a thing to say out loud rather than a thing to hope falls out of the
+    /// last handle going away.
+    pub fn close_sessions_on(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
         let closed: Vec<_> = self
             .sessions
             .iter()
             .filter(|session| session.read(cx).config.id == id)
             .cloned()
             .collect();
+        for session in &closed {
+            session.update(cx, |session, cx| session.disconnect(cx));
+        }
         self.sessions
             .retain(|session| session.read(cx).config.id != id);
         for pane in &mut self.panes {
@@ -4831,7 +5043,11 @@ impl Workspace {
         // look like it is reporting two different things.
         let server = match session {
             Some(session) => match session.snapshot.as_ref() {
-                Some(snapshot) => format!("postgres {}", short_version(&snapshot.server_version)),
+                Some(snapshot) => format!(
+                    "{} {}",
+                    session.config.engine.as_str(),
+                    short_version(&snapshot.server_version)
+                ),
                 None => state.label().to_string(),
             },
             None => "No connection".to_string(),
@@ -5234,6 +5450,7 @@ impl Render for Workspace {
             .children(self.render_commit_preview(cx))
             .children(self.object_sheet.clone())
             .children(self.render_structure_preview(cx))
+            .children(self.render_remove_connection(cx))
             // The menu paints over even the sheets, because it is the only
             // thing here that is anchored to a point the user just clicked.
             .children(self.render_object_menu(cx))
@@ -5242,6 +5459,7 @@ impl Render for Workspace {
             .children(self.render_database_menu(cx))
             .children(self.render_filter_menu(cx))
             .children(self.render_decoder_menu(cx))
+            .children(self.render_connection_menu(cx))
     }
 }
 

@@ -9,6 +9,7 @@ members = [
     "crates/db_pg",
     "crates/db_redis",
     "crates/db_clickhouse",
+    "crates/db_sqlite",
     "crates/drivers",
     "crates/sqlgen",
     "crates/store",
@@ -42,6 +43,7 @@ tree-sitter = "0.25"
 tree-sitter-sequel = "0.3"
 nucleo-matcher = "0.3"
 rmpv = "1.3"
+rusqlite = { version = "0.40.2", features = ["bundled", "column_decltype"] }
 flate2 = "1"
 base64 = "0.22"
 criterion = { version = "0.5", features = ["html_reports"] }

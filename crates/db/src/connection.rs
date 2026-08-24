@@ -170,6 +170,12 @@ impl ConnectionConfig {
         if !self.name.trim().is_empty() {
             return self.name.clone();
         }
+        // A file has no user and no host to be named after. Its own name is
+        // what somebody with ten of them recognises; the directory it is in
+        // goes on the endpoint line underneath.
+        if self.engine.is_file() {
+            return file_label(&self.database);
+        }
         let db = if self.database.is_empty() {
             &self.user
         } else {
@@ -181,6 +187,9 @@ impl ConnectionConfig {
     /// `host:port/database`, for the status bar and the tab subtitle. The port
     /// is left out when it is the one the engine would have used anyway.
     pub fn endpoint(&self) -> String {
+        if self.engine.is_file() {
+            return home_relative(&self.database);
+        }
         if self.port == self.engine.default_port() {
             format!("{}/{}", self.host, self.database)
         } else {
@@ -195,6 +204,15 @@ impl ConnectionConfig {
     /// added by the driver at the last moment and never passes through here,
     /// which is what makes it safe to log this string.
     pub fn connection_string(&self) -> String {
+        // Nothing else on the list applies to a path, and writing `host=` and
+        // `sslmode=` beside one would suggest they did.
+        if self.engine.is_file() {
+            return format!(
+                "{} {}",
+                kv("engine", self.engine.as_str()),
+                kv("dbname", &self.database)
+            );
+        }
         let mut parts = vec![
             kv("host", &self.host),
             kv("port", &self.port.to_string()),
@@ -215,6 +233,12 @@ impl ConnectionConfig {
                 }
             }
         }
+        // Only when it is not the default: a Postgres string is the one
+        // everybody pastes elsewhere, and an `engine=postgres` in it would be
+        // a keyword `psql` does not know.
+        if self.engine != Engine::default() {
+            parts.insert(0, kv("engine", self.engine.as_str()));
+        }
         parts.push(kv("application_name", "tupli"));
         parts.join(" ")
     }
@@ -223,6 +247,20 @@ impl ConnectionConfig {
     /// fields. Empty means it is ready to connect.
     pub fn problems(&self) -> Vec<&'static str> {
         let mut problems = Vec::new();
+        // A file connection has no server, so none of the questions about one
+        // are asked. What it has instead is a path, and the mistake it is
+        // actually prone to is a path that is not there — which is worth
+        // saying in the form rather than at the end of a failed connect,
+        // because the driver deliberately will not create the file.
+        if self.engine.is_file() {
+            let path = self.database.trim();
+            if path.is_empty() {
+                problems.push("Choose a database file");
+            } else if path != MEMORY && !std::path::Path::new(path).exists() {
+                problems.push("There is no file at that path");
+            }
+            return problems;
+        }
         if self.host.trim().is_empty() {
             problems.push("Host is required");
         }
@@ -307,7 +345,10 @@ impl ConnectionConfig {
                 }
                 // `db` is not libpq's spelling; it is accepted because it is
                 // what everybody types, and rejecting it would teach nothing.
-                "dbname" | "db" | "database" => config.database = value,
+                // `file` and `path` are the words for the SQLite case, where
+                // "database" is a thing on disk rather than a name on a
+                // server.
+                "dbname" | "db" | "database" | "file" | "path" => config.database = value,
                 "user" => config.user = value,
                 "sslmode" => {
                     ssl_given = true;
@@ -406,6 +447,39 @@ fn kv(key: &str, value: &str) -> String {
         )
     } else {
         format!("{key}={value}")
+    }
+}
+
+/// The path SQLite reads as "do not touch the disk at all".
+pub const MEMORY: &str = ":memory:";
+
+/// A path as the last thing on it — `tupli.db` out of `/srv/data/tupli.db`.
+fn file_label(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return "No file".to_string();
+    }
+    if path == MEMORY {
+        return "In memory".to_string();
+    }
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// `~/db/tupli.db` rather than `/Users/somebody/db/tupli.db`.
+///
+/// A status bar has one line for this and a home directory is a third of it
+/// spent saying something the reader already knows.
+fn home_relative(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || path == home {
+        return path.to_string();
+    }
+    match path.strip_prefix(&format!("{home}/")) {
+        Some(rest) => format!("~/{rest}"),
+        None => path.to_string(),
     }
 }
 
@@ -567,6 +641,66 @@ mod tests {
         assert_eq!(spec.ssl_mode, SslMode::Disable);
         let typed = ConnectionConfig::from_spec("engine=redis sslmode=verify-full").unwrap();
         assert_eq!(typed.ssl_mode, SslMode::VerifyFull);
+    }
+
+    #[test]
+    fn a_file_connection_names_itself_after_its_file() {
+        let config = ConnectionConfig {
+            engine: Engine::Sqlite,
+            database: "/srv/data/orders.db".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.display_name(), "orders.db");
+        assert_eq!(config.endpoint(), "/srv/data/orders.db");
+        // The host, the port and the user are all still sitting there with
+        // their Postgres defaults, and none of them is a reason to complain.
+        assert!(
+            config.problems().is_empty() || config.problems() == ["There is no file at that path"]
+        );
+    }
+
+    #[test]
+    fn a_file_connection_is_asked_only_for_a_file() {
+        let missing = ConnectionConfig {
+            engine: Engine::Sqlite,
+            host: String::new(),
+            user: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(missing.problems(), ["Choose a database file"]);
+
+        let nowhere = ConnectionConfig {
+            engine: Engine::Sqlite,
+            database: "/no/such/place/tupli.db".into(),
+            ..Default::default()
+        };
+        assert_eq!(nowhere.problems(), ["There is no file at that path"]);
+
+        // An in-memory database is a real answer and not a path to check.
+        let memory = ConnectionConfig {
+            engine: Engine::Sqlite,
+            database: MEMORY.into(),
+            ..Default::default()
+        };
+        assert!(memory.problems().is_empty());
+        assert_eq!(memory.display_name(), "In memory");
+    }
+
+    #[test]
+    fn a_file_spec_round_trips_and_says_which_engine() {
+        let config = ConnectionConfig {
+            engine: Engine::Sqlite,
+            database: "/srv/data/orders.db".into(),
+            ..Default::default()
+        };
+        let spec = config.connection_string();
+        assert_eq!(spec, "engine=sqlite dbname=/srv/data/orders.db");
+        let back = ConnectionConfig::from_spec(&spec).unwrap();
+        assert_eq!(back.engine, Engine::Sqlite);
+        assert_eq!(back.database, config.database);
+        // And the words somebody would actually type for a file.
+        let typed = ConnectionConfig::from_spec("engine=sqlite file=/tmp/a.db").unwrap();
+        assert_eq!(typed.database, "/tmp/a.db");
     }
 
     #[test]

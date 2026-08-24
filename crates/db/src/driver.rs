@@ -40,18 +40,35 @@ pub const DEFAULT_MAX_ROWS: usize = 50_000;
 pub enum Engine {
     #[default]
     Postgres,
+    /// A file rather than a server. Everything else here is reached over a
+    /// socket; this one is a path, and the difference shows up in every field
+    /// of a connection.
+    Sqlite,
     Redis,
     ClickHouse,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 3] = [Self::Postgres, Self::Redis, Self::ClickHouse];
+    pub const ALL: [Engine; 4] = [Self::Postgres, Self::Sqlite, Self::Redis, Self::ClickHouse];
+
+    /// Is the connection a file on this machine rather than a server
+    /// somewhere?
+    ///
+    /// The one question about an engine that is not a capability, because it
+    /// is not about what a connection can do — it is about what a connection
+    /// *is*, and so about which fields the connection window draws. A host, a
+    /// port, a user and a TLS mode are all answers to "which server", and for
+    /// a file there is no such question to answer.
+    pub fn is_file(self) -> bool {
+        matches!(self, Self::Sqlite)
+    }
 
     /// The stored spelling. Written to SQLite and to `TUPLI_CONNECT`, so it
     /// does not change once a version has shipped with it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
             Self::Redis => "redis",
             Self::ClickHouse => "clickhouse",
         }
@@ -61,6 +78,7 @@ impl Engine {
     pub fn label(self) -> &'static str {
         match self {
             Self::Postgres => "PostgreSQL",
+            Self::Sqlite => "SQLite",
             Self::Redis => "Redis",
             Self::ClickHouse => "ClickHouse",
         }
@@ -71,6 +89,7 @@ impl Engine {
     pub fn from_str(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Some(Self::Postgres),
+            "sqlite" | "sqlite3" => Some(Self::Sqlite),
             "redis" => Some(Self::Redis),
             "clickhouse" | "click-house" | "ch" => Some(Self::ClickHouse),
             _ => None,
@@ -80,6 +99,10 @@ impl Engine {
     pub fn default_port(self) -> u16 {
         match self {
             Self::Postgres => 5432,
+            // Nothing listens. Zero rather than an arbitrary number so that
+            // anything printing an endpoint has a value it can recognise as
+            // "there is no port here" instead of one it has to special-case.
+            Self::Sqlite => 0,
             Self::Redis => 6379,
             // The native protocol. 8123 is the HTTP interface, which is a
             // different thing this app does not speak.
@@ -99,6 +122,8 @@ impl Engine {
     pub fn default_ssl_mode(self) -> crate::SslMode {
         match self {
             Self::Postgres => crate::SslMode::Require,
+            // There is no wire to encrypt.
+            Self::Sqlite => crate::SslMode::Disable,
             Self::Redis => crate::SslMode::Disable,
             // ClickHouse is Redis' case exactly: 9000 is plain, TLS is 9440
             // and has to be turned on, and a TLS client against 9000 hangs
@@ -113,6 +138,7 @@ impl Engine {
     pub fn capabilities(self) -> Capabilities {
         match self {
             Self::Postgres => Capabilities::POSTGRES,
+            Self::Sqlite => Capabilities::SQLITE,
             Self::Redis => Capabilities::REDIS,
             Self::ClickHouse => Capabilities::CLICKHOUSE,
         }
@@ -186,6 +212,43 @@ impl Capabilities {
         paged_catalog: false,
         roles: true,
         identity_overrides: true,
+    };
+
+    /// SQLite is a Postgres with the server taken out, and the `false`s below
+    /// are what leaves with it.
+    ///
+    /// `schemas` is true and `databases` false for the same reason as
+    /// ClickHouse, arrived at from the other direction: one connection is one
+    /// file, so there is nothing to switch between — but `main`, `temp` and
+    /// anything `ATTACH`ed are all visible at once and can be joined across,
+    /// which is what a schema is.
+    ///
+    /// `explain` is false even though SQLite will explain a statement, because
+    /// the statement is `EXPLAIN QUERY PLAN` and not `EXPLAIN`: bare `EXPLAIN`
+    /// here prints virtual-machine bytecode, which is an answer to a different
+    /// question than the one anybody clicking a button labelled Explain is
+    /// asking.
+    ///
+    /// `ddl` is false because the DDL this app writes is Postgres', and
+    /// SQLite's `ALTER TABLE` can rename and add and little else — an offer to
+    /// change a column's type here would be an offer to produce a statement
+    /// the engine refuses. Reading DDL is unaffected: every relation carries
+    /// the `CREATE` that made it, because SQLite stores that text verbatim.
+    ///
+    /// `roles` is false because there is no server to have users on. A file's
+    /// permissions are the filesystem's.
+    pub const SQLITE: Self = Self {
+        dialect: Dialect::Sql,
+        schemas: true,
+        databases: false,
+        transactions: true,
+        cancel: true,
+        explain: false,
+        editable_rows: true,
+        ddl: false,
+        paged_catalog: false,
+        roles: false,
+        identity_overrides: false,
     };
 
     /// Redis is the reason this struct exists. It has logical databases and

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use gpui::{px, size, AppContext as _, HeadlessAppContext};
+use gpui::{px, size, AppContext as _, Focusable as _, HeadlessAppContext};
 use tupli::workspace::Workspace;
 use ui::{Appearance, Assets, Theme, ThemeRegistry};
 
@@ -355,6 +355,32 @@ fn main() {
             });
         }
 
+        // `TUPLI_FIND=<text>` opens the find bar and types into it, over the
+        // console by default and over the rows with `TUPLI_FIND_ROWS=1`. The
+        // surface is chosen by focus, which is a real focus here rather than a
+        // flag, so the photograph exercises the same path ⌘F does.
+        if let Ok(text) = std::env::var("TUPLI_FIND") {
+            let rows = std::env::var("TUPLI_FIND_ROWS").as_deref() == Ok("1");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, window, cx| {
+                        let handle = match rows {
+                            true => workspace.pane().grid.read(cx).focus_handle(cx),
+                            false => workspace.pane().editor.read(cx).focus().clone(),
+                        };
+                        window.focus(&handle, cx);
+                        workspace.open_find(Some(&*window), cx);
+                        workspace
+                            .pane()
+                            .find
+                            .clone()
+                            .update(cx, |input, cx| input.set_text(&text, cx));
+                    })
+                    .expect("open the find bar")
+            });
+            cx.run_until_parked();
+        }
+
         // `TUPLI_EDIT=1` stages one of each kind of change on the browsed
         // table, so the pending-state colours can be photographed without a
         // hand on the keyboard. Nothing is sent: staging is the whole point.
@@ -677,6 +703,75 @@ fn main() {
                     target = handle.into();
                 }
                 None => eprintln!("warning: the settings window did not open"),
+            }
+        }
+
+        // `TUPLI_CONN_MENU=1` photographs the connection row's own menu, and
+        // `TUPLI_CONN_MENU=remove` the sheet its last item opens. Both are
+        // about a *saved* connection, and `TUPLI_CONNECT` does not save — so
+        // the spec is written into this run's throwaway store first, under the
+        // id the live session already has, which is what keeps the sidebar at
+        // one root rather than the same server twice.
+        if let Ok(which) = std::env::var("TUPLI_CONN_MENU") {
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        let live = workspace.tree.first().map(|node| node.origin.connection);
+                        if let (Some(id), Ok(spec)) = (live, std::env::var("TUPLI_CONNECT")) {
+                            if let Ok(mut config) = db::ConnectionConfig::from_spec(&spec) {
+                                config.id = id;
+                                config.name = "Local".to_string();
+                                workspace.save_connection(&config, None, cx);
+                            }
+                        }
+                        let Some(id) = workspace.connections.first().map(|c| c.id) else {
+                            eprintln!("warning: no saved connection to open a menu on");
+                            return;
+                        };
+                        match which.as_str() {
+                            "remove" => workspace.prompt_remove_connection(id, cx),
+                            // What the menu's second item does, rather than
+                            // the menu itself: the row it leaves behind is the
+                            // thing worth photographing.
+                            "disconnect" => workspace.close_sessions_on(id, cx),
+                            // And the way back up, which is the same click a
+                            // connection has always been opened with.
+                            "reconnect" => {
+                                workspace.close_sessions_on(id, cx);
+                                let config = workspace.connections[0].clone();
+                                workspace.open_connection(config, cx);
+                            }
+                            _ => workspace.open_connection_menu(
+                                id,
+                                gpui::point(px(150.), px(150.)),
+                                cx,
+                            ),
+                        }
+                    })
+                    .expect("open the connection menu")
+            });
+            cx.run_until_parked();
+            // A reconnect is a second handshake, and a handshake is a socket
+            // rather than a task the executor can be run to the end of.
+            if which == "reconnect" {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    cx.run_until_parked();
+                    let ready = cx.update(|cx| {
+                        window
+                            .read(cx)
+                            .map(|workspace| workspace.is_connected(cx))
+                            .unwrap_or(false)
+                    });
+                    if ready {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        eprintln!("warning: gave up waiting for the reconnect");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
         }
 

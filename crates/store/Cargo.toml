@@ -10,7 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 log.workspace = true
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite.workspace = true
 security-framework = "3.7.0"
 db = { path = "../db" }
 time.workspace = true

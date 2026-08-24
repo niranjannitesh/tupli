@@ -7,11 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use gpui::{div, prelude::*, px, Context, IntoElement, ParentElement, Window};
+use gpui::{div, prelude::*, px, Context, IntoElement, ParentElement, Pixels, Point, Window};
 use ui::{
-    region, v_flex, ActiveTheme, Button, ButtonSize, ButtonVariant, Disclosure, EmptyState,
-    IconColor, IconName, IconSize, Label, LabelSize, ListItem, SectionHeader, Segmented, Spinner,
-    Tab, TabBar, Toolbar, Tooltip,
+    region, v_flex, ActiveTheme, Button, ButtonSize, ButtonVariant, ContextMenu, Disclosure,
+    EmptyState, IconColor, IconName, IconSize, Label, LabelSize, ListItem, MenuItem, SectionHeader,
+    Segmented, Sheet, Spinner, Tab, TabBar, Toolbar, Tooltip,
 };
 
 use crate::session::Activity;
@@ -234,18 +234,29 @@ impl Workspace {
                     .on_secondary_click(cx.listener(
                         move |this, event: &gpui::ClickEvent, _, cx| {
                             this.selected_node = Some(id);
-                            // Only a relation has a menu: its verbs are DDL,
-                            // and there is no `rename` or `truncate` to put
-                            // under a key.
-                            if let Some(relation) = this
-                                .tree
-                                .iter()
-                                .find(|node| node.id == id)
-                                .and_then(|node| node.target.as_ref())
-                                .and_then(Target::relation)
-                                .cloned()
-                            {
-                                this.open_object_menu(relation, event.position(), cx);
+                            let node = this.tree.iter().find(|node| node.id == id).cloned();
+                            match node {
+                                // A connection row's verbs are about the
+                                // server rather than about anything in it, and
+                                // are the same four whether the row is still a
+                                // door or has a tree under it.
+                                Some(node) if node.kind == NodeKind::Connection => this
+                                    .open_connection_menu(
+                                        node.origin.connection,
+                                        event.position(),
+                                        cx,
+                                    ),
+                                // Below that, only a relation has a menu: its
+                                // verbs are DDL, and there is no `rename` or
+                                // `truncate` to put under a key.
+                                Some(node) => {
+                                    if let Some(relation) =
+                                        node.target.as_ref().and_then(Target::relation).cloned()
+                                    {
+                                        this.open_object_menu(relation, event.position(), cx);
+                                    }
+                                }
+                                None => {}
                             }
                             cx.notify();
                         },
@@ -347,6 +358,7 @@ impl Workspace {
         let mut rows = vec![SectionHeader::new("Connections").into_any_element()];
         for (index, config) in self.connections.iter().enumerate() {
             let config = config.clone();
+            let id = config.id;
             let tint = crate::tint::tint(config.color, cx);
             rows.push(
                 ListItem::new(("connection", index), config.display_name())
@@ -363,6 +375,11 @@ impl Workspace {
                     .when(connecting == Some(config.id), |el| {
                         el.end_child(Spinner::new(("connecting", index)).size(IconSize::XSmall))
                     })
+                    .on_secondary_click(cx.listener(
+                        move |this, event: &gpui::ClickEvent, _, cx| {
+                            this.open_connection_menu(id, event.position(), cx);
+                        },
+                    ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if connecting.is_none() {
                             this.open_connection(config.clone(), cx);
@@ -372,6 +389,158 @@ impl Workspace {
             );
         }
         rows
+    }
+
+    /// Right-click on a connection row, wherever the row is drawn.
+    pub fn open_connection_menu(
+        &mut self,
+        id: uuid::Uuid,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        self.row_menu = None;
+        self.tab_menu = None;
+        self.connection_menu = Some((at, id));
+        cx.notify();
+    }
+
+    pub(crate) fn close_connection_menu(&mut self, cx: &mut Context<Self>) {
+        if self.connection_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The connection row's four verbs.
+    ///
+    /// Connect and Disconnect are the pair the sidebar had no gesture for at
+    /// all: a click on a closed row connects, and until this there was nothing
+    /// anywhere that closed one again. Edit and Remove are here because this
+    /// is where the saved connection is on screen, and walking to Settings to
+    /// change a port you are looking at is the kind of trip an app makes you
+    /// take once.
+    pub(crate) fn render_connection_menu(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (at, id) = self.connection_menu?;
+        // A row the saved list has never heard of — `TUPLI_CONNECT`, or a
+        // connection deleted while it was open. It has a session, so it can be
+        // closed; there is no record behind it to edit or remove.
+        let config = self.connections.iter().find(|c| c.id == id).cloned();
+        let open = self.sessions.iter().any(|s| s.read(cx).config.id == id);
+        let connecting = self.connection_connecting(id, cx);
+        // A server that is already up has nothing to connect. One whose last
+        // attempt failed has, which is why this asks about the state of the
+        // session rather than about whether there is one.
+        let failed = self.connection_failed(id, cx);
+
+        let connect = config.clone();
+        let edit = config.clone();
+
+        Some(
+            ContextMenu::new("connection-menu")
+                .at(at)
+                .width(px(216.))
+                .on_dismiss(cx.listener(|this, _, _, cx| this.close_connection_menu(cx)))
+                .item(
+                    MenuItem::new("Connect")
+                        .icon(IconName::Plug)
+                        .disabled(connect.is_none() || connecting || (open && !failed))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_connection_menu(cx);
+                            if let Some(config) = connect.clone() {
+                                this.open_connection(config, cx);
+                            }
+                        })),
+                )
+                .item(
+                    MenuItem::new("Disconnect")
+                        .icon(IconName::CircleXmark)
+                        .disabled(!open)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_connection_menu(cx);
+                            this.close_sessions_on(id, cx);
+                        })),
+                )
+                .separator()
+                .item(
+                    MenuItem::new("Edit…")
+                        .icon(IconName::Pen)
+                        .disabled(edit.is_none())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_connection_menu(cx);
+                            if let Some(config) = edit.clone() {
+                                this.edit_connection(config, cx);
+                            }
+                        })),
+                )
+                .item(
+                    MenuItem::new("Remove…")
+                        .icon(IconName::Trash)
+                        .danger()
+                        .disabled(config.is_none())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_connection_menu(cx);
+                            this.prompt_remove_connection(id, cx);
+                        })),
+                ),
+        )
+    }
+
+    /// Ask about removing one saved connection.
+    pub fn prompt_remove_connection(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.removing_connection = Some(id);
+        cx.notify();
+    }
+
+    /// The sheet Remove asks through.
+    ///
+    /// Nothing here reaches the server and nothing is lost that cannot be
+    /// typed again, so this is one button rather than the name-typing the drop
+    /// sheet asks for — but a saved connection is a thing you set up once and
+    /// then never think about again, and a menu item one row under Edit is
+    /// close enough to it to be worth a question.
+    pub(crate) fn render_remove_connection(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let id = self.removing_connection?;
+        let config = self.connections.iter().find(|c| c.id == id)?;
+        let (name, endpoint) = (config.display_name(), config.endpoint());
+
+        Some(
+            Sheet::new("remove-connection", format!("Remove “{name}”?"))
+                .subtitle(endpoint)
+                .width(px(420.))
+                .child(
+                    Label::new(
+                        "The server is not touched. This forgets how to reach it, and closes \
+                         whatever is open on it.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(IconColor::Muted)
+                    .wrap(),
+                )
+                .on_dismiss(cx.listener(|this, _, _, cx| this.cancel_remove_connection(cx)))
+                .footer_end(
+                    Button::new("remove-connection-cancel", "Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_remove_connection(cx))),
+                )
+                .footer_end(
+                    Button::new("remove-connection-confirm", "Remove")
+                        .variant(ButtonVariant::Danger)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.removing_connection = None;
+                            this.delete_connection(id, cx);
+                        })),
+                ),
+        )
+    }
+
+    fn cancel_remove_connection(&mut self, cx: &mut Context<Self>) {
+        self.removing_connection = None;
+        cx.notify();
     }
 
     /// Ids to show for `query`: every node whose name contains it, plus the

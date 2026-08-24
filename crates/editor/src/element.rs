@@ -157,6 +157,13 @@ struct Frame {
     statement_rows: Option<Range<usize>>,
     /// The word the open hover panel is describing.
     hovered: Option<Range<usize>>,
+    /// Every hit of the open find. Only the rows on screen would be enough,
+    /// but the list is already computed against the buffer version and
+    /// narrowing it per frame would cost more than painting past the edges of
+    /// the content mask does.
+    matches: Vec<Range<usize>>,
+    /// Which of `matches` the cursor is on.
+    current: Option<usize>,
 }
 
 impl Frame {
@@ -303,6 +310,7 @@ impl Element for EditorElement {
             editor.viewport = text_bounds.size;
             editor.refresh_longest_line();
             editor.refresh_highlights();
+            editor.refresh_find();
             let max_scroll = editor.max_scroll(text_bounds.size, line_height, char_width);
             if std::mem::take(&mut editor.autoscroll) {
                 editor.scroll_cursor_into_view(text_bounds.size, line_height, char_width);
@@ -360,6 +368,12 @@ impl Element for EditorElement {
                 show_line_numbers: editor.show_line_numbers && editor.mode == EditorMode::Full,
                 statement_rows,
                 hovered: editor.hover.as_ref().map(|open| open.range.clone()),
+                matches: editor
+                    .find
+                    .as_ref()
+                    .map(|open| open.matches.clone())
+                    .unwrap_or_default(),
+                current: editor.find.as_ref().and_then(|open| open.current),
                 texts,
                 spans,
                 errors,
@@ -441,6 +455,8 @@ impl Element for EditorElement {
             placeholder,
             statement_rows: frame_seed.statement_rows,
             hovered: frame_seed.hovered,
+            matches: frame_seed.matches,
+            current: frame_seed.current,
         };
 
         PrepaintState { hitbox, frame }
@@ -585,6 +601,28 @@ impl Element for EditorElement {
                 let row_end = line.start + line.len;
                 let text_x = f.text_bounds.origin.x - f.scroll.x;
 
+                // The hits the reader is not on, under everything. The one
+                // they *are* on is painted after the selection instead — see
+                // below.
+                for (index, hit) in f.matches.iter().enumerate() {
+                    if f.current == Some(index) || hit.end < row_start || hit.start > row_end {
+                        continue;
+                    }
+                    let a = hit.start.clamp(row_start, row_end) - row_start;
+                    let b = hit.end.clamp(row_start, row_end) - row_start;
+                    let x0 = text_x + line.x_for_column(a);
+                    let x1 = text_x + line.x_for_column(b);
+                    if x1 > x0 {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(x0, y),
+                                size: size(x1 - x0, f.line_height),
+                            },
+                            c.search_match,
+                        ));
+                    }
+                }
+
                 // Under the selection, so that selecting the word the panel
                 // describes still looks like a selection and not like a third
                 // colour nobody chose.
@@ -635,6 +673,33 @@ impl Element for EditorElement {
                             },
                             selection_color,
                         ));
+                    }
+                }
+
+                // Over the selection, and outlined. While the find field has
+                // focus the editor's selection is drawn in its dimmed inactive
+                // colour, so leaving the current hit to the selection alone
+                // would make the one match you are standing on the quietest
+                // thing on screen.
+                if let Some(hit) = f.current.and_then(|index| f.matches.get(index)) {
+                    if hit.end >= row_start && hit.start <= row_end {
+                        let a = hit.start.clamp(row_start, row_end) - row_start;
+                        let b = hit.end.clamp(row_start, row_end) - row_start;
+                        let x0 = text_x + line.x_for_column(a);
+                        let x1 = text_x + line.x_for_column(b);
+                        if x1 > x0 {
+                            window.paint_quad(gpui::quad(
+                                Bounds {
+                                    origin: point(x0, y),
+                                    size: size(x1 - x0, f.line_height),
+                                },
+                                px(2.),
+                                c.search_match,
+                                px(1.),
+                                c.accent,
+                                gpui::BorderStyle::Solid,
+                            ));
+                        }
                     }
                 }
 
@@ -722,6 +787,8 @@ struct FrameSeed {
     show_line_numbers: bool,
     statement_rows: Option<Range<usize>>,
     hovered: Option<Range<usize>>,
+    matches: Vec<Range<usize>>,
+    current: Option<usize>,
     texts: Vec<(usize, usize, String)>,
     /// Colours for each entry of `texts`, in the same order. Empty when there
     /// is no highlighter at all.

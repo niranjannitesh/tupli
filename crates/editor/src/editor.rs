@@ -184,6 +184,31 @@ pub struct Editor {
     /// does not restart the wait on every pixel.
     hover_pending: Option<Range<usize>>,
     hover_task: Option<Task<()>>,
+
+    // ---- find ------------------------------------------------------------
+    /// The open find bar's search, and where in its results the editor is.
+    /// `None` — the default — is a closed find bar, and costs nothing.
+    pub(crate) find: Option<FindState>,
+}
+
+/// An open find.
+pub(crate) struct FindState {
+    search: crate::find::Search,
+    /// Char ranges, left to right. Recomputed when the search or the text
+    /// changes and not otherwise: it is O(text), and the text is repainted
+    /// sixty times a second.
+    pub(crate) matches: Vec<Range<usize>>,
+    /// Index into `matches`. `None` when nothing matched.
+    pub(crate) current: Option<usize>,
+    /// The buffer version `matches` was computed from.
+    version: usize,
+    /// Where the cursor was when the find opened.
+    ///
+    /// Every recompute picks the first match at or after this, rather than at
+    /// or after the cursor — which is the match it just moved the cursor to.
+    /// Without it, typing `sel` in a script full of selects walks forward one
+    /// match per keystroke.
+    origin: usize,
 }
 
 /// An open hover panel.
@@ -253,6 +278,7 @@ impl Editor {
             hover: None,
             hover_pending: None,
             hover_task: None,
+            find: None,
         }
     }
 
@@ -1519,6 +1545,130 @@ impl Editor {
     }
 }
 
+// ---- find -----------------------------------------------------------------
+
+impl Editor {
+    /// Start a find, change the one that is open, or — with `None` — end it.
+    ///
+    /// The cursor lands on the first match at or after where it was when the
+    /// find began, which is the one the reader is looking for: a find opened
+    /// halfway down a script is asking about the half below, not about the
+    /// first `select` in the file.
+    pub fn set_search(&mut self, search: Option<crate::find::Search>, cx: &mut Context<Self>) {
+        let Some(search) = search else {
+            if self.find.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        let origin = match &self.find {
+            Some(open) => open.origin,
+            None => self.selections.newest().start(),
+        };
+        self.find = Some(FindState {
+            search,
+            matches: Vec::new(),
+            current: None,
+            // Nothing has been searched yet, and a version no buffer can be at
+            // is what makes the refresh below do the work.
+            version: usize::MAX,
+            origin,
+        });
+        self.refresh_find();
+        self.reveal_match(cx);
+    }
+
+    pub fn search(&self) -> Option<&crate::find::Search> {
+        self.find.as_ref().map(|open| &open.search)
+    }
+
+    /// Which match the cursor is on and how many there are, both one-based, or
+    /// `None` when the query has found nothing. For the count beside the field.
+    pub fn find_status(&self) -> Option<(usize, usize)> {
+        let open = self.find.as_ref()?;
+        Some((open.current? + 1, open.matches.len()))
+    }
+
+    /// Step to the next match, or the previous one, wrapping at either end.
+    ///
+    /// Wrapping rather than stopping because a find that goes quiet at the last
+    /// match looks broken, and because the count beside the field already says
+    /// where in the list you are.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.refresh_find();
+        let Some(open) = self.find.as_mut() else {
+            return;
+        };
+        let count = open.matches.len();
+        if count == 0 {
+            return;
+        }
+        open.current = Some(match open.current {
+            Some(at) if forward => (at + 1) % count,
+            Some(at) => (at + count - 1) % count,
+            None => 0,
+        });
+        self.reveal_match(cx);
+    }
+
+    /// Recompute the matches if the text has moved under them.
+    ///
+    /// Pulled from the frame for the same reason [`Editor::refresh_highlights`]
+    /// is: there are a dozen ways to change a buffer and one way to draw it.
+    pub(crate) fn refresh_find(&mut self) {
+        let version = self.buffer.version();
+        let Some(open) = self.find.as_mut() else {
+            return;
+        };
+        if open.version == version {
+            return;
+        }
+        open.matches = open.search.find_all(&self.buffer.text());
+        open.version = version;
+        // Whichever match the reader was on has almost certainly moved. Going
+        // back to the one at the origin is the only answer that does not
+        // depend on how the text was edited.
+        let at_origin = open.matches.iter().position(|m| m.start >= open.origin);
+        open.current = match at_origin {
+            Some(index) => Some(index),
+            // Every match is behind the origin, so the search wraps.
+            None => (!open.matches.is_empty()).then_some(0),
+        };
+    }
+
+    /// Select the current match and scroll it into view.
+    fn reveal_match(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.find.as_ref() else {
+            return;
+        };
+        let Some(range) = open.current.and_then(|at| open.matches.get(at)).cloned() else {
+            cx.notify();
+            return;
+        };
+        self.selections
+            .set(vec![Selection::new(range.start, range.end)]);
+        self.autoscroll = true;
+        self.restart_blink(cx);
+        cx.emit(EditorEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    /// What ⌘F should put in the field: the selection, when there is exactly
+    /// one and it is on one line. The text someone has just highlighted is
+    /// nearly always the text they are about to go looking for.
+    pub fn find_seed(&self) -> Option<String> {
+        if self.selections.len() != 1 {
+            return None;
+        }
+        let sel = self.selections.newest();
+        if sel.is_empty() {
+            return None;
+        }
+        let text = self.buffer.slice(sel.range());
+        (!text.contains('\n')).then_some(text)
+    }
+}
+
 /// The closing half of a pair, if `c` opens one.
 ///
 /// Backticks are not here: Postgres does not use them, and a `` ` `` in a query
@@ -2142,6 +2292,121 @@ mod tests {
         ) -> Vec<(Range<usize>, gpui::Hsla)> {
             Vec::new()
         }
+    }
+
+    // ---- find ------------------------------------------------------------
+
+    /// The cursor after a find, as `start..end`.
+    fn selected(editor: &gpui::Entity<Editor>, cx: &mut TestAppContext) -> Range<usize> {
+        editor.update(cx, |editor, _| {
+            let sel = editor.selections.newest();
+            sel.start()..sel.end()
+        })
+    }
+
+    #[gpui::test]
+    fn a_find_lands_on_the_first_hit_after_where_the_cursor_was(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "select id from t where id = 1");
+        editor.update(cx, |editor, cx| {
+            editor.place_cursor(10, false, cx);
+            editor.set_search(Some(crate::find::Search::new("id")), cx);
+            assert_eq!(editor.find_status(), Some((2, 2)));
+        });
+        assert_eq!(selected(&editor, cx), 23..25);
+    }
+
+    /// Typing into the field walks the query, not the results: every keystroke
+    /// searches again from where the find opened.
+    #[gpui::test]
+    fn narrowing_the_query_does_not_walk_forward_a_hit_at_a_time(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "select a, select b, select c");
+        editor.update(cx, |editor, cx| {
+            editor.place_cursor(0, false, cx);
+            editor.set_search(Some(crate::find::Search::new("s")), cx);
+            editor.set_search(Some(crate::find::Search::new("se")), cx);
+            editor.set_search(Some(crate::find::Search::new("sel")), cx);
+            assert_eq!(editor.find_status(), Some((1, 3)));
+        });
+        assert_eq!(selected(&editor, cx), 0..3);
+    }
+
+    #[gpui::test]
+    fn stepping_past_the_last_hit_wraps_to_the_first(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "a a a");
+        editor.update(cx, |editor, cx| {
+            editor.place_cursor(0, false, cx);
+            editor.set_search(Some(crate::find::Search::new("a")), cx);
+            editor.find_step(true, cx);
+            editor.find_step(true, cx);
+            assert_eq!(editor.find_status(), Some((3, 3)));
+            editor.find_step(true, cx);
+            assert_eq!(editor.find_status(), Some((1, 3)));
+        });
+        assert_eq!(selected(&editor, cx), 0..1);
+    }
+
+    #[gpui::test]
+    fn stepping_back_from_the_first_hit_wraps_to_the_last(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "a a a");
+        editor.update(cx, |editor, cx| {
+            editor.place_cursor(0, false, cx);
+            editor.set_search(Some(crate::find::Search::new("a")), cx);
+            editor.find_step(false, cx);
+            assert_eq!(editor.find_status(), Some((3, 3)));
+        });
+    }
+
+    /// Editing under an open find is not an error; the hits move with the text.
+    #[gpui::test]
+    fn changing_the_text_re_finds_it(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "id");
+        editor.update(cx, |editor, cx| {
+            editor.place_cursor(0, false, cx);
+            editor.set_search(Some(crate::find::Search::new("id")), cx);
+            assert_eq!(editor.find_status(), Some((1, 1)));
+            editor.set_text("id and id", cx);
+            editor.refresh_find();
+            assert_eq!(editor.find_status(), Some((1, 2)));
+        });
+    }
+
+    #[gpui::test]
+    fn a_query_nothing_matches_has_no_status_at_all(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "select 1");
+        editor.update(cx, |editor, cx| {
+            editor.set_search(Some(crate::find::Search::new("nobody")), cx);
+            assert_eq!(editor.find_status(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn closing_the_find_leaves_nothing_highlighted(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "select 1");
+        editor.update(cx, |editor, cx| {
+            editor.set_search(Some(crate::find::Search::new("select")), cx);
+            editor.set_search(None, cx);
+            assert!(editor.find.is_none());
+            assert_eq!(editor.find_status(), None);
+        });
+    }
+
+    /// ⌘F seeds the field from the selection, which is nearly always the word
+    /// somebody has just double-clicked.
+    #[gpui::test]
+    fn a_one_line_selection_is_what_the_field_starts_with(cx: &mut TestAppContext) {
+        let editor = new_editor(cx, "select id\nfrom t");
+        editor.update(cx, |editor, _| {
+            editor.selections.set(vec![Selection::new(7, 9)]);
+            assert_eq!(editor.find_seed().as_deref(), Some("id"));
+
+            // A selection spanning lines is a block of text, not a word: using
+            // it as a query would find nothing and look broken.
+            editor.selections.set(vec![Selection::new(0, 12)]);
+            assert_eq!(editor.find_seed(), None);
+
+            editor.selections.set(vec![Selection::cursor(3)]);
+            assert_eq!(editor.find_seed(), None);
+        });
     }
 
     #[gpui::test]

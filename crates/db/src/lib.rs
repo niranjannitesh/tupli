@@ -18,7 +18,7 @@ pub use column::{
     BytesBuf, Cell, CellText, Column, ColumnBuilder, ColumnData, ColumnMeta, NullMask, ResultSet,
     TextBuf, TextColumnBuilder,
 };
-pub use connection::{ConnectionColor, ConnectionConfig, SafetyLevel, SslMode};
+pub use connection::{ConnectionColor, ConnectionConfig, SafetyLevel, SslMode, MEMORY};
 pub use decode::{decode, hex_dump, sniff, DecodeError, Decoded, Decoder, Form};
 pub use driver::{
     Capabilities, Catalog, Dialect, Driver, Engine, Outcome, Write, DEFAULT_MAX_ROWS,

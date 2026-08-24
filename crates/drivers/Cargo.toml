@@ -9,3 +9,4 @@ db = { path = "../db" }
 db_clickhouse = { path = "../db_clickhouse" }
 db_pg = { path = "../db_pg" }
 db_redis = { path = "../db_redis" }
+db_sqlite = { path = "../db_sqlite" }

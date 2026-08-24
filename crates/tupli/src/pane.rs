@@ -332,6 +332,20 @@ pub(crate) struct StatementResult {
     pub truncated: bool,
 }
 
+/// Which surface an open find bar is looking through.
+///
+/// Decided when ⌘F is pressed and then remembered rather than re-derived,
+/// because the moment the field takes focus neither the console nor the grid
+/// has it and a live check would answer "neither" for as long as the bar is
+/// open.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FindTarget {
+    /// The SQL in the console.
+    Console,
+    /// The rows in the results dock.
+    Rows,
+}
+
 /// One editor and the result set it produced.
 ///
 /// A window starts with one of these and gains another every time something is
@@ -419,6 +433,18 @@ pub struct Pane {
     /// `UPDATE 3` — what a statement that returned no rows did.
     pub affected: Option<u64>,
 
+    // ---- find ------------------------------------------------------------
+    /// What the find bar is looking for. One field per pane and not one per
+    /// surface: only one bar is ever open, and carrying the query from the
+    /// console to the rows is the useful behaviour rather than the surprising
+    /// one.
+    pub find: Entity<Input>,
+    /// Which surface the open find is looking through. `None` — the resting
+    /// state — is a closed bar.
+    pub find_target: Option<FindTarget>,
+    pub find_case: bool,
+    pub find_word: bool,
+
     // ---- editing ---------------------------------------------------------
     /// How a row of the shown result set is addressed for writes, or why it
     /// cannot be. Recomputed whenever the grid is handed different rows —
@@ -442,6 +468,7 @@ impl Pane {
         grid: Entity<Grid>,
         filter: Entity<Input>,
         chip_value: Entity<Input>,
+        find: Entity<Input>,
     ) -> Self {
         Self {
             id,
@@ -456,6 +483,10 @@ impl Pane {
             selected_column: 0,
             filter,
             chip_value,
+            find,
+            find_target: None,
+            find_case: false,
+            find_word: false,
             composer: None,
             results_tab: ResultsTab::Data,
             results: Vec::new(),

@@ -147,6 +147,10 @@ struct Frame {
     /// Everything staged. Cloning an `Arc` per frame is the whole cost of
     /// painting pending state, which is why the grid keeps it behind one.
     changes: Arc<PendingChanges>,
+    /// What the open find bar is looking for. Tested against the cells being
+    /// drawn and no others — a screenful, not a page — which is what makes a
+    /// live highlight affordable over two hundred thousand rows.
+    find: Option<editor::Search>,
 }
 
 impl Frame {
@@ -372,6 +376,7 @@ impl Element for GridElement {
                 zebra: grid.zebra,
                 fetched_rows: grid.fetched_row_count(),
                 changes: grid.changes.clone(),
+                find: grid.find.clone(),
             }
         });
 
@@ -479,6 +484,17 @@ impl Element for GridElement {
                     };
                     if text.is_empty() {
                         continue;
+                    }
+                    // Only a real value can be a hit, for the same reason it is
+                    // the only kind that gets a quiet tail: `NULL` and
+                    // `DEFAULT` are the grid's words, not the database's, and
+                    // `color` is already the test for which is which.
+                    if color == c.text {
+                        if let Some(search) = &f.find {
+                            if search.matches(text) {
+                                window.paint_quad(fill(cell, c.search_match));
+                            }
+                        }
                     }
                     // Only an ordinary value gets a quiet tail. When the colour
                     // is already saying something — null, staged, disabled — a

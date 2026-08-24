@@ -120,6 +120,11 @@ pub struct ThemeColors {
     /// Line-number colour, and the current line number when brighter.
     pub editor_line_number: Hsla,
     pub editor_line_number_active: Hsla,
+    /// Wash behind every hit of an open find, in the console and in the grid.
+    /// Translucent and amber rather than opaque and accent-coloured: it sits
+    /// under text that still has to be readable, and the selection — which is
+    /// the hit you are *on* — has to stay the louder of the two.
+    pub search_match: Hsla,
     /// Cell background for a row edited but not yet committed.
     pub grid_dirty: Hsla,
     /// Cell background for a row queued for deletion.
@@ -460,6 +465,7 @@ impl ThemeColors {
             editor_active_statement: rgba(0x99ffe45c).into(),
             editor_line_number: rgb(0x505050).into(),
             editor_line_number_active: rgb(0xffffff).into(),
+            search_match: rgba(0xffc79947).into(),
             grid_dirty: rgba(0xffc79926).into(),
             grid_deleted: rgba(0xff808026).into(),
             grid_inserted: rgba(0x99ffe426).into(),
@@ -522,6 +528,7 @@ impl ThemeColors {
             editor_active_statement: rgba(0x0f9d5866).into(),
             editor_line_number: rgb(0xb0b0b8).into(),
             editor_line_number_active: rgb(0x50505a).into(),
+            search_match: rgba(0xfacc157a).into(),
             grid_dirty: rgba(0xb4530926).into(),
             grid_deleted: rgba(0xd42f2f26).into(),
             grid_inserted: rgba(0x0f9d5826).into(),

@@ -2,7 +2,7 @@
 //!
 //! The one place that knows the engines by name. It exists so that nothing
 //! above it does: the app depends on this crate and on [`db`], never on
-//! `db_pg`, `db_redis` or `db_clickhouse`, which makes "the UI does not know
+//! `db_pg`, `db_sqlite`, `db_redis` or `db_clickhouse`, which makes "the UI does not know
 //! what it is talking to" a fact the compiler checks rather than a rule people
 //! remember.
 //!
@@ -26,6 +26,8 @@ pub async fn connect(
         Engine::Postgres => {
             Arc::new(db_pg::PgConnection::connect(config, password).await?) as Arc<dyn Driver>
         }
+        Engine::Sqlite => Arc::new(db_sqlite::SqliteConnection::connect(config, password).await?)
+            as Arc<dyn Driver>,
         Engine::Redis => {
             Arc::new(db_redis::RedisConnection::connect(config, password).await?) as Arc<dyn Driver>
         }

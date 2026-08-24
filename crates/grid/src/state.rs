@@ -7,11 +7,12 @@
 //! re-derives which thirty rows are on screen with two divisions. Nothing is
 //! created or destroyed when you scroll a million rows.
 
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
 
 use db::{ResultSet, Value, ValueKind};
-use editor::{Editor, EditorEvent, EditorMode};
+use editor::{Editor, EditorEvent, EditorMode, Search};
 use sqlgen::{PendingChanges, RowRef};
 
 use crate::bench::{Bench, FrameMeter};
@@ -199,6 +200,11 @@ pub struct Grid {
     /// Set when an edit begins, for the same reason as `refocus` and in the
     /// other direction: the new editor has to take the keyboard.
     pub(crate) focus_edit: bool,
+
+    // ---- find ------------------------------------------------------------
+    /// What the open find bar is looking for. `None` — the default — is a
+    /// closed find bar, and costs the paint loop nothing.
+    pub(crate) find: Option<Search>,
 }
 
 /// A cell being typed into.
@@ -272,6 +278,7 @@ impl Grid {
             refocus: false,
             gutter: px(0.),
             focus_edit: false,
+            find: None,
         }
     }
 
@@ -968,6 +975,121 @@ impl Grid {
     }
 }
 
+// ---- find -------------------------------------------------------------------
+
+impl Grid {
+    pub fn search(&self) -> Option<&Search> {
+        self.find.as_ref()
+    }
+
+    /// Start a find, change the one that is open, or — with `None` — end it.
+    ///
+    /// Deliberately does not go looking: it stores the query and redraws, and
+    /// the cells on screen that hold it light up. Stepping to a hit is
+    /// [`Grid::find_step`], on ⏎ and ⌘G, because a page can be two hundred
+    /// thousand rows deep and scanning all of it on every keystroke would make
+    /// the field feel like it was fighting back — while the wash on the rows
+    /// already visible answers the common case before the scan would have
+    /// finished.
+    pub fn set_search(&mut self, search: Option<Search>, cx: &mut Context<Self>) {
+        if self.find == search {
+            return;
+        }
+        self.find = search;
+        cx.notify();
+    }
+
+    /// Move the cursor to the next cell holding the search, or the previous
+    /// one, wrapping at the end. Returns false when nothing in the loaded rows
+    /// matches at all.
+    ///
+    /// Only the loaded rows: this is a find over what is on the page, not a
+    /// `where` clause. The filter bar is the other question, and it is the one
+    /// that goes to the server.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(search) = self.find.clone() else {
+            return false;
+        };
+        if search.is_empty() {
+            return false;
+        }
+        match self.scan(self.cursor, forward, &search) {
+            Some((row, col)) => {
+                self.set_cursor(row, col, false, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The first cell holding `search`, walking out from `from` and wrapping
+    /// once. `from` itself is visited last, so a hit already under the cursor
+    /// does not stop the search on the spot.
+    fn scan(&self, from: (usize, usize), forward: bool, search: &Search) -> Option<(usize, usize)> {
+        let cols: Vec<usize> = (0..self.columns.len())
+            .filter(|col| !self.columns[*col].hidden)
+            .collect();
+        let rows = self.row_count();
+        if cols.is_empty() || rows == 0 {
+            return None;
+        }
+        // Cells numbered row-major over the visible columns, so "next" is one
+        // number up and the wrap is one modulo.
+        let width = cols.len();
+        let total = rows.checked_mul(width)?;
+        let at =
+            from.0.min(rows - 1) * width + cols.iter().position(|col| *col == from.1).unwrap_or(0);
+        let mut scratch = String::new();
+        for step in 1..=total {
+            let cell = match forward {
+                true => (at + step) % total,
+                false => (at + total - step % total) % total,
+            };
+            let (row, col) = (cell / width, cols[cell % width]);
+            if self.cell_matches(row, col, search, &mut scratch) {
+                return Some((row, col));
+            }
+        }
+        None
+    }
+
+    /// Whether a cell's text contains the search.
+    ///
+    /// A cell with no value — a null, or a new row's untouched column — never
+    /// matches, even though the grid draws the words `NULL` and `DEFAULT` in
+    /// it. Those are the grid's words, not the database's, and a find for
+    /// `null` that selected every empty cell in the table would be answering a
+    /// question the filter bar exists to answer properly.
+    pub(crate) fn cell_matches(
+        &self,
+        row: usize,
+        col: usize,
+        search: &Search,
+        scratch: &mut String,
+    ) -> bool {
+        // A staged edit is what the cell shows, so it is what the find looks at.
+        if let Some(value) = self.row_ref(row).and_then(|r| self.changes.value(r, col)) {
+            if value.is_null() {
+                return false;
+            }
+            scratch.clear();
+            let _ = write!(scratch, "{value}");
+            return search.matches(scratch);
+        }
+        let Some(column) = self.data.columns.get(col) else {
+            return false;
+        };
+        if row >= self.data.row_count() {
+            return false;
+        }
+        match column.render(row, scratch) {
+            db::CellText::Null => false,
+            db::CellText::Borrowed(text) => search.matches(text),
+            db::CellText::Formatted => search.matches(scratch),
+        }
+    }
+}
+
 /// [`Grid::row_ref`] without borrowing the whole grid — the mutating paths need
 /// the data and the change set at the same time, and one of them is `&mut`.
 fn row_ref_in(data: &ResultSet, changes: &PendingChanges, row: usize) -> Option<RowRef> {
@@ -1165,6 +1287,148 @@ mod reload_tests {
 
             assert_eq!(grid.columns.len(), 1);
             assert_eq!(grid.scroll.x, px(0.));
+        });
+    }
+}
+
+/// Find, with a real grid under it: the wrap, the hidden column, and the rule
+/// that the grid's own placeholders are not text anybody can search for.
+#[cfg(test)]
+mod find_tests {
+    use db::{Column, ColumnData, ColumnMeta, NullMask, ResultSet, TextColumnBuilder, ValueKind};
+    use editor::Search;
+    use gpui::{AppContext as _, Entity, TestAppContext};
+
+    use super::Grid;
+
+    /// Four rows. `email` is null on the last one, so the `NULL` the grid draws
+    /// there is available to search for — and must not be found.
+    fn users() -> ResultSet {
+        let mut ids = NullMask::with_capacity(4);
+        let mut values = Vec::new();
+        for row in 0..4 {
+            ids.push(false, row);
+            values.push(row as i64 + 1);
+        }
+        let mut emails = TextColumnBuilder::new();
+        for row in 0..3 {
+            emails.push(Some(&format!("user{}@example.com", row + 1)));
+        }
+        emails.push(None);
+        ResultSet::new(vec![
+            Column {
+                meta: ColumnMeta::new("id".to_string(), ValueKind::Int, "int8")
+                    .pk()
+                    .not_null(),
+                nulls: ids,
+                data: ColumnData::I64(values),
+            },
+            emails.finish(ColumnMeta::new(
+                "email".to_string(),
+                ValueKind::Text,
+                "text",
+            )),
+        ])
+    }
+
+    fn grid(cx: &mut TestAppContext) -> Entity<Grid> {
+        cx.update(|cx| ui::Theme::set_global(ui::Theme::of(ui::Appearance::Dark), cx));
+        cx.update(|cx| cx.new(|cx| Grid::new(users(), cx)))
+    }
+
+    #[gpui::test]
+    fn a_step_moves_the_cursor_to_the_next_cell_holding_the_text(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_search(Some(Search::new("user2")), cx);
+            assert!(grid.find_step(true, cx));
+            assert_eq!(grid.cursor(), (1, 1));
+        });
+    }
+
+    #[gpui::test]
+    fn the_cell_under_the_cursor_is_visited_last(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_search(Some(Search::new("example")), cx);
+            grid.set_cursor(1, 1, false, cx);
+            // Not (1, 1) again, even though it matches.
+            assert!(grid.find_step(true, cx));
+            assert_eq!(grid.cursor(), (2, 1));
+        });
+    }
+
+    #[gpui::test]
+    fn a_step_past_the_last_hit_wraps_to_the_first(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_search(Some(Search::new("example")), cx);
+            grid.set_cursor(2, 1, false, cx);
+            assert!(grid.find_step(true, cx));
+            assert_eq!(grid.cursor(), (0, 1));
+        });
+    }
+
+    #[gpui::test]
+    fn stepping_backwards_walks_the_other_way(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_search(Some(Search::new("example")), cx);
+            grid.set_cursor(2, 1, false, cx);
+            assert!(grid.find_step(false, cx));
+            assert_eq!(grid.cursor(), (1, 1));
+        });
+    }
+
+    #[gpui::test]
+    fn a_search_nothing_holds_leaves_the_cursor_where_it_was(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_cursor(2, 0, false, cx);
+            grid.set_search(Some(Search::new("nobody")), cx);
+            assert!(!grid.find_step(true, cx));
+            assert_eq!(grid.cursor(), (2, 0));
+        });
+    }
+
+    /// `NULL` is the grid's word for an empty cell, not the database's.
+    #[gpui::test]
+    fn the_placeholder_in_an_empty_cell_is_not_findable(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_search(Some(Search::new("null")), cx);
+            assert!(!grid.find_step(true, cx));
+        });
+    }
+
+    /// The find follows the screen, and a hidden column is not on it.
+    #[gpui::test]
+    fn a_hidden_column_is_not_searched(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.columns[1].hidden = true;
+            grid.rebuild_offsets();
+            grid.set_search(Some(Search::new("example")), cx);
+            assert!(!grid.find_step(true, cx));
+        });
+    }
+
+    /// An edit that has not been sent yet is what the cell shows, so it is what
+    /// the find looks at.
+    #[gpui::test]
+    fn a_staged_edit_is_what_gets_searched(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        grid.update(cx, |grid, cx| {
+            grid.set_editable(true, cx);
+            grid.set_cell(
+                0,
+                1,
+                db::Value::text(ValueKind::Text, "moved@elsewhere"),
+                cx,
+            );
+            grid.set_search(Some(Search::new("elsewhere")), cx);
+            assert!(grid.find_step(true, cx));
+            assert_eq!(grid.cursor(), (0, 1));
         });
     }
 }

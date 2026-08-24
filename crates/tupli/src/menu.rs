@@ -48,6 +48,9 @@ actions!(
         SaveAs,
         ExportRows,
         ImportRows,
+        Find,
+        FindNext,
+        FindPrevious,
         Run,
         RunAll,
         Cancel,
@@ -100,6 +103,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-e", ExportRows, None),
         KeyBinding::new("cmd-shift-i", ImportRows, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-f", Find, None),
+        KeyBinding::new("cmd-g", FindNext, None),
+        KeyBinding::new("cmd-shift-g", FindPrevious, None),
         // Query. ⌘↵ runs the statement under the cursor and ⇧⌘↵ the whole
         // script, which is the split every SQL client has settled on.
         KeyBinding::new("cmd-enter", Run, None),
@@ -163,6 +169,10 @@ pub fn init(cx: &mut App) {
             MenuItem::os_action("Copy", gpui::NoAction, OsAction::Copy),
             MenuItem::os_action("Paste", gpui::NoAction, OsAction::Paste),
             MenuItem::os_action("Select All", gpui::NoAction, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find…", Find),
+            MenuItem::action("Find Next", FindNext),
+            MenuItem::action("Find Previous", FindPrevious),
         ]),
         Menu::new("Query").items(vec![
             MenuItem::action("Run Statement", Run),

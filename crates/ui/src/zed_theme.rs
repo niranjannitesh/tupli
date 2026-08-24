@@ -288,6 +288,7 @@ impl ThemeVariant {
             &mut c.editor_active_statement,
             &["editor.highlighted_line.background"],
         );
+        take(&mut c.search_match, &["search.match_background"]);
         take(&mut c.editor_line_number, &["editor.line_number"]);
         take(
             &mut c.editor_line_number_active,

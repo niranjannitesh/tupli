@@ -1,0 +1,18 @@
+[package]
+name = "db_sqlite"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+db = { path = "../db" }
+futures.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+# Only the handle: the work here is blocking file I/O, and `spawn_blocking` is
+# the whole of what this crate wants from a runtime.
+tokio = { version = "1.53.1", features = ["rt"] }
+
+[dev-dependencies]
+sqlgen = { path = "../sqlgen" }

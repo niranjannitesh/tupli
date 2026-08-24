@@ -487,11 +487,18 @@ impl ConnectionForm {
         let text = |input: &Entity<Input>| input.read(cx).text(cx).trim().to_string();
         let host = text(&self.host);
         let name = text(&self.name);
+        let file = self.engine.is_file();
         ConnectionConfig {
             id: self.base.id,
             // An unnamed connection is named after where it goes, which is what
-            // the person would have typed anyway.
-            name: if name.is_empty() { host.clone() } else { name },
+            // the person would have typed anyway. A file names itself, and it
+            // does so out of a path the form has not collected yet, so the name
+            // is left empty for `display_name` to answer.
+            name: if name.is_empty() && !file {
+                host.clone()
+            } else {
+                name
+            },
             group: self.base.group.clone(),
             host: if host.is_empty() {
                 "localhost".into()
@@ -549,6 +556,42 @@ impl ConnectionForm {
             return None;
         }
         Some(self.password.read(cx).text(cx))
+    }
+
+    /// The open panel, for the engines whose database is a path.
+    ///
+    /// Typing the path works too — the field is a field — but nobody knows
+    /// where an application put its SQLite file off the top of their head.
+    fn choose_file(&mut self, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match prompt.await {
+                Ok(Ok(Some(paths))) => match paths.into_iter().next() {
+                    Some(path) => path,
+                    None => return,
+                },
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    log::warn!("the open panel did not open: {error:#}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            this.update(cx, |this, cx| {
+                let path = path.to_string_lossy().into_owned();
+                this.database
+                    .update(cx, |input, cx| input.set_text(&path, cx));
+                this.test = Test::Untried;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Open a connection, ask it one question, and drop it.
@@ -638,36 +681,56 @@ impl Render for ConnectionForm {
                     .hint(engine_hint(engine)),
             )
             .child(FormRow::new("Name").child(self.name.clone()))
-            .child(
-                FormRow::new("Host")
-                    .child(self.host.clone())
-                    .trailing(div().w(px(72.)).child(self.port.clone())),
-            )
-            .child(FormRow::new("Database").child(self.database.clone()))
-            .child(FormRow::new("User").child(self.user.clone()))
-            .child(
-                FormRow::new("Password")
-                    .child(self.password.clone())
-                    .hint("Stored in the macOS Keychain, never in tupli's own database."),
-            )
-            .child(
-                FormRow::new("SSL")
-                    .child(
-                        Segmented::new("ssl-mode", SslMode::ALL.map(|mode| mode.as_str()))
-                            .selected(SslMode::ALL.iter().position(|m| *m == ssl).unwrap_or(3))
-                            .on_select({
-                                let form = cx.entity();
-                                move |index, _, cx| {
-                                    form.update(cx, |this, cx| {
-                                        this.ssl = SslMode::ALL[index];
-                                        this.test = Test::Untried;
-                                        cx.notify();
-                                    });
-                                }
-                            }),
+            // A file has no server, so the half of the form that describes one
+            // is not hidden as a shortcut — there is nothing behind it to fill
+            // in, and a greyed-out `Host` would suggest otherwise.
+            .when(!engine.is_file(), |el| {
+                el.child(
+                    FormRow::new("Host")
+                        .child(self.host.clone())
+                        .trailing(div().w(px(72.)).child(self.port.clone())),
+                )
+            })
+            .child(if engine.is_file() {
+                FormRow::new("File")
+                    .child(self.database.clone())
+                    .trailing(
+                        Button::new("choose-file", "Choose…")
+                            .size(ButtonSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx))),
                     )
-                    .hint(ssl_hint(ssl)),
-            )
+                    .hint("The file has to exist already: opening one never creates it.")
+            } else {
+                FormRow::new("Database").child(self.database.clone())
+            })
+            .when(!engine.is_file(), |el| {
+                el.child(FormRow::new("User").child(self.user.clone()))
+                    .child(
+                        FormRow::new("Password")
+                            .child(self.password.clone())
+                            .hint("Stored in the macOS Keychain, never in tupli's own database."),
+                    )
+                    .child(
+                        FormRow::new("SSL")
+                            .child(
+                                Segmented::new("ssl-mode", SslMode::ALL.map(|mode| mode.as_str()))
+                                    .selected(
+                                        SslMode::ALL.iter().position(|m| *m == ssl).unwrap_or(3),
+                                    )
+                                    .on_select({
+                                        let form = cx.entity();
+                                        move |index, _, cx| {
+                                            form.update(cx, |this, cx| {
+                                                this.ssl = SslMode::ALL[index];
+                                                this.test = Test::Untried;
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .hint(ssl_hint(ssl)),
+                    )
+            })
             .child(
                 FormRow::new("Colour").child(h_flex().gap(px(6.)).children(
                     PALETTE.into_iter().enumerate().map(|(index, option)| {
@@ -749,10 +812,9 @@ impl Render for ConnectionForm {
     }
 }
 
-/// One line about what the chosen mode actually promises, because the libpq
-/// names are famously misleading — `require` encrypts but verifies nothing.
 /// What the `Database` and `User` fields fall back to, which is not the same
-/// question on both engines: one is asking for a name, the other for an index.
+/// question on every engine: one is asking for a name, another for an index,
+/// and a file engine for a path.
 fn engine_placeholder(engine: Engine) -> (String, String) {
     match engine {
         Engine::Postgres => ("postgres".into(), whoami_or_postgres()),
@@ -762,6 +824,8 @@ fn engine_placeholder(engine: Engine) -> (String, String) {
         // Where a bare table name resolves, rather than a boundary: a
         // ClickHouse session can read every database on the server.
         Engine::ClickHouse => ("default".into(), "default".into()),
+        // No user to fall back to, and the field is not on screen anyway.
+        Engine::Sqlite => ("~/database.sqlite".into(), String::new()),
     }
 }
 
@@ -770,9 +834,12 @@ fn engine_hint(engine: Engine) -> &'static str {
         Engine::Postgres => "Tables, a SQL editor, and editable results.",
         Engine::Redis => "Keys by pattern, and a command line instead of SQL.",
         Engine::ClickHouse => "Tables and a SQL editor. Results are read-only.",
+        Engine::Sqlite => "A file on disk. Tables, a SQL editor, editable results.",
     }
 }
 
+/// One line about what the chosen mode actually promises, because the libpq
+/// names are famously misleading — `require` encrypts but verifies nothing.
 fn ssl_hint(mode: SslMode) -> &'static str {
     match mode {
         SslMode::Disable => "No encryption. Only for a server on this machine.",
