@@ -166,6 +166,47 @@ fn main() {
             }
         }
 
+        // `TUPLI_SECOND=<spec>` opens a second connection, and `TUPLI_OPEN`
+        // the same table on it. Two tabs whose titles are identical is the
+        // state the strip has to be able to explain, and one server cannot
+        // produce it on its own.
+        if let Ok(spec) = std::env::var("TUPLI_SECOND") {
+            let config = db::ConnectionConfig::from_spec(&spec).expect("TUPLI_SECOND is a spec");
+            cx.update(|cx| {
+                window
+                    .update(cx, |workspace, _window, cx| {
+                        workspace.open_connection(config, cx)
+                    })
+                    .expect("open a second connection")
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                cx.run_until_parked();
+                let ready = cx.update(|cx| {
+                    window
+                        .read(cx)
+                        .map(|workspace| workspace.is_connected(cx))
+                        .unwrap_or(false)
+                });
+                if ready || std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if let Ok(open) = std::env::var("TUPLI_OPEN") {
+                let (schema, name) = open.split_once('.').expect("TUPLI_OPEN is schema.table");
+                let relation = db::RelationRef::new(schema, name);
+                cx.update(|cx| {
+                    window
+                        .update(cx, |workspace, _window, cx| {
+                            workspace.open_relation(&relation, cx)
+                        })
+                        .expect("browse the same table again")
+                });
+                cx.run_until_parked();
+            }
+        }
+
         // `TUPLI_RUN=<sql>` types a statement into the console and runs it, so
         // a frame can show what a failure looks like — the squiggle under the
         // character the server named — without a hand on the keyboard. Needs

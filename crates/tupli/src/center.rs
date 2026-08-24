@@ -15,7 +15,7 @@ use ui::{
     NoticeTone, ResizeHandle, Tab, TabBar, Toolbar, Tooltip,
 };
 
-use crate::pane::{FindTarget, Layout, Member, PaneGroup, PaneId};
+use crate::pane::{source_labels, FindTarget, Layout, Member, PaneGroup, PaneId, TabSource};
 use crate::results::ResultsTab;
 use crate::workspace::{count_of, format_duration, thousands, CenterKind, DragTarget, Workspace};
 
@@ -318,19 +318,16 @@ impl Workspace {
         let active = pane.active_tab;
 
         // What each tab is connected to, and whether that is worth saying. One
-        // database across the whole strip is the ordinary case and naming it on
+        // place across the whole strip is the ordinary case and naming it on
         // every tab would be noise; two is the thing a person has to be able to
         // see without clicking, because it decides what `select * from users`
         // means.
-        let sources: Vec<Option<SharedString>> = pane
+        let sources: Vec<Option<TabSource>> = pane
             .tabs
             .iter()
-            .map(|tab| self.tab_database(tab, cx))
+            .map(|tab| self.tab_source(tab, cx))
             .collect();
-        let mixed = {
-            let named: std::collections::HashSet<_> = sources.iter().flatten().collect();
-            named.len() > 1
-        };
+        let places = source_labels(&sources);
         let pane = self.pane_by(id).expect("checked above");
 
         let tabs: Vec<_> = pane
@@ -338,19 +335,30 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                // The database instead of the schema: when the strip spans two
-                // of them, which schema a table is in is the smaller half of
-                // the answer.
-                let detail = match mixed {
-                    true => sources.get(i).cloned().flatten().or(tab.detail.clone()),
-                    false => tab.detail.clone(),
-                };
+                // Where instead of which schema: when the strip spans more
+                // than one place, the schema a table is in is the smaller half
+                // of the answer.
+                let detail = places
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| tab.detail.clone());
                 let (icon, tone) = match tab.kind {
                     CenterKind::Query => (IconName::Code, IconColor::Accent),
                     CenterKind::Table => (IconName::Table, IconColor::Custom(c.warning)),
                     CenterKind::Structure => (IconName::Columns, IconColor::Muted),
                     CenterKind::Key => (IconName::Key, IconColor::Custom(c.info)),
                 };
+                // A connection that carries a colour carries it here too. What
+                // kind of tab this is stays legible — that is the icon's shape,
+                // not its colour — and two tabs on two servers stop looking
+                // alike, which is the whole point of setting one.
+                let tone = sources
+                    .get(i)
+                    .and_then(|source| source.as_ref())
+                    .and_then(|source| crate::tint::tint(source.color, cx))
+                    .map(IconColor::Custom)
+                    .unwrap_or(tone);
                 Tab::new(pane_id("center-tab", id, i), tab.title.clone())
                     .icon(icon)
                     .icon_color(tone)

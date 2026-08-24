@@ -29,7 +29,7 @@ use ui::{
 
 use editor::{Input, InputSize};
 
-use crate::tint::{tint, PALETTE};
+use crate::tint::tint;
 use crate::workspace::Workspace;
 
 /// Wide enough for the form's labels and its widest control — the five SSL
@@ -732,38 +732,43 @@ impl Render for ConnectionForm {
                     )
             })
             .child(
-                FormRow::new("Colour").child(h_flex().gap(px(6.)).children(
-                    PALETTE.into_iter().enumerate().map(|(index, option)| {
-                        let selected = option == color;
-                        let fill = tint(option, cx);
-                        div()
-                            .id(("swatch", index))
-                            .size(px(18.))
-                            .rounded_full()
-                            .cursor_pointer()
-                            .border_2()
-                            .border_color(if selected {
-                                c.text
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .child(
+                FormRow::new("Colour").child(
+                    h_flex().gap(px(6.)).children(
+                        ConnectionColor::ALL
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, option)| {
+                                let selected = option == color;
+                                let fill = tint(option, cx);
                                 div()
-                                    .size_full()
+                                    .id(("swatch", index))
+                                    .size(px(18.))
                                     .rounded_full()
-                                    .when_some(fill, |el, fill| el.bg(fill))
-                                    // "No colour" is a ring, not a blank:
-                                    // an empty slot reads as a bug.
-                                    .when(fill.is_none(), |el| {
-                                        el.border_1().border_color(c.border_strong)
-                                    }),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.color = option;
-                                cx.notify();
-                            }))
-                    }),
-                )),
+                                    .cursor_pointer()
+                                    .border_2()
+                                    .border_color(if selected {
+                                        c.text
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .child(
+                                        div()
+                                            .size_full()
+                                            .rounded_full()
+                                            .when_some(fill, |el, fill| el.bg(fill))
+                                            // "No colour" is a ring, not a blank:
+                                            // an empty slot reads as a bug.
+                                            .when(fill.is_none(), |el| {
+                                                el.border_1().border_color(c.border_strong)
+                                            }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.color = option;
+                                        cx.notify();
+                                    }))
+                            }),
+                    ),
+                ),
             )
             .child(
                 FormRow::new("Safety")

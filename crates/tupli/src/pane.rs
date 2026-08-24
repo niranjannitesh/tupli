@@ -322,6 +322,88 @@ pub struct CenterTab {
     pub(crate) reconnect: Option<(uuid::Uuid, String)>,
 }
 
+/// Where a tab is connected, in every term the strip might have to name it by.
+///
+/// A database name is only unique inside one server, and this app is happy to
+/// hold two: two tabs reading `oracle` can be two different `oracle`s. The
+/// whole identity travels together so the strip can pick the shortest wording
+/// that actually tells them apart.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct TabSource {
+    pub connection: uuid::Uuid,
+    /// The database as the connection names it, which for a file engine is a
+    /// whole path. Identity rather than wording: two files called `app.db` are
+    /// two databases.
+    pub database: SharedString,
+    /// The same thing short enough for a tab — `app.db`, not the path to it.
+    pub short: SharedString,
+    /// What the connection is called in the sidebar.
+    pub name: SharedString,
+    /// `host:port/database`, which is the last word on which server this is.
+    pub endpoint: SharedString,
+    pub color: db::ConnectionColor,
+}
+
+impl TabSource {
+    /// Which place this is. The connection alone will not do: opening another
+    /// database keeps the connection and changes the name.
+    fn place(&self) -> (uuid::Uuid, &SharedString) {
+        (self.connection, &self.database)
+    }
+
+    fn label(&self, rung: usize) -> SharedString {
+        match rung {
+            0 => self.short.clone(),
+            1 => self.name.clone(),
+            2 => format!("{}/{}", self.name, self.short).into(),
+            _ => self.endpoint.clone(),
+        }
+    }
+}
+
+/// How many rungs [`TabSource::label`] has.
+const RUNGS: usize = 4;
+
+/// What each tab has to say about where it is connected.
+///
+/// `None` for every tab when they are all in the same place, because a strip
+/// that repeats one database name on every tab has said nothing and taken the
+/// room the schema was using to say it.
+///
+/// Otherwise the shortest wording that separates the places actually on the
+/// strip: the database when the databases differ, the connection's name when
+/// they do not, and the endpoint when two connections are called the same
+/// thing. Widening one tab's label widens all of them — the labels are being
+/// compared with each other, so they have to be the same kind of thing.
+pub(crate) fn source_labels(sources: &[Option<TabSource>]) -> Vec<Option<SharedString>> {
+    let mut places: Vec<&TabSource> = Vec::new();
+    for source in sources.iter().flatten() {
+        if !places.iter().any(|other| other.place() == source.place()) {
+            places.push(source);
+        }
+    }
+    if places.len() < 2 {
+        return vec![None; sources.len()];
+    }
+
+    let rung = (0..RUNGS)
+        .find(|rung| {
+            let mut labels: Vec<SharedString> =
+                places.iter().map(|place| place.label(*rung)).collect();
+            labels.sort();
+            labels.dedup();
+            labels.len() == places.len()
+        })
+        // Two places that are the same server, the same database and the same
+        // name are as far as words go; the tabs keep the fullest one.
+        .unwrap_or(RUNGS - 1);
+
+    sources
+        .iter()
+        .map(|source| source.as_ref().map(|source| source.label(rung)))
+        .collect()
+}
+
 /// One statement's rows, kept so that a script's answers can be looked at one
 /// at a time. Only statements that returned rows are here: an `update` reports
 /// what it changed in the message log and has nothing for a grid to show.
@@ -524,6 +606,126 @@ mod tests {
 
     fn ids(group: &PaneGroup) -> Vec<PaneId> {
         group.panes()
+    }
+
+    fn source(connection: u128, database: &str, name: &str, host: &str) -> Option<TabSource> {
+        Some(TabSource {
+            connection: uuid::Uuid::from_u128(connection),
+            database: database.into(),
+            short: database.into(),
+            name: name.into(),
+            endpoint: format!("{host}/{database}").into(),
+            color: db::ConnectionColor::None,
+        })
+    }
+
+    fn labels(sources: &[Option<TabSource>]) -> Vec<Option<String>> {
+        source_labels(sources)
+            .into_iter()
+            .map(|label| label.map(|label| label.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn one_place_needs_no_labelling_at_all() {
+        let strip = vec![
+            source(1, "oracle", "local", "localhost"),
+            source(1, "oracle", "local", "localhost"),
+        ];
+        assert_eq!(labels(&strip), vec![None, None]);
+    }
+
+    #[test]
+    fn two_databases_are_told_apart_by_their_names() {
+        let strip = vec![
+            source(1, "oracle", "local", "localhost"),
+            source(1, "reports", "local", "localhost"),
+        ];
+        assert_eq!(
+            labels(&strip),
+            vec![Some("oracle".into()), Some("reports".into())]
+        );
+    }
+
+    #[test]
+    fn the_same_database_on_two_connections_is_told_apart_by_the_connection() {
+        let strip = vec![
+            source(1, "oracle", "local", "localhost"),
+            source(2, "oracle", "staging", "db.internal"),
+        ];
+        assert_eq!(
+            labels(&strip),
+            vec![Some("local".into()), Some("staging".into())]
+        );
+    }
+
+    #[test]
+    fn a_connection_holding_two_databases_beside_another_holding_one_says_both() {
+        let strip = vec![
+            source(1, "oracle", "local", "localhost"),
+            source(1, "reports", "local", "localhost"),
+            source(2, "oracle", "staging", "db.internal"),
+        ];
+        assert_eq!(
+            labels(&strip),
+            vec![
+                Some("local/oracle".into()),
+                Some("local/reports".into()),
+                Some("staging/oracle".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_connections_called_the_same_thing_fall_back_to_the_endpoint() {
+        let strip = vec![
+            source(1, "oracle", "oracle", "localhost"),
+            source(2, "oracle", "oracle", "db.internal"),
+        ];
+        assert_eq!(
+            labels(&strip),
+            vec![
+                Some("localhost/oracle".into()),
+                Some("db.internal/oracle".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_files_of_the_same_name_are_told_apart_by_their_connections() {
+        // A file engine's database is a path, and a path is far too long for a
+        // tab; the short form collides, which is exactly when the connection's
+        // own name is the answer.
+        let a = TabSource {
+            connection: uuid::Uuid::from_u128(1),
+            database: "/srv/a/app.db".into(),
+            short: "app.db".into(),
+            name: "local".into(),
+            endpoint: "/srv/a/app.db".into(),
+            color: db::ConnectionColor::None,
+        };
+        let b = TabSource {
+            connection: uuid::Uuid::from_u128(2),
+            database: "/srv/b/app.db".into(),
+            short: "app.db".into(),
+            name: "backup".into(),
+            endpoint: "/srv/b/app.db".into(),
+            color: db::ConnectionColor::None,
+        };
+        assert_eq!(
+            labels(&[Some(a), Some(b)]),
+            vec![Some("local".into()), Some("backup".into())]
+        );
+    }
+
+    #[test]
+    fn a_tab_connected_to_nothing_is_left_to_its_schema() {
+        let strip = vec![
+            source(1, "oracle", "local", "localhost"),
+            source(2, "reports", "staging", "db.internal"),
+            None,
+        ];
+        assert_eq!(labels(&strip)[2], None);
     }
 
     #[test]

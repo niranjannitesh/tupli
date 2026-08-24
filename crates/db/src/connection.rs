@@ -95,6 +95,42 @@ pub enum ConnectionColor {
     Pink,
 }
 
+impl ConnectionColor {
+    /// The name the settings file and the connection spec use. Also the serde
+    /// spelling, which is what keeps a saved connection and a typed one
+    /// meaning the same thing.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Grey => "grey",
+            Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+            Self::Pink => "pink",
+        }
+    }
+
+    pub fn from_str(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.as_str() == text)
+    }
+
+    /// Every colour, in the order the picker offers them.
+    pub const ALL: [Self; 9] = [
+        Self::None,
+        Self::Grey,
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+        Self::Pink,
+    ];
+}
+
 /// How careful to be with writes on this connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -182,6 +218,40 @@ impl ConnectionConfig {
             &self.database
         };
         format!("{}@{}/{}", self.user, self.host, db)
+    }
+
+    /// The connection in as few characters as tell it apart.
+    ///
+    /// Its name if it has one; otherwise the server it points at — the host,
+    /// or for a file the directory the file is in, which is what distinguishes
+    /// two copies of `app.db`. [`Self::display_name`] answers the same
+    /// question at full length, and full length is not what a tab has.
+    pub fn short_name(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.clone();
+        }
+        if self.engine.is_file() {
+            let path = std::path::Path::new(self.database.trim());
+            return path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.display_name());
+        }
+        self.host.clone()
+    }
+
+    /// What to call the database in a space too small for a path.
+    ///
+    /// On a server that is the name and there is nothing to shorten. A file
+    /// engine's "database" is where the file is, and the last part of it is
+    /// the part somebody recognises — the directory above is what
+    /// [`Self::endpoint`] is for.
+    pub fn database_label(&self) -> String {
+        if self.engine.is_file() {
+            return file_label(&self.database);
+        }
+        self.database.clone()
     }
 
     /// `host:port/database`, for the status bar and the tab subtitle. The port
@@ -359,6 +429,10 @@ impl ConnectionConfig {
                 "sslkey" => config.ssl_key = Some(value),
                 "sslrootcert" => config.ssl_root_cert = Some(value),
                 "name" => config.name = value,
+                "color" => {
+                    config.color = ConnectionColor::from_str(&value)
+                        .ok_or_else(|| format!("unknown colour {value:?}"))?
+                }
                 // Written by `connection_string` and meaningless coming back.
                 "application_name" => {}
                 other => return Err(format!("unknown keyword {other:?}")),
@@ -544,6 +618,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.display_name(), "reader@db.internal/app");
+    }
+
+    #[test]
+    fn a_connection_short_of_room_is_its_name_or_its_server() {
+        let mut config = ConnectionConfig {
+            user: "reader".into(),
+            host: "db.internal".into(),
+            database: "app".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.short_name(), "db.internal");
+        config.name = "staging".into();
+        assert_eq!(config.short_name(), "staging");
+    }
+
+    #[test]
+    fn an_unnamed_file_is_short_for_the_directory_it_is_in() {
+        // Which is the whole of the difference between two backups of the same
+        // database, and the only part of the path worth a tab's room.
+        let config = ConnectionConfig {
+            engine: Engine::Sqlite,
+            database: "/srv/nightly/app.db".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.short_name(), "nightly");
+        assert_eq!(config.database_label(), "app.db");
     }
 
     #[test]

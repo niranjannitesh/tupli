@@ -43,16 +43,3 @@ pub fn tint_wash(color: ConnectionColor, cx: &App) -> Option<Hsla> {
     };
     Some(base)
 }
-
-/// Every colour in palette order, for the picker.
-pub const PALETTE: [ConnectionColor; 9] = [
-    ConnectionColor::None,
-    ConnectionColor::Grey,
-    ConnectionColor::Red,
-    ConnectionColor::Orange,
-    ConnectionColor::Yellow,
-    ConnectionColor::Green,
-    ConnectionColor::Blue,
-    ConnectionColor::Purple,
-    ConnectionColor::Pink,
-];

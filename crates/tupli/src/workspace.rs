@@ -27,7 +27,7 @@ use crate::mock;
 use crate::palette::{
     Command, ItemKind, Palette, PaletteAction, PaletteEvent, PaletteItem, PaletteMode,
 };
-use crate::pane::{FindTarget, Layout, Pane, PaneGroup, PaneId};
+use crate::pane::{FindTarget, Layout, Pane, PaneGroup, PaneId, TabSource};
 use crate::results::{one_line, ResultsTab};
 use crate::save_sheet::{SaveQuerySheet, SaveSheetEvent};
 use crate::session::{Activity, Session, SessionEvent, SessionState};
@@ -2375,17 +2375,48 @@ impl Workspace {
         }
     }
 
-    /// Which database a tab is looking at, by name.
+    /// Where a tab is connected.
     ///
-    /// A live session if it has one, and otherwise the name it was restored
-    /// with — a tab you have not clicked since launch still knows where it
-    /// belongs, and the strip has to be able to say so before the connection
-    /// is opened.
-    pub(crate) fn tab_database(&self, tab: &CenterTab, cx: &App) -> Option<SharedString> {
-        match &tab.session {
-            Some(session) => Some(session.read(cx).config.database.clone().into()),
-            None => tab.reconnect.as_ref().map(|(_, db)| db.clone().into()),
-        }
+    /// A live session if it has one, and otherwise the connection it was
+    /// restored with — a tab you have not clicked since launch still knows
+    /// where it belongs, and the strip has to be able to say so before the
+    /// connection is opened.
+    pub(crate) fn tab_source(&self, tab: &CenterTab, cx: &App) -> Option<TabSource> {
+        let config = match &tab.session {
+            Some(session) => session.read(cx).config.clone(),
+            None => {
+                let (id, database) = tab.reconnect.clone()?;
+                match self.connections.iter().find(|c| c.id == id).cloned() {
+                    Some(mut config) => {
+                        // The tab may have been left on a database other than
+                        // the one the connection opens by default.
+                        config.database = database;
+                        config
+                    }
+                    // Removed since it was last open: the name it went by went
+                    // with it, and the database is all there is left to say.
+                    None => {
+                        let database: SharedString = database.into();
+                        return Some(TabSource {
+                            connection: id,
+                            database: database.clone(),
+                            short: database.clone(),
+                            name: database.clone(),
+                            endpoint: database,
+                            color: db::ConnectionColor::None,
+                        });
+                    }
+                }
+            }
+        };
+        Some(TabSource {
+            connection: config.id,
+            database: config.database.clone().into(),
+            short: config.database_label().into(),
+            name: config.short_name().into(),
+            endpoint: config.endpoint().into(),
+            color: config.color,
+        })
     }
 
     /// Point this window at a connection and open it.

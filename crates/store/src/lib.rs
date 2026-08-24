@@ -222,7 +222,7 @@ impl Store {
                 config.ssl_cert,
                 config.ssl_key,
                 config.ssl_root_cert,
-                color_name(config.color),
+                config.color.as_str(),
                 safety_name(config.safety),
                 config.keep_alive,
                 next,
@@ -308,32 +308,10 @@ fn parse_ssl_mode(text: &str) -> SslMode {
         .unwrap_or_default()
 }
 
-fn color_name(color: ConnectionColor) -> &'static str {
-    match color {
-        ConnectionColor::None => "none",
-        ConnectionColor::Grey => "grey",
-        ConnectionColor::Red => "red",
-        ConnectionColor::Orange => "orange",
-        ConnectionColor::Yellow => "yellow",
-        ConnectionColor::Green => "green",
-        ConnectionColor::Blue => "blue",
-        ConnectionColor::Purple => "purple",
-        ConnectionColor::Pink => "pink",
-    }
-}
-
+/// A colour this version does not know is no colour, on the same principle as
+/// the engine above: a row written by a later version still opens.
 fn parse_color(text: &str) -> ConnectionColor {
-    match text {
-        "grey" => ConnectionColor::Grey,
-        "red" => ConnectionColor::Red,
-        "orange" => ConnectionColor::Orange,
-        "yellow" => ConnectionColor::Yellow,
-        "green" => ConnectionColor::Green,
-        "blue" => ConnectionColor::Blue,
-        "purple" => ConnectionColor::Purple,
-        "pink" => ConnectionColor::Pink,
-        _ => ConnectionColor::None,
-    }
+    ConnectionColor::from_str(text).unwrap_or_default()
 }
 
 fn safety_name(safety: SafetyLevel) -> &'static str {
