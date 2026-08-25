@@ -3,6 +3,7 @@
 
 pub mod center;
 pub mod clipboard;
+pub mod columns;
 pub mod complete;
 pub mod connection_window;
 pub mod editing;

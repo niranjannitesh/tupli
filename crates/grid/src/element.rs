@@ -877,6 +877,23 @@ impl GridElement {
                 let (row, col) = match f.region(e.position) {
                     Region::Cell(row, col) => (row, col),
                     Region::Gutter(row) => (row, 0),
+                    // A header carries its own menu, about the column rather
+                    // than about the rows. The edge is the resize handle, but
+                    // only to a drag; a right click there means the header it
+                    // belongs to.
+                    Region::Header(col) | Region::ColumnEdge(col) => {
+                        let handle = grid.read(cx).focus().clone();
+                        grid.update(cx, |grid, cx| {
+                            grid.stage_edit(cx);
+                            cx.emit(GridEvent::HeaderMenu {
+                                at: e.position,
+                                col,
+                            });
+                        });
+                        window.focus(&handle, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     _ => return,
                 };
                 let handle = grid.read(cx).focus().clone();

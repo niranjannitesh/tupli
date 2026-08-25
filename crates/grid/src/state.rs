@@ -115,6 +115,13 @@ pub enum GridEvent {
         row: usize,
         col: usize,
     },
+    /// A right click landed on a column header. Nothing about the selection
+    /// has changed — a header is not a cell, and taking the cursor off the row
+    /// someone was reading to open a menu about a column would be a theft.
+    HeaderMenu {
+        at: Point<Pixels>,
+        col: usize,
+    },
 }
 
 /// Which column the grid is sorted by, and which way.

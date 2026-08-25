@@ -400,6 +400,7 @@ impl Workspace {
     ) {
         self.menu = None;
         self.row_menu = None;
+        self.column_menu = None;
         self.tab_menu = None;
         self.connection_menu = Some((at, id));
         cx.notify();

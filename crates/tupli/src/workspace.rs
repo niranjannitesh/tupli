@@ -283,6 +283,9 @@ pub struct Workspace {
     /// there is a row with something decodable in it. Screenshots only, for
     /// the same reason as [`Self::pending_demo`].
     pub(crate) pending_decoder: Option<String>,
+    /// `TUPLI_COLUMN_MENU`: the grid column whose header menu to open, once
+    /// there is a result set for it to be about. Screenshots only, again.
+    pending_column_menu: Option<usize>,
     /// This window, learned on the first frame. Held so that something
     /// started in another window — editing a connection from Settings — can
     /// bring the window the sheet actually appears in to the front.
@@ -322,6 +325,8 @@ pub struct Workspace {
     pub(crate) menu: Option<crate::objects::ObjectMenu>,
     /// The grid's own context menu, while it is open.
     pub(crate) row_menu: Option<crate::clipboard::RowMenu>,
+    /// The grid's header menu, while it is open.
+    pub(crate) column_menu: Option<crate::columns::ColumnMenu>,
     /// The tab strip's menu, while it is up.
     pub(crate) tab_menu: Option<crate::tabs::TabMenu>,
     /// Where the titlebar's database switcher was clicked, while its menu is
@@ -411,6 +416,10 @@ fn build_pane(
         GridEvent::ContextMenu { at, row, col } => {
             this.active_pane = id;
             this.open_row_menu(*at, *row, *col, cx);
+        }
+        GridEvent::HeaderMenu { at, col } => {
+            this.active_pane = id;
+            this.open_column_menu(*at, *col, cx);
         }
         // Staged, not saved. The toolbar's counts and the tab's dirty dot both
         // read the grid, so all this has to do is ask for a frame.
@@ -1031,10 +1040,12 @@ impl Workspace {
             pending_demo: None,
             pending_design: None,
             pending_decoder: None,
+            pending_column_menu: None,
             pending_refresh: false,
 
             menu: None,
             row_menu: None,
+            column_menu: None,
             tab_menu: None,
             database_menu: None,
             filter_menu: None,
@@ -4808,6 +4819,12 @@ impl Workspace {
                 None => log::warn!("TUPLI_DESIGN={spec:?} is not schema.table or `new`"),
             }
         }
+        if let Ok(col) = std::env::var("TUPLI_COLUMN_MENU") {
+            match col.parse::<usize>() {
+                Ok(col) => self.pending_column_menu = Some(col),
+                Err(_) => log::warn!("TUPLI_COLUMN_MENU={col:?} is not a column index"),
+            }
+        }
         if let Ok(column) = std::env::var("TUPLI_DECODER") {
             self.pending_decoder = Some(column);
         }
@@ -5316,6 +5333,15 @@ impl Render for Workspace {
             window.focus(&handle, cx);
         }
 
+        // The header menu waits for a result set: it names a column, and until
+        // rows arrive there is no column for it to name.
+        if let Some(col) = self.pending_column_menu {
+            if self.pane().grid.read(cx).data().columns.len() > col {
+                self.pending_column_menu = None;
+                self.open_column_menu(gpui::point(px(360.), px(196.)), col, cx);
+            }
+        }
+
         // The theme changed under us. Every element in the tree cached its
         // colours when it was built, so the whole window has to be rebuilt and
         // this is the only place that can say so.
@@ -5486,6 +5512,7 @@ impl Render for Workspace {
             // thing here that is anchored to a point the user just clicked.
             .children(self.render_object_menu(cx))
             .children(self.render_row_menu(cx))
+            .children(self.render_column_menu(cx))
             .children(self.render_tab_menu(cx))
             .children(self.render_database_menu(cx))
             .children(self.render_filter_menu(cx))

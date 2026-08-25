@@ -32,6 +32,7 @@ impl Workspace {
         // Two menus at once is never what was meant; the tree's is the only
         // other one that can still be up when a click reaches the grid.
         self.menu = None;
+        self.column_menu = None;
         self.row_menu = Some(RowMenu { at, row, col });
         cx.notify();
     }

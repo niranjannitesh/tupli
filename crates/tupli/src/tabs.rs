@@ -40,6 +40,7 @@ impl Workspace {
         self.activate_pane(pane, cx);
         self.menu = None;
         self.row_menu = None;
+        self.column_menu = None;
         self.tab_menu = Some(TabMenu { at, pane, index });
         cx.notify();
     }
