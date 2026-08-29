@@ -31,4 +31,5 @@ pub mod tabs;
 pub mod tint;
 pub mod titlebar;
 pub mod tree;
+pub mod vibrancy;
 pub mod workspace;
