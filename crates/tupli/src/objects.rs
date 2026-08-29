@@ -670,6 +670,7 @@ mod tests {
 
     fn tab(title: &str, relation: Option<db::RelationRef>) -> crate::pane::CenterTab {
         crate::pane::CenterTab {
+            cached: None,
             kind: match relation {
                 Some(_) => crate::pane::CenterKind::Table,
                 None => crate::pane::CenterKind::Query,

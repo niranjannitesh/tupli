@@ -7,6 +7,9 @@
     "bold: nucleo-micro-bold. Only glyphs whose meaning IS the solidity --",
     "  a run triangle, a filled warning, an active star -- where an outline",
     "  version would read as the inactive state of itself.",
+    "fill: nucleo-ui-fill-18. The same 18x18 box as the outline pack, filled.",
+    "  For a solid glyph the 20x20 bold pack does not carry, and for the ones",
+    "  that must sit beside their own outline at the same weight.",
     "duo: nucleo-ui-fill-duo-18. Decorative and empty-state only; two layers."
   ],
   "outline": {
@@ -80,7 +83,7 @@
     "moon": "moon",
     "pause": "media-pause",
     "pen": "pen",
-    "pin": "pin",
+    "pin": "pin-tack",
     "plug": "plug",
     "plus": "plus",
     "redo": "redo",
@@ -134,10 +137,12 @@
     "circle-check-filled": "circle-check-filled",
     "circle-xmark-filled": "circle-xmark-filled",
     "warning-filled": "triangle-warning-filled",
-    "pin-filled": "pin-filled",
     "star-filled": "star-filled",
     "stop-filled": "media-stopped-filled",
     "square-caret-down": "square-caret-down-filled"
+  },
+  "fill": {
+    "pin-filled": "pin-tack"
   },
   "duo": {
     "duo-key": "key",

@@ -181,7 +181,7 @@ impl RenderOnce for Sheet {
                                     .py(px(12.))
                                     .gap(px(8.))
                                     .border_t_1()
-                                    .border_color(c.border)
+                                    .border_color(c.seam)
                                     .bg(c.panel)
                                     .children(self.footer_start)
                                     .child(div().flex_1())

@@ -582,7 +582,7 @@ pub(crate) fn structure_header(c: &ui::ThemeColors, columns: &[(&'static str, Sl
         .gap(px(8.))
         .bg(c.chrome)
         .border_b_1()
-        .border_color(c.border);
+        .border_color(c.seam);
     for (title, width) in columns {
         let label = Label::new(*title)
             .size(LabelSize::Small)

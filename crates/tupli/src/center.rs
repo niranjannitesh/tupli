@@ -10,14 +10,20 @@ use gpui::{
     Pixels, SharedString, Window,
 };
 use ui::{
-    h_flex, region, v_flex, ActiveTheme, Axis, Badge, BadgeStyle, BadgeTone, Button, ButtonSize,
+    h_flex, page, v_flex, ActiveTheme, Axis, Badge, BadgeStyle, BadgeTone, Button, ButtonSize,
     ButtonVariant, EmptyState, Icon, IconColor, IconName, IconSize, Label, LabelSize, Notice,
-    NoticeTone, ResizeHandle, Tab, TabBar, Toolbar, Tooltip,
+    NoticeTone, Popup, ResizeHandle, Tab, TabBar, Toolbar, Tooltip,
 };
 
 use crate::pane::{source_labels, FindTarget, Layout, Member, PaneGroup, PaneId, TabSource};
 use crate::results::ResultsTab;
 use crate::workspace::{count_of, format_duration, thousands, CenterKind, DragTarget, Workspace};
+
+/// The height of everything on a row of the filter band, buttons included.
+/// One height and no exceptions: a field that stands taller than the controls
+/// beside it is the shape a web form has, where the input is the only thing
+/// anybody styled.
+const ROW: Pixels = px(20.);
 
 impl Workspace {
     /// Every pane is looking at a table's rows rather than at a script.
@@ -409,7 +415,7 @@ impl Workspace {
                 pane.tab_scroll.scroll_to_item(active);
             }
         }
-        region(cx)
+        page(cx)
             .map(|el| match browsing {
                 true => el.flex_none(),
                 false => el.flex_1().min_h_0(),
@@ -583,9 +589,7 @@ impl Workspace {
                             .px(px(6.))
                             .py(px(2.))
                             .rounded(cx.metrics().radius_sm)
-                            .when(connected, |el| {
-                                el.cursor_pointer().hover(|el| el.bg(cx.colors().hover))
-                            })
+                            .when(connected, |el| el.hover(|el| el.bg(cx.colors().hover)))
                             .child(Icon::new(IconName::Database).size(IconSize::Small).color(
                                 if connected {
                                     IconColor::Accent
@@ -806,7 +810,7 @@ impl Workspace {
             .flatten()
             .map(|result| SharedString::from(crate::results::one_line(&result.sql)));
 
-        region(cx)
+        ui::page(cx)
             .size_full()
             // No border on the region itself: the strip below draws its own top
             // hairline, and a region border here as well is the same line twice
@@ -864,7 +868,7 @@ impl Workspace {
                     .px(px(8.))
                     .gap(px(8.))
                     .border_t_1()
-                    .border_color(c.border)
+                    .border_color(c.seam)
                     .child(
                         // What the last run actually did, not a relative time
                         // nobody can check. A failure says so: the rows above
@@ -1030,7 +1034,10 @@ impl Workspace {
                 ));
             }
             if let Some(length) = facts.length {
-                pairs.push((length_label(&kind).into(), thousands(length as usize).into()));
+                pairs.push((
+                    length_label(&kind).into(),
+                    thousands(length as usize).into(),
+                ));
             }
         }
 
@@ -1043,7 +1050,11 @@ impl Workspace {
                     h_flex()
                         .flex_none()
                         .gap(px(5.))
-                        .child(Label::new(name).size(LabelSize::Small).color(IconColor::Subtle))
+                        .child(
+                            Label::new(name)
+                                .size(LabelSize::Small)
+                                .color(IconColor::Subtle),
+                        )
                         .child(
                             div()
                                 .font(ty.mono_font())
@@ -1056,208 +1067,317 @@ impl Workspace {
         )
     }
 
-    /// hard case starts from the easy one instead of from an empty field.
+    /// What the filter is doing, in one line, in the toolbar above the rows.
+    ///
+    /// The band it summarises can be shut, and "why are there only nine rows"
+    /// needs an answer that does not depend on a disclosure being open. The
+    /// generated `where` rather than a count of conditions, because the clause
+    /// is the answer and anybody reading this row already reads SQL.
     fn render_filter_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let c = cx.colors().clone();
         let ty = cx.typography().clone();
-        let radius = cx.metrics().radius_sm;
-        let value_color = cx.syntax().string;
-        let Some(tab) = self.pane().active() else {
-            return div().flex_1().into_any_element();
-        };
-        if tab.filter.raw {
-            return div()
-                .flex_1()
-                .min_w_0()
-                .font(ty.mono_font())
-                .child(self.pane().filter.clone())
-                .into_any_element();
-        }
-        let chips = tab.filter.chips.clone();
-        let composer = self.pane().composer.clone();
-        let anything = !chips.is_empty() || composer.is_some();
-
-        // A pill: the shape both a committed chip and the composer wear, so
-        // editing one does not make it jump to somewhere else on the row.
-        let pill = move |id: ElementId| {
-            h_flex()
-                .id(id)
-                .flex_none()
-                .h(px(22.))
-                .px(px(6.))
-                .gap(px(5.))
-                .rounded(radius)
-                .bg(c.field)
-                .border_1()
-                .border_color(c.border)
-        };
-
+        let columns = self.filter_columns(cx);
+        let predicate = self
+            .pane()
+            .active()
+            .map(|tab| tab.filter.predicate(&columns))
+            .unwrap_or_default();
+        // Nothing at all while the band is open: the band prints the same
+        // clause along its own foot, and the same sentence twice two lines
+        // apart reads as two different things being said.
+        let open = self.pane().filter_open;
         h_flex()
-            .id("filter-chips")
+            .id("filter-summary")
             .flex_1()
             .min_w_0()
             .h(px(24.))
-            .gap(px(4.))
-            .overflow_x_scroll()
-            .children(chips.iter().enumerate().flat_map(|(i, chip)| {
-                // The join sits *before* the chip it belongs to, which is where
-                // it is read, and the first chip has none: `and email = ...`
-                // with nothing to its left is a clause missing its beginning.
-                let join = (i > 0).then(|| {
-                    h_flex()
-                        .id(("filter-join", i))
-                        .flex_none()
-                        .h(px(22.))
-                        .px(px(4.))
-                        .rounded(radius)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(c.hover))
-                        .on_click(cx.listener(move |this, _, _, cx| this.flip_join(i, cx)))
-                        .child(
-                            Label::new(chip.join.keyword())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_band(cx)))
+            .child(match predicate.is_empty() || open {
+                true => div()
+                    .when(!open, |el| {
+                        el.child(
+                            Label::new("no filter")
                                 .size(LabelSize::Small)
-                                .color(IconColor::Subtle),
+                                .color(IconColor::Disabled),
                         )
-                        .into_any_element()
+                    })
+                    .into_any_element(),
+                false => div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .font(ty.mono_font())
+                    .text_size(ty.ui_size_sm)
+                    .text_color(c.text_muted)
+                    .child(format!("where {predicate}"))
+                    .into_any_element(),
+            })
+            .into_any_element()
+    }
+
+    /// The filter band: one condition per line, under the results toolbar.
+    ///
+    /// Stacked rather than strung along a row, because conditions are read
+    /// down a column and because each one has four controls in it — a row of
+    /// them scrolls sideways out of sight by the third, which is exactly when
+    /// a filter starts being worth looking at.
+    fn render_filter_band(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let c = cx.colors().clone();
+        let ty = cx.typography().clone();
+        let radius = cx.metrics().radius_sm;
+        let Some(tab) = self.pane().active() else {
+            return div().into_any_element();
+        };
+        let chips = tab.filter.chips.clone();
+        let composer = self.pane().composer.clone();
+        let columns = self.filter_columns(cx);
+        let predicate = tab.filter.predicate(&columns);
+        // The composed row is not in the stack until it is committed, so a new
+        // one draws under the last of them and an edit draws in place.
+        let appending = composer.as_ref().is_some_and(|c| c.editing.is_none());
+        let committed = chips.len();
+        let rows = committed + usize::from(appending);
+        // The tick reports the state it is moving *to* rather than the click,
+        // so it takes a plain handler and reaches the workspace itself.
+        let workspace = cx.entity();
+
+        // Fixed widths, so that three rows naming columns of different lengths
+        // still line their operators up under one another.
+        let popup =
+            |id: ElementId, text: SharedString, width: Pixels| Popup::new(id, text).w(width).h(ROW);
+
+        v_flex()
+            .id("filter-band")
+            .flex_none()
+            .w_full()
+            .px(px(10.))
+            .py(px(8.))
+            .gap(px(6.))
+            .bg(c.surface)
+            .border_b_1()
+            .border_color(c.seam)
+            .children((0..rows).map(|i| {
+                let editing = composer.as_ref().filter(|composer| {
+                    composer.editing == Some(i) || (composer.editing.is_none() && i == committed)
                 });
-                let body = pill(("filter-chip", i).into())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c.hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_chip(Some(i), cx)))
-                    .child(Label::new(chip.column.clone()).size(LabelSize::Small))
+                let chip = match (&editing, chips.get(i)) {
+                    (Some(composer), _) => composer.chip.clone(),
+                    (None, Some(chip)) => chip.clone(),
+                    (None, None) => return div().into_any_element(),
+                };
+                let live = editing.is_some();
+                let raw = chip.subject == crate::filter::Subject::Raw;
+                let value = chip.value.clone();
+                h_flex()
+                    .id(("filter-row", i))
+                    .w_full()
+                    .h(ROW)
+                    .gap(px(4.))
                     .child(
-                        Label::new(chip.op.symbol())
-                            .size(LabelSize::Small)
-                            .color(IconColor::Subtle),
+                        ui::Checkbox::new(("filter-on", i), chip.enabled)
+                            // A row still being written is not in force yet,
+                            // so there is nothing for the tick to take out.
+                            .disabled(live)
+                            .on_toggle({
+                                let workspace = workspace.clone();
+                                move |_, _, cx| {
+                                    workspace.update(cx, |this, cx| this.toggle_chip(i, cx))
+                                }
+                            }),
                     )
-                    // The value in mono and in the string colour: it is data,
-                    // and the column name beside it is not. Without the split
-                    // `plan = free` reads as two column names.
-                    .when(chip.op.takes_value(), |el| {
-                        el.child(
-                            Label::new(chip.value.clone())
-                                .mono()
-                                .size(LabelSize::Small)
-                                .color(IconColor::Custom(value_color)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("filter-chip-x", i))
+                    // The join belongs to the row it is written on and joins it
+                    // to everything above.
+                    .child(match i > 0 {
+                        true => Button::new(("filter-join", i), chip.join.keyword())
+                            .variant(ButtonVariant::Filled)
+                            .size(ButtonSize::Small)
+                            .w(px(48.))
+                            .h(ROW)
+                            .on_click(cx.listener(move |this, _, _, cx| match live {
+                                true => this.flip_composer_join(cx),
+                                false => this.flip_join(i, cx),
+                            }))
+                            .into_any_element(),
+                        // Not a control: there is nothing above the first row
+                        // for it to join to. The word is there so the stack
+                        // reads as a sentence, in the slot the joins below it
+                        // use so that the columns stay in one line.
+                        false => h_flex()
                             .flex_none()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_chip(i, cx)
-                            }))
+                            .w(px(48.))
+                            // Centred, because the joins below it are buttons
+                            // with centred labels: the words have to sit over
+                            // one another or the stack reads as two columns.
+                            .justify_center()
                             .child(
-                                Icon::new(IconName::Xmark)
-                                    .size(IconSize::XSmall)
-                                    .color(IconColor::Disabled)
-                                    .flat(),
-                            ),
-                    )
-                    .into_any_element();
-                join.into_iter().chain(std::iter::once(body))
-            }))
-            // The composer wears the same pill, with its column and operator as
-            // menus and its value as a live field. Committing is Enter, leaving
-            // it is Escape; both are wired on the input.
-            .children(composer.map(|composer| {
-                let (column, op) = (composer.chip.column.clone(), composer.chip.op);
-                pill("filter-composer".into())
-                    // The chip being composed is not yet in the row, so nothing
-                    // renders the join in front of it and the row would read
-                    // `plan = enterprise  id = 7` with no word between them.
-                    .when(!chips.is_empty(), |el| {
-                        el.child(
-                            Label::new(composer.chip.join.keyword())
-                                .size(LabelSize::Small)
-                                .color(IconColor::Subtle),
-                        )
-                    })
-                    .border_color(c.border_focus)
-                    .child(
-                        div()
-                            .id("filter-composer-column")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
-                                let at = e.position();
-                                this.open_filter_menu(crate::workspace::FilterMenu::Column, at, cx)
-                            }))
-                            .child(Label::new(column).size(LabelSize::Small)),
-                    )
-                    .child(
-                        div()
-                            .id("filter-composer-op")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
-                                let at = e.position();
-                                this.open_filter_menu(crate::workspace::FilterMenu::Op, at, cx)
-                            }))
-                            .child(
-                                Label::new(op.symbol())
+                                Label::new("where")
                                     .size(LabelSize::Small)
-                                    .color(IconColor::Accent),
-                            ),
+                                    .color(IconColor::Subtle),
+                            )
+                            .into_any_element(),
+                    })
+                    .child(
+                        popup(
+                            ("filter-subject", i).into(),
+                            chip.subject_label().to_string().into(),
+                            px(168.),
+                        )
+                        .on_open(cx.listener(
+                            move |this, from: &gpui::Bounds<Pixels>, _, cx| {
+                                let from = *from;
+                                this.open_chip(Some(i).filter(|_| i < committed), cx);
+                                this.open_filter_menu(
+                                    crate::workspace::FilterMenu::Column,
+                                    from,
+                                    cx,
+                                )
+                            },
+                        )),
                     )
-                    .when(op.takes_value(), |el| {
+                    // A raw row has no operator and no value box: the whole
+                    // condition is the one field, and an `=` beside it would be
+                    // a control that does nothing.
+                    .when(!raw, |el| {
                         el.child(
-                            div()
-                                .w(px(140.))
-                                .font(ty.mono_font())
-                                .child(self.pane().chip_value.clone()),
+                            popup(("filter-op", i).into(), chip.op.symbol().into(), px(116.))
+                                .on_open(cx.listener(
+                                    move |this, from: &gpui::Bounds<Pixels>, _, cx| {
+                                        let from = *from;
+                                        this.open_chip(Some(i).filter(|_| i < committed), cx);
+                                        this.open_filter_menu(
+                                            crate::workspace::FilterMenu::Op,
+                                            from,
+                                            cx,
+                                        )
+                                    },
+                                )),
                         )
                     })
+                    .child(match (live, chip.op.takes_value() || raw) {
+                        // The one live field on the band. Enter commits and
+                        // re-asks the server, Escape abandons the row; both are
+                        // wired on the input itself.
+                        (true, true) => h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h(ROW)
+                            .px(px(8.))
+                            .rounded(radius)
+                            .bg(c.field)
+                            .border_1()
+                            .border_color(c.border_focus)
+                            .font(ty.mono_font())
+                            .child(div().flex_1().min_w_0().child(match raw {
+                                true => self.pane().filter.clone(),
+                                false => self.pane().chip_value.clone(),
+                            }))
+                            .into_any_element(),
+                        // The same box, unfocused. The same box on purpose: a
+                        // committed value that is drawn as a label rather than
+                        // as a field makes the row change shape under the
+                        // pointer, which is what a form does when nobody has
+                        // decided what its controls are.
+                        (false, true) => h_flex()
+                            .id(("filter-value", i))
+                            .flex_1()
+                            .min_w_0()
+                            .h(ROW)
+                            .px(px(8.))
+                            .overflow_hidden()
+                            .rounded(radius)
+                            .bg(c.field)
+                            .border_1()
+                            .border_color(c.border_strong)
+                            .hover(|s| s.border_color(c.border_focus))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.open_chip(Some(i), cx)),
+                            )
+                            .child(
+                                // In mono: it is data, and the column name to
+                                // its left is not. Without the split
+                                // `plan = free` reads as two column names.
+                                Label::new(value)
+                                    .mono()
+                                    .size(LabelSize::Small)
+                                    .color(IconColor::Default),
+                            )
+                            .into_any_element(),
+                        // `is null` takes no value, and an empty box beside it
+                        // is an invitation to type into something that will
+                        // ignore what you type.
+                        (_, false) => div().flex_1().min_w_0().into_any_element(),
+                    })
+                    .child(
+                        Button::icon(("filter-remove", i), IconName::Minus)
+                            .variant(ButtonVariant::Filled)
+                            .size(ButtonSize::XSmall)
+                            .on_click(cx.listener(move |this, _, _, cx| match i < committed {
+                                true => this.remove_chip(i, cx),
+                                false => this.close_chip(cx),
+                            })),
+                    )
+                    .child(
+                        Button::icon(("filter-add", i), IconName::Plus)
+                            .variant(ButtonVariant::Filled)
+                            .size(ButtonSize::XSmall)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.add_chip_after(i, cx)),
+                            ),
+                    )
+                    .into_any_element()
+            }))
+            // An empty band is a band with no `+` on it, because the `+` lives
+            // on a row. This is the way back in.
+            .children((rows == 0).then(|| {
+                h_flex().w_full().h(ROW).child(
+                    Button::new("filter-add-first", "Add condition")
+                        .size(ButtonSize::XSmall)
+                        .start_icon(IconName::Plus)
+                        .on_click(cx.listener(|this, _, _, cx| this.open_chip(None, cx))),
+                )
             }))
             .child(
-                // Add. Reads as part of the row rather than as a toolbar
-                // button, because what it adds lands right here.
                 h_flex()
-                    .id("filter-add")
-                    .flex_none()
-                    .size(px(22.))
-                    .justify_center()
-                    .rounded(radius)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c.hover))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_chip(None, cx)))
+                    .w_full()
+                    .h(ROW)
+                    .gap(px(6.))
                     .child(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::XSmall)
-                            .color(IconColor::Subtle)
-                            .flat(),
+                        // The clause the band is producing, spelled out. The
+                        // band shows conditions; this shows what they become,
+                        // brackets and all, which is the only place the reading
+                        // of a mixed `and`/`or` stack is visible.
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font(ty.mono_font())
+                            .text_size(ty.ui_size_sm)
+                            .text_color(c.text_subtle)
+                            .child(match predicate.is_empty() {
+                                true => String::new(),
+                                false => format!("where {predicate}"),
+                            }),
+                    )
+                    .child(
+                        Button::new("filter-clear", "Clear")
+                            .size(ButtonSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_filter(cx))),
+                    )
+                    .child(
+                        // Enter in the value box does the same thing. The
+                        // button is here for the row finished with a menu —
+                        // `is null`, or an operator changed on a committed row
+                        // — where there is nothing to press Enter in.
+                        Button::new("filter-apply", "Apply")
+                            .size(ButtonSize::XSmall)
+                            .variant(ButtonVariant::Filled)
+                            .on_click(cx.listener(|this, _, _, cx| match this.pane().composer {
+                                Some(_) => this.commit_chip(cx),
+                                None => this.apply_filter(cx),
+                            })),
                     ),
             )
-            .when(!anything, |el| {
-                // Not a disabled control and not an empty box: the row says
-                // what pressing the `+` beside it would do.
-                el.child(
-                    Label::new("no filter")
-                        .size(LabelSize::Small)
-                        .color(IconColor::Disabled),
-                )
-            })
-            .child(div().flex_1().min_w_0())
-            .when(anything, |el| {
-                el.child(
-                    h_flex()
-                        .id("filter-clear")
-                        .flex_none()
-                        .size(px(22.))
-                        .justify_center()
-                        .rounded(radius)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(c.hover))
-                        .on_click(cx.listener(|this, _, _, cx| this.clear_filter(cx)))
-                        .child(
-                            Icon::new(IconName::Xmark)
-                                .size(IconSize::XSmall)
-                                .color(IconColor::Subtle)
-                                .flat(),
-                        ),
-                )
-            })
             .into_any_element()
     }
 
@@ -1288,10 +1408,12 @@ impl Workspace {
                 .not_editable(cx)
                 .map(|message| (NoticeTone::Warning, message)),
         };
+        let filter_columns = self.filter_columns(cx);
         let filtering = self
             .pane()
             .active()
-            .is_some_and(|tab| tab.filter.is_active());
+            .is_some_and(|tab| tab.filter.is_active(&filter_columns));
+        let band = self.pane().filter_open;
         let keyed = self
             .pane()
             .active()
@@ -1320,7 +1442,9 @@ impl Workspace {
                                 .size(ButtonSize::XSmall)
                                 .tooltip(Tooltip::text("Filter Rows"))
                                 .selected(filtering)
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_filter_band(cx)),
+                                ),
                         )
                     })
                     // A key's facts stand where a table's filter does: it is
@@ -1390,6 +1514,7 @@ impl Workspace {
                     .pb(px(6.))
                     .child(Notice::new(tone, message))
             }))
+            .children((band && !keyed).then(|| self.render_filter_band(cx)))
             .children(finding.then(|| self.render_find_bar(id, cx)))
             .child(self.render_grid(cx))
             // Postgres' DETAIL and HINT are unusually good, so they are shown
@@ -1449,7 +1574,7 @@ impl Workspace {
             .gap(px(6.))
             .bg(c.surface)
             .border_b_1()
-            .border_color(c.border)
+            .border_color(c.seam)
             .child(div().flex_1().min_w_0().child(input))
             .children(status.map(|status| {
                 Label::new(status)

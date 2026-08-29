@@ -8,8 +8,8 @@
 //! the palette teaches you not to need it.
 //!
 //! The prefix chooses what is being searched, exactly as in §5.8 of the plan:
-//! nothing for commands and objects together, `>` for commands, `@` for schema
-//! objects, `#` for themes, `:` for a line number, `?` for the list of prefixes.
+//! nothing for commands and places together, `>` for commands, `@` for
+//! everywhere in the window that can be gone to, `#` for themes, `:` for a line number, `?` for the list of prefixes.
 //! The palette owns the last three itself — a theme and a line number are facts
 //! about the window, not about the database — and is handed the first three by
 //! the workspace, which is the only thing that knows what is connected.
@@ -68,7 +68,7 @@ impl PaletteMode {
         match self {
             Self::Mixed => None,
             Self::Commands => Some("Command"),
-            Self::Objects => Some("Object"),
+            Self::Objects => Some("Go To"),
             Self::Themes => Some("Theme"),
             Self::Line => Some("Line"),
             Self::Help => Some("Help"),
@@ -77,9 +77,9 @@ impl PaletteMode {
 
     fn placeholder(self) -> &'static str {
         match self {
-            Self::Mixed => "Search commands and objects…",
+            Self::Mixed => "Search commands, tabs and tables…",
             Self::Commands => "Run a command…",
-            Self::Objects => "Open a table, view or function…",
+            Self::Objects => "Go to a tab, table or saved query…",
             Self::Themes => "Select a theme…",
             Self::Line => "Go to line…",
             Self::Help => "Prefixes",
@@ -108,8 +108,22 @@ pub struct ThemeChoice {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaletteAction {
     Command(Command),
-    /// Browse a table, view or materialized view.
-    Open(db::RelationRef),
+    /// Browse a table, view or materialized view, on the connection and
+    /// database it was found under — which need not be the one in front. The
+    /// origin is `None` only for a relation that came from nowhere in
+    /// particular, and then it opens where you are.
+    Open(db::RelationRef, Option<crate::tree::Origin>),
+    /// Show a tab that is already open, in whichever pane holds it.
+    GoToTab {
+        pane: crate::pane::PaneId,
+        tab: usize,
+    },
+    /// Go to a saved connection — bringing it up first if it is not connected.
+    /// A server you have not opened yet is still somewhere this window can go,
+    /// and having to find it in the tree first is the thing a palette is for.
+    OpenConnection(uuid::Uuid),
+    /// Go to one database on a connection.
+    OpenDatabase(crate::tree::Origin, SharedString),
     /// Load a saved query into the editor.
     LoadQuery(uuid::Uuid),
     Theme(ThemeChoice),
@@ -140,6 +154,8 @@ pub enum Command {
     NewTab,
     NewTable,
     CloseTab,
+    NextTab,
+    PreviousTab,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -180,6 +196,8 @@ impl Command {
         Command::NewTab,
         Command::NewTable,
         Command::CloseTab,
+        Command::NextTab,
+        Command::PreviousTab,
         Command::SplitRight,
         Command::SplitDown,
         Command::ClosePane,
@@ -217,6 +235,8 @@ impl Command {
             Self::NewTab => "New Query Tab",
             Self::NewTable => "New Table…",
             Self::CloseTab => "Close Tab",
+            Self::NextTab => "Next Tab",
+            Self::PreviousTab => "Previous Tab",
             Self::SplitRight => "Split Editor Right",
             Self::SplitDown => "Split Editor Down",
             Self::ClosePane => "Close Split",
@@ -252,6 +272,8 @@ impl Command {
             Self::NewTab => IconName::Plus,
             Self::NewTable => IconName::Columns,
             Self::CloseTab => IconName::Xmark,
+            Self::NextTab => IconName::ChevronRight,
+            Self::PreviousTab => IconName::ChevronLeft,
             Self::SplitRight => IconName::SplitX,
             Self::SplitDown => IconName::SplitY,
             Self::ClosePane => IconName::Xmark,
@@ -285,6 +307,8 @@ impl Command {
             Self::ImportRows => Some("⇧⌘I"),
             Self::NewTab => Some("⌘T"),
             Self::CloseTab => Some("⌘W"),
+            Self::NextTab => Some("⌃⇥"),
+            Self::PreviousTab => Some("⌃⇧⇥"),
             Self::SplitRight => Some("⌘D"),
             Self::SplitDown => Some("⇧⌘D"),
             Self::NewConnection => Some("⌘N"),
@@ -305,11 +329,33 @@ impl Command {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ItemKind {
     Command,
+    /// A connection or a database: a place the whole window moves to.
+    Place,
+    /// A tab that is already open. First in the list, because "go back to what
+    /// I had" is the question this palette is asked most.
+    Tab,
     Object,
     Query,
     Theme,
     /// A row that switches the palette into another mode.
     Mode,
+}
+
+impl ItemKind {
+    /// The heading a run of rows sits under. A `Mode` row is a verb like the
+    /// commands it sits among — "Change Theme…" is one of the things you came
+    /// here to do — so it shares their heading rather than getting one of its
+    /// own for two rows.
+    fn group(self) -> &'static str {
+        match self {
+            ItemKind::Command | ItemKind::Mode => "Commands",
+            ItemKind::Tab => "Open Tabs",
+            ItemKind::Place => "Connections",
+            ItemKind::Object => "Tables and Views",
+            ItemKind::Query => "Saved Queries",
+            ItemKind::Theme => "Themes",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -393,7 +439,8 @@ struct Match {
 
 pub struct Palette {
     query: Entity<Editor>,
-    /// Commands, schema objects and saved queries, handed over at open time.
+    /// Commands, open tabs, schema objects and saved queries, handed over at
+    /// open time.
     items: Vec<PaletteItem>,
     /// The rows the current mode is searching. Rebuilt when the mode changes,
     /// not on every keystroke.
@@ -522,10 +569,20 @@ impl Palette {
                 .filter(|item| matches!(item.kind, ItemKind::Command | ItemKind::Mode))
                 .cloned()
                 .collect(),
+            // Everywhere in the window that can be gone to: the open tabs
+            // first, then every table the sidebar has scanned on every
+            // connection, then the saved queries. Not the connection in front
+            // only — a window with three servers open is one workspace, and
+            // moving around it is what this list is for.
             PaletteMode::Objects => self
                 .items
                 .iter()
-                .filter(|item| item.kind == ItemKind::Object)
+                .filter(|item| {
+                    matches!(
+                        item.kind,
+                        ItemKind::Tab | ItemKind::Object | ItemKind::Query
+                    )
+                })
                 .cloned()
                 .collect(),
             // Every installed theme, dark and light in one list, in the same
@@ -794,13 +851,35 @@ impl Render for Palette {
         let ty = cx.typography().clone();
         let empty = self.query.read(cx).text() == self.mode.prefix();
 
+        // Headings only on a list nobody has filtered. A needle sorts by score,
+        // which interleaves the kinds, and a heading over a run of one row has
+        // stopped saying "here is a section" and started saying "here is a
+        // row". They are also only worth drawing where there is more than one
+        // group to tell apart: in Themes mode the chip in the field has
+        // already said what the whole list is.
+        let groups: Vec<&'static str> = match self.needle(cx).trim().is_empty() {
+            false => Vec::new(),
+            true => self
+                .matches
+                .iter()
+                .filter_map(|matched| Some(self.candidates.get(matched.index)?.kind.group()))
+                .collect(),
+        };
+        let headed = groups.iter().any(|group| *group != groups[0]);
+
+        let mut previous: Option<&'static str> = None;
         let rows: Vec<_> = self
             .matches
             .iter()
             .enumerate()
             .filter_map(|(row, matched)| {
                 let item = self.candidates.get(matched.index)?;
-                Some(self.render_row(row, item, &matched.ranges, cx))
+                let heading = match headed && previous != Some(item.kind.group()) {
+                    true => Some(item.kind.group()),
+                    false => None,
+                };
+                previous = Some(item.kind.group());
+                Some(self.render_row(row, item, &matched.ranges, heading, cx))
             })
             .collect();
         let nothing = rows.is_empty();
@@ -878,7 +957,7 @@ impl Render for Palette {
                                 )
                             }),
                     )
-                    .child(div().flex_none().h(px(1.)).w_full().bg(c.border))
+                    .child(div().flex_none().h(px(1.)).w_full().bg(c.seam))
                     // ---- the list -------------------------------------
                     .when(nothing, |el| {
                         el.child(
@@ -915,12 +994,12 @@ impl Render for Palette {
                                 .px(px(10.))
                                 .gap(px(10.))
                                 .border_t_1()
-                                .border_color(c.border)
+                                .border_color(c.seam)
                                 .bg(c.chrome)
                                 .children(
                                     [
                                         (">", "commands"),
-                                        ("@", "objects"),
+                                        ("@", "go to"),
                                         ("#", "themes"),
                                         (":", "line"),
                                         ("?", "help"),
@@ -954,34 +1033,28 @@ impl Palette {
         row: usize,
         item: &PaletteItem,
         ranges: &[std::ops::Range<usize>],
+        heading: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = cx.colors().clone();
         let m = cx.metrics().clone();
         let ty = cx.typography().clone();
         let selected = row == self.selected;
-        let text = if selected { c.text_on_accent } else { c.text };
-        let dim = if selected {
-            c.text_on_accent
-        } else {
-            c.text_subtle
-        };
 
         let highlight = HighlightStyle {
-            color: Some(if selected { c.text_on_accent } else { c.accent }),
+            color: Some(c.accent),
             font_weight: Some(gpui::FontWeight::SEMIBOLD),
             ..Default::default()
         };
 
-        h_flex()
+        let row_el = h_flex()
             .id(("palette-row", row))
             .h(ROW_HEIGHT)
             .flex_none()
-            .mx(px(4.))
+            .mx(px(6.))
             .px(px(6.))
             .gap(px(8.))
             .rounded(m.radius)
-            .cursor_pointer()
             // `StyledText` paints in the ambient style rather than in one of
             // its own, so the row is where the label's face is decided. Left
             // to the window default it would come out a couple of points
@@ -989,8 +1062,14 @@ impl Palette {
             .font_family(ty.ui_family.clone())
             .text_size(ty.ui_size)
             .line_height(ty.ui_line_height)
-            .text_color(text)
-            .when(selected, |el| el.bg(c.accent))
+            .text_color(c.text)
+            // The highlight is a surface, not a colour: an inset pill in the
+            // accent-tinted `selected` fill, with the label, the detail and
+            // the icon left exactly as they read on every other row. Painting
+            // the whole row in the accent and inverting the text turns a list
+            // of things you might do into an open `<select>`, and it costs the
+            // one place the accent still earns its keep — the shortcut.
+            .when(selected, |el| el.bg(c.selected))
             .when(!selected, |el| el.hover(|s| s.bg(c.hover)))
             .on_mouse_move(cx.listener(move |this, _, _, cx| this.select(row, cx)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1000,11 +1079,7 @@ impl Palette {
             .child(
                 Icon::new(item.icon)
                     .size(IconSize::Small)
-                    .color(if selected {
-                        IconColor::Custom(c.text_on_accent)
-                    } else {
-                        IconColor::Muted
-                    }),
+                    .color(IconColor::Muted),
             )
             .child(
                 div().flex_1().min_w_0().overflow_hidden().child(
@@ -1015,27 +1090,52 @@ impl Palette {
             .children(item.detail.clone().map(|detail| {
                 Label::new(detail)
                     .size(LabelSize::Small)
-                    .color(IconColor::Custom(dim))
+                    .color(IconColor::Subtle)
             }))
             .children(item.shortcut.clone().map(|keys| {
+                // The accent, on the selected row only. It is the answer to
+                // "what does Return do here", and having it move down the list
+                // with the highlight is what tells you the two are the same
+                // key.
                 Label::new(keys)
                     .size(LabelSize::Small)
-                    .color(IconColor::Custom(dim))
+                    .color(match selected {
+                        true => IconColor::Accent,
+                        false => IconColor::Subtle,
+                    })
             }))
             .when(item.current, |el| {
-                el.child(
-                    Icon::new(IconName::Check)
-                        .size(IconSize::Small)
-                        .color(IconColor::Custom(text)),
+                el.child(Icon::new(IconName::Check).size(IconSize::Small))
+            });
+
+        match heading {
+            None => row_el.into_any_element(),
+            // The heading rides with the row it heads rather than being a
+            // sibling of it, so that the list still has one child per match
+            // and `scroll_to_item(self.selected)` still lands on the right
+            // one.
+            Some(heading) => v_flex()
+                .child(
+                    div().flex_none().px(px(12.)).pt(px(10.)).pb(px(4.)).child(
+                        Label::new(heading)
+                            .size(LabelSize::Small)
+                            .color(IconColor::Subtle),
+                    ),
                 )
-            })
-            .into_any_element()
+                .child(row_el)
+                .into_any_element(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mode_row_is_headed_as_a_command() {
+        assert_eq!(ItemKind::Mode.group(), ItemKind::Command.group());
+    }
 
     #[test]
     fn a_prefix_chooses_the_mode() {
@@ -1110,7 +1210,7 @@ mod tests {
         }
         assert_eq!(
             Command::ALL.len(),
-            33,
+            35,
             "add the new command to ALL, not just to the enum"
         );
     }

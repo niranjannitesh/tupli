@@ -387,6 +387,7 @@ impl Tab {
             _ => None,
         };
         CenterTab {
+            cached: None,
             key: None,
             // An unknown word is a tab kind from a build this one is older
             // than. It becomes a query tab, which is the kind that needs
@@ -412,7 +413,10 @@ impl Tab {
             relation,
             saved_query: self.saved_query,
             sql: self.sql.clone(),
-            filter: self.filter.clone().unwrap_or_default(),
+            // Through `migrated`, because a file written by an older build
+            // says "the whole filter is this one clause" and this build has no
+            // such thing — only rows, one of which may hold a clause.
+            filter: self.filter.clone().unwrap_or_default().migrated(),
             page: None,
             structure: None,
             // Bound when the tab is first shown: a window that comes back
@@ -451,6 +455,7 @@ mod tests {
 
     fn query(title: &str, sql: &str) -> CenterTab {
         CenterTab {
+            cached: None,
             kind: CenterKind::Query,
             title: title.into(),
             detail: None,
@@ -482,6 +487,7 @@ mod tests {
     #[test]
     fn a_browsed_table_comes_back_pointing_at_the_same_relation() {
         let tabs = vec![CenterTab {
+            cached: None,
             kind: CenterKind::Table,
             title: "users".into(),
             detail: Some("public".into()),

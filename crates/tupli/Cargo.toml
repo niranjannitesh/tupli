@@ -45,6 +45,12 @@ serde_json.workspace = true
 libc = "0.2"
 nucleo-matcher.workspace = true
 
+# Only to reach past gpui for the one thing it gets wrong on macOS 26; see
+# `src/vibrancy.rs`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+raw-window-handle = "0.6"
+
 [dev-dependencies]
 image.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

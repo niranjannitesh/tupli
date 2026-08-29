@@ -48,10 +48,11 @@ impl Workspace {
 
         region(cx)
             .border_l_1()
-            .border_color(cx.colors().border)
+            .border_color(cx.colors().seam)
             .size_full()
             .child(
                 TabBar::new("inspector-tabs")
+                    .fronts_panel()
                     .tab(
                         Tab::new("inspector-row", "Row")
                             .icon(IconName::BulletList)
@@ -225,9 +226,11 @@ impl Workspace {
                     // tab now, because a cell was never the thing being looked
                     // at — a field of the row was.
                     .id(("row-field", ix))
+                    // No fill under the pointer. Every row here is one column
+                    // of the one row already selected, so lighting one says
+                    // nothing about what is about to happen — the buttons the
+                    // group reveals are the whole of what hover is for.
                     .group("row-field")
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c.hover))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.expanded_field = match this.expanded_field == Some(ix) {
                             true => None,
@@ -239,7 +242,7 @@ impl Workspace {
                     .py(px(5.))
                     .gap(px(2.))
                     .border_b_1()
-                    .border_color(c.border)
+                    .border_color(c.seam)
                     .child(
                         h_flex()
                             .gap(px(5.))
@@ -256,7 +259,6 @@ impl Workspace {
                                     .mono()
                                     .size(LabelSize::Small)
                                     .color(IconColor::Muted)
-                                    .flex_1()
                                     .min_w_0(),
                             )
                             // What the bytes turned out to be, where the
@@ -295,6 +297,11 @@ impl Workspace {
                                     .color(IconColor::Disabled)
                                     .into_any_element(),
                             })
+                            // The slack goes here, not into the name. A type
+                            // belongs to the column beside it; pushed to the
+                            // far edge of the panel by a name that took all the
+                            // room, it reads as a third thing on the row.
+                            .child(div().flex_1().min_w_0())
                             // The way back up, at the top. An expanded 10KB
                             // document puts its own end a screen and a half
                             // below the fold, and a collapse control down there
@@ -569,7 +576,7 @@ impl Workspace {
                             .px(px(10.))
                             .py(px(4.))
                             .border_t_1()
-                            .border_color(c.border)
+                            .border_color(c.seam)
                             .font(ty.mono_font())
                             .child(
                                 Label::new(sql.trim().to_string())
@@ -595,7 +602,7 @@ fn fact(label: &'static str, value: String, cx: &mut Context<Workspace>) -> impl
         .gap(px(8.))
         .items_start()
         .border_t_1()
-        .border_color(cx.colors().border)
+        .border_color(cx.colors().seam)
         .child(
             Label::new(label)
                 .size(LabelSize::Small)

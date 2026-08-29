@@ -432,6 +432,17 @@ impl SettingsWindow {
                             ))),
                     ),
             )
+            .child(section("The window"))
+            .child(
+                FormRow::new("Translucency")
+                    .hint("Let the desktop show through the titlebar, the sidebar and the status bar. The grid and the editor stay opaque \u{2014} data over a moving backdrop is data you have to squint at.")
+                    .child(
+                        Switch::new("vibrancy", settings.vibrancy()).on_toggle({
+                            let workspace = workspace.clone();
+                            move |on, _, cx| change(&workspace, cx, move |s| s.set_vibrancy(on))
+                        }),
+                    ),
+            )
             .child(section("Rows"))
             .child(
                 FormRow::new("Row height")

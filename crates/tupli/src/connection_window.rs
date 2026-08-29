@@ -744,7 +744,6 @@ impl Render for ConnectionForm {
                                     .id(("swatch", index))
                                     .size(px(18.))
                                     .rounded_full()
-                                    .cursor_pointer()
                                     .border_2()
                                     .border_color(if selected {
                                         c.text

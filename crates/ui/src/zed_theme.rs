@@ -132,6 +132,24 @@ fn separate(line: Hsla, plane: Hsla, least: f32) -> Hsla {
     }
 }
 
+/// Pull `line` back towards `plane` when their lightness differs by more than
+/// `most`, leaving its hue and saturation alone.
+///
+/// The mirror of [`separate`], and needed for the same reason: an editor puts
+/// its hairlines between a gutter and a tab bar, where a strong line is a
+/// deliberate edge. This window puts them between two grids and a sidebar, where
+/// a strong line is a scaffold drawn over the data.
+fn contain(line: Hsla, plane: Hsla, most: f32) -> Hsla {
+    let delta = line.l - plane.l;
+    if delta.abs() <= most || line.a < 0.99 {
+        return line;
+    }
+    Hsla {
+        l: (plane.l + delta.signum() * most).clamp(0., 1.),
+        ..line
+    }
+}
+
 impl ThemeVariant {
     pub fn appearance(&self) -> Appearance {
         match self.appearance.eq_ignore_ascii_case("light") {
@@ -225,13 +243,22 @@ impl ThemeVariant {
         // titlebar joins the tab strip on one plane, the way it does in the
         // built-in themes, and `title_bar.background` is only the fallback for
         // a file that has no tab bar at all.
-        take(&mut c.background, &["tab_bar.background", "title_bar.background"]);
-        take(&mut c.chrome, &["tab_bar.background", "title_bar.background"]);
+        take(
+            &mut c.background,
+            &["tab_bar.background", "title_bar.background"],
+        );
+        take(
+            &mut c.chrome,
+            &["tab_bar.background", "title_bar.background"],
+        );
         take(&mut c.panel, &["editor.background", "panel.background"]);
         take(&mut c.surface, &["editor.background"]);
         take(&mut c.overlay, &["elevated_surface.background"]);
         take(&mut c.field, &["element.background"]);
-        take(&mut c.tab_active, &["tab.active_background", "editor.background"]);
+        take(
+            &mut c.tab_active,
+            &["tab.active_background", "editor.background"],
+        );
 
         // ---- lines --------------------------------------------------------
         // `border.variant` is the hairline between panes; plain `border` is the
@@ -246,8 +273,32 @@ impl ThemeVariant {
         // side of one, and the line is the only thing saying they are two
         // regions. So the hairline gets a floor, and a theme that already draws
         // it stronger than the floor keeps exactly what it drew.
+        // …and a ceiling, which is the complaint the floor cannot answer. Fleet
+        // hands both weights one colour a sixth of the way up from its plane;
+        // Gruvbox Dark Hard puts its heavy line a fifth of the way up. In an
+        // editor that is one rule around one pane. Here it is the outline of
+        // every field, button, split and dock at once, and the window stops
+        // being a surface with things on it and becomes a wireframe of itself.
+        // The band is the built-in dark theme's own: One Dark already sits
+        // inside it, which is why One Dark already looks right.
+        if dark {
+            c.border = contain(c.border, c.panel, 0.09);
+            c.border_strong = contain(c.border_strong, c.panel, 0.14);
+        }
         c.border = separate(c.border, c.panel, 0.06);
         c.border_strong = separate(c.border_strong, c.panel, 0.12);
+        // A Zed palette has one hairline where this window wants two. The seam
+        // is that line drawn most of the way back towards the plane it sits on:
+        // enough to confirm an edge the plane step already made, not enough to
+        // be the edge itself.
+        c.seam = separate(
+            Hsla {
+                l: c.panel.l + (c.border.l - c.panel.l) * 0.35,
+                ..c.border
+            },
+            c.panel,
+            0.015,
+        );
         take(&mut c.scrollbar_thumb, &["scrollbar.thumb.background"]);
         take(
             &mut c.scrollbar_thumb_hover,
@@ -277,13 +328,25 @@ impl ThemeVariant {
         take(&mut c.warning, &["warning", "modified"]);
         take(&mut c.danger, &["error", "deleted"]);
         take(&mut c.info, &["info"]);
-        take(&mut c.success_bg, &["success.background", "created.background"]);
-        take(&mut c.warning_bg, &["warning.background", "modified.background"]);
-        take(&mut c.danger_bg, &["error.background", "deleted.background"]);
+        take(
+            &mut c.success_bg,
+            &["success.background", "created.background"],
+        );
+        take(
+            &mut c.warning_bg,
+            &["warning.background", "modified.background"],
+        );
+        take(
+            &mut c.danger_bg,
+            &["error.background", "deleted.background"],
+        );
         take(&mut c.info_bg, &["info.background"]);
 
         // ---- editor -------------------------------------------------------
-        take(&mut c.editor_active_line, &["editor.active_line.background"]);
+        take(
+            &mut c.editor_active_line,
+            &["editor.active_line.background"],
+        );
         take(
             &mut c.editor_active_statement,
             &["editor.highlighted_line.background"],
@@ -299,9 +362,18 @@ impl ThemeVariant {
         // A cell with an uncommitted edit is a modified line; a row queued for
         // deletion is a deleted one. Zed's diff colours are already tuned to
         // sit under text without eating it, which is the whole requirement.
-        take(&mut c.grid_dirty, &["modified.background", "conflict.background"]);
-        take(&mut c.grid_deleted, &["deleted.background", "error.background"]);
-        take(&mut c.grid_inserted, &["created.background", "success.background"]);
+        take(
+            &mut c.grid_dirty,
+            &["modified.background", "conflict.background"],
+        );
+        take(
+            &mut c.grid_deleted,
+            &["deleted.background", "error.background"],
+        );
+        take(
+            &mut c.grid_inserted,
+            &["created.background", "success.background"],
+        );
         // No editor has a zebra stripe, so this is the one plane that has to be
         // invented. One step off the page in whichever direction the page is
         // not — small enough that it reads as ruling rather than as banding.
@@ -331,7 +403,10 @@ impl ThemeVariant {
         take_syntax(&mut s.number, &["number", "constant"]);
         take_syntax(&mut s.comment, &["comment"]);
         take_syntax(&mut s.operator, &["operator"]);
-        take_syntax(&mut s.punctuation, &["punctuation", "punctuation.delimiter"]);
+        take_syntax(
+            &mut s.punctuation,
+            &["punctuation", "punctuation.delimiter"],
+        );
         take_syntax(&mut s.variable, &["property", "variable.parameter"]);
         if let Some(v) = self.color(&["error", "deleted"]) {
             s.invalid = v;
@@ -404,13 +479,17 @@ mod tests {
         let theme = f.themes[0].to_theme();
         assert_eq!(theme.colors.surface, parse_hex("#101010").unwrap());
         assert_eq!(theme.colors.text, Theme::dark().colors.text);
-        assert_eq!(theme.colors.border, Theme::dark().colors.border);
         assert_eq!(theme.syntax.keyword, Theme::dark().syntax.keyword);
+        // The built-in's line, but measured against the file's plane rather
+        // than the one it was picked for: a hairline is a distance from a
+        // background, and this file moved the background.
+        assert!(theme.colors.border.l - theme.colors.panel.l <= 0.091);
     }
 
     #[test]
     fn unknown_keys_and_null_values_are_not_errors() {
-        let f = family(r##"{"pane.focused_border":null,"whatever.new":"#ffffff","text":"#eeeeee"}"##);
+        let f =
+            family(r##"{"pane.focused_border":null,"whatever.new":"#ffffff","text":"#eeeeee"}"##);
         let theme = f.themes[0].to_theme();
         assert_eq!(theme.colors.text, parse_hex("#eeeeee").unwrap());
     }
@@ -442,6 +521,39 @@ mod tests {
     }
 
     #[test]
+    fn a_line_too_bright_to_ignore_is_pulled_back_onto_its_plane() {
+        // Fleet Dark: one colour for both weights, a sixth of the way up from
+        // the plane. Every field and split in the window outlined in it reads
+        // as a wireframe drawn over the data.
+        let f = family(
+            r##"{"panel.background":"#18191bff","editor.background":"#18191bff","border":"#3e4147ff"}"##,
+        );
+        let c = f.themes[0].to_theme().colors;
+        assert!(c.border.l - c.panel.l <= 0.091, "{:?}", c.border);
+        assert!(
+            c.border_strong.l - c.panel.l <= 0.141,
+            "{:?}",
+            c.border_strong
+        );
+        // The two weights part company, which the file did not let them do.
+        assert!(c.border_strong.l > c.border.l);
+        // and the theme's hue survives being turned down
+        assert_eq!(c.border.h, parse_hex("#3e4147").unwrap().h);
+    }
+
+    #[test]
+    fn a_line_already_quiet_enough_is_left_alone() {
+        // One Dark sits inside the band the built-in dark theme occupies, and
+        // is the reason the band is where it is.
+        let f = family(
+            r##"{"editor.background":"#282c33ff","border.variant":"#363c46ff","border":"#464b57ff"}"##,
+        );
+        let c = f.themes[0].to_theme().colors;
+        assert_eq!(c.border, parse_hex("#363c46").unwrap());
+        assert_eq!(c.border_strong, parse_hex("#464b57").unwrap());
+    }
+
+    #[test]
     fn a_seam_too_faint_to_see_is_pushed_off_its_plane() {
         // One Dark draws its pane divider three points off the panel, which is
         // fine either side of a gutter and not fine between two grids.
@@ -456,10 +568,21 @@ mod tests {
     }
 
     #[test]
-    fn a_seam_the_theme_already_draws_clearly_is_left_alone() {
+    fn the_quiet_seam_lands_between_the_plane_and_the_hairline() {
         let f = family(r##"{"panel.background":"#101010ff","border.variant":"#606060ff"}"##);
         let c = f.themes[0].to_theme().colors;
-        assert_eq!(c.border, parse_hex("#606060").unwrap());
+        assert!(
+            c.seam.l > c.panel.l && c.seam.l < c.border.l,
+            "{:?}",
+            c.seam
+        );
+    }
+
+    #[test]
+    fn a_seam_the_theme_already_draws_clearly_is_left_alone() {
+        let f = family(r##"{"editor.background":"#101010ff","border.variant":"#242424ff"}"##);
+        let c = f.themes[0].to_theme().colors;
+        assert_eq!(c.border, parse_hex("#242424").unwrap());
     }
 
     #[test]

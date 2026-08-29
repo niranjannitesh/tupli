@@ -25,16 +25,26 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tab = self.sidebar_tab;
+        // The only region that takes the blur. The inspector is the same plane
+        // but holds a row's values, and a value read against whatever happens
+        // to be behind the window is a value read twice.
+        let vibrant = self.settings.vibrancy();
 
         region(cx)
             .size_full()
+            // No plane of its own when the window is see-through: the tab strip
+            // and the body below each paint one, and a tint laid over a tint
+            // saturates to opaque. Every pixel of a translucent region gets
+            // exactly one.
+            .when(vibrant, |el| el.bg(gpui::transparent_black()))
             // The seam to the centre stack. Drawn here rather than by the
             // splitter that sits on it, because the splitter is a grab strip
             // that only shows itself while it is being used.
             .border_r_1()
-            .border_color(cx.colors().border)
+            .border_color(cx.colors().seam)
             .child(
                 TabBar::new("sidebar-tabs")
+                    .fronts_panel()
                     .tab(
                         Tab::new("sidebar-db", "Database")
                             .fill()
@@ -69,43 +79,53 @@ impl Workspace {
                     ),
             )
             .child(
-                Toolbar::new("sidebar-toolbar")
-                    .transparent()
-                    .borderless()
-                    // The centre slot, not the leading one: this field is the
-                    // thing that should take the width the buttons do not.
-                    .center_child(div().flex_1().min_w_0().child(self.tree_filter.clone()))
-                    .end_child(
-                        Button::icon("sidebar-add", IconName::Plus)
-                            .size(ButtonSize::XSmall)
-                            .tooltip(Tooltip::key("New Connection", "⌘N"))
-                            .on_click(cx.listener(|this, _, _, cx| this.new_connection(cx))),
-                    )
-                    .end_child(
-                        Button::icon("sidebar-refresh", IconName::Refresh)
-                            .size(ButtonSize::XSmall)
-                            .tooltip(Tooltip::key("Refresh Schema", "⇧⌘R"))
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh_schema(cx))),
-                    ),
-            )
-            // The scope switch sits above the scroll rather than in it: it is
-            // what decides the list, and a control that scrolls away with the
-            // list it governs is one nobody finds twice.
-            .when(tab == SidebarTab::History, |panel| {
-                panel.child(self.render_history_scope(cx))
-            })
-            .child(
                 v_flex()
-                    .id("sidebar-body")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .py(px(4.))
-                    .children(match tab {
-                        SidebarTab::Database => self.render_database_tab(cx),
-                        SidebarTab::Queries => self.render_query_list(cx),
-                        SidebarTab::History => self.render_history(cx),
-                    }),
+                    .when(vibrant, |el| el.bg(cx.colors().panel_vibrant()))
+                    .child(
+                        Toolbar::new("sidebar-toolbar")
+                            .transparent()
+                            .borderless()
+                            // The centre slot, not the leading one: this field is the
+                            // thing that should take the width the buttons do not.
+                            .center_child(div().flex_1().min_w_0().child(self.tree_filter.clone()))
+                            .end_child(
+                                Button::icon("sidebar-add", IconName::Plus)
+                                    .size(ButtonSize::XSmall)
+                                    .tooltip(Tooltip::key("New Connection", "⌘N"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.new_connection(cx)),
+                                    ),
+                            )
+                            .end_child(
+                                Button::icon("sidebar-refresh", IconName::Refresh)
+                                    .size(ButtonSize::XSmall)
+                                    .tooltip(Tooltip::key("Refresh Schema", "⇧⌘R"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.refresh_schema(cx)),
+                                    ),
+                            ),
+                    )
+                    // The scope switch sits above the scroll rather than in it:
+                    // it is what decides the list, and a control that scrolls
+                    // away with the list it governs is one nobody finds twice.
+                    .when(tab == SidebarTab::History, |panel| {
+                        panel.child(self.render_history_scope(cx))
+                    })
+                    .child(
+                        v_flex()
+                            .id("sidebar-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .py(px(4.))
+                            .children(match tab {
+                                SidebarTab::Database => self.render_database_tab(cx),
+                                SidebarTab::Queries => self.render_query_list(cx),
+                                SidebarTab::History => self.render_history(cx),
+                            }),
+                    ),
             )
     }
 
@@ -619,7 +639,7 @@ impl Workspace {
             .px(px(8.))
             .py(px(6.))
             .border_b_1()
-            .border_color(cx.colors().border)
+            .border_color(cx.colors().seam)
             .child(
                 Segmented::new("history-scope", ["Everything", "This window"])
                     .no_wrap()

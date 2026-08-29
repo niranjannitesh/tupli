@@ -14,6 +14,7 @@ const OUT = process.env.ICON_OUT ?? "./svg";
 
 const PACKS = [
   { pkg: "nucleo-micro-bold", out: "micro", duo: false, strip: /^Icon/ },
+  { pkg: "nucleo-ui-fill-18", out: "fill", duo: false, strip: /^Icon|Fill18$/g },
   {
     pkg: "nucleo-ui-fill-duo-18",
     out: "duo",

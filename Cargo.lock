@@ -6937,6 +6937,8 @@ dependencies = [
  "libc",
  "log",
  "nucleo-matcher",
+ "objc",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sqlgen",

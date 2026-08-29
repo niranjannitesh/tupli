@@ -20,6 +20,9 @@ const TRACK_WIDTH: gpui::Pixels = px(28.);
 const TRACK_HEIGHT: gpui::Pixels = px(16.);
 const KNOB: gpui::Pixels = px(12.);
 
+/// Side of the checkbox itself. AppKit draws a small checkbox 14pt across.
+const BOX: gpui::Pixels = px(14.);
+
 #[derive(IntoElement)]
 pub struct Switch {
     id: ElementId,
@@ -72,8 +75,7 @@ impl RenderOnce for Switch {
             .when(on, |el| el.justify_end())
             .when(disabled, |el| el.opacity(0.4))
             .when(!disabled, |el| {
-                el.cursor_pointer()
-                    .hover(|el| el.border_color(c.accent_hover))
+                el.hover(|el| el.border_color(c.accent_hover))
             })
             .child(div().size(KNOB).rounded(KNOB / 2.).bg(if on {
                 c.text_on_accent
@@ -130,6 +132,7 @@ impl Checkbox {
 
 impl RenderOnce for Checkbox {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let c = cx.colors().clone();
         let checked = self.checked;
         let disabled = self.disabled;
         let handler = self.on_toggle;
@@ -137,26 +140,35 @@ impl RenderOnce for Checkbox {
         h_flex()
             .id(self.id)
             .justify_center()
-            // The hit area is the row's height, not the glyph's: a 14px target
-            // is a miss waiting to happen, and the icon is the only part that
+            // The hit area is the row's height, not the box's: a 14px target
+            // is a miss waiting to happen, and the box is the only part that
             // has to be small.
             .size(px(20.))
-            .rounded(px(3.))
             .when(disabled, |el| el.opacity(0.4))
-            .when(!disabled, |el| {
-                el.cursor_pointer().hover(|el| el.bg(cx.colors().hover))
-            })
             .child(
-                crate::Icon::new(match checked {
-                    true => crate::IconName::CheckboxChecked,
-                    false => crate::IconName::CheckboxUnchecked,
-                })
-                .size(crate::IconSize::Small)
-                .color(match checked {
-                    true => crate::IconColor::Accent,
-                    false => crate::IconColor::Disabled,
-                })
-                .flat(),
+                // Drawn rather than set in an icon font. A checkbox is a
+                // control, and on this platform a control is a filled box with
+                // the window's accent in it — an outlined glyph that stays the
+                // same shape whether it is ticked or not is a picture of a
+                // checkbox, which is what every web framework ships and what
+                // makes them all look alike.
+                h_flex()
+                    .flex_none()
+                    .size(BOX)
+                    .justify_center()
+                    .rounded(px(3.5))
+                    .border_1()
+                    .when(checked, |el| el.bg(c.accent).border_color(c.accent))
+                    .when(!checked, |el| el.bg(c.field).border_color(c.border_strong))
+                    .when(!disabled && !checked, |el| {
+                        el.hover(|s| s.border_color(c.border_focus))
+                    })
+                    .children(checked.then(|| {
+                        crate::Icon::new(crate::IconName::Check)
+                            .size(crate::IconSize::XSmall)
+                            .color(crate::IconColor::Custom(c.text_on_accent))
+                            .flat()
+                    })),
             )
             .on_click(move |_, window, cx| {
                 if disabled {

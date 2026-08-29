@@ -16,8 +16,8 @@ use gpui::{
     MouseButton, MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString, Window,
 };
 use ui::{
-    h_flex, v_flex, ActiveTheme, Axis, BadgeTone, Icon, IconColor, IconName, IconSize, Label,
-    LabelSize, ResizeHandle, Spinner, StatusBar,
+    h_flex, v_flex, ActiveTheme, Axis, Icon, IconColor, IconName, IconSize, Label, LabelSize,
+    ResizeHandle, Spinner, StatusBar,
 };
 
 use editor::{Editor, EditorMode, Input};
@@ -301,6 +301,11 @@ pub struct Workspace {
     /// global, so every colour cached in every element is stale and the whole
     /// window has to be told — which needs a `Window`, which only `render` has.
     pending_refresh: bool,
+    /// What the platform window was last told about its own transparency.
+    /// Asking AppKit to install or tear down a blur view is not free and the
+    /// answer only changes when the setting does, so the frame that notices a
+    /// difference is the one that pays for it.
+    vibrancy_applied: Option<(bool, bool)>,
 
     // ---- inspector -------------------------------------------------------
     pub inspector_tab: InspectorTab,
@@ -332,9 +337,10 @@ pub struct Workspace {
     /// Where the titlebar's database switcher was clicked, while its menu is
     /// up. A point rather than a bool: the menu opens under the chevron.
     pub(crate) database_menu: Option<Point<Pixels>>,
-    /// The chip composer's column or operator list, while it is up, and where
-    /// it was asked for.
-    pub(crate) filter_menu: Option<(Point<Pixels>, FilterMenu)>,
+    /// The chip composer's column or operator list, while it is up, and the
+    /// frame of the control it belongs to — the menu lands on the box, not on
+    /// the pointer.
+    pub(crate) filter_menu: Option<(gpui::Bounds<Pixels>, FilterMenu)>,
     /// The connection row's menu, while it is up, and which saved connection
     /// it came out of.
     pub(crate) connection_menu: Option<(Point<Pixels>, uuid::Uuid)>,
@@ -451,7 +457,7 @@ fn build_pane(
     // colour as its column names, is the one field in the window that lies
     // about what it holds.
     let filter = cx.new(|cx| {
-        let input = Input::new(cx).placeholder("where …", cx);
+        let input = Input::new(cx).bare().placeholder("id = 12", cx);
         let style = editor::EditorStyle::code(cx);
         input.editor().update(cx, |editor, _| {
             editor.set_sql(true);
@@ -503,26 +509,36 @@ fn build_pane(
                 this.active_pane = id;
                 this.commit_chip(cx);
             }
-            // Escape abandons the chip rather than committing half of it.
+            // Escape abandons the chip rather than committing half of it,
+            // and a second one puts the band away.
             editor::EditorEvent::Cancel => {
                 this.active_pane = id;
-                this.close_chip(cx);
+                this.escape_filter(cx);
             }
             _ => {}
         },
     )
     .detach();
 
-    // Enter in the filter re-asks the server, rather than hiding rows the
-    // client already has. Filtering in the client would only ever filter the
-    // first fifty thousand rows, which is a lie the moment the table is bigger
-    // than that.
-    cx.subscribe(&filter, move |this, _, event: &editor::EditorEvent, cx| {
-        if matches!(event, editor::EditorEvent::Submit) {
-            this.active_pane = id;
-            this.apply_filter(cx);
-        }
-    })
+    // The same two gestures as the value box next door, because it is the same
+    // row: this is the field a Raw row is edited in, and Enter there re-asks
+    // the server rather than hiding rows the client already has. Filtering in
+    // the client would only ever filter the first fifty thousand rows, which is
+    // a lie the moment the table is bigger than that.
+    cx.subscribe(
+        &filter,
+        move |this, _, event: &editor::EditorEvent, cx| match event {
+            editor::EditorEvent::Submit => {
+                this.active_pane = id;
+                this.commit_chip(cx);
+            }
+            editor::EditorEvent::Cancel => {
+                this.active_pane = id;
+                this.escape_filter(cx);
+            }
+            _ => {}
+        },
+    )
     .detach();
 
     // ⌘⏎ in the console runs whatever the cursor is in. The editor only
@@ -607,6 +623,33 @@ impl Workspace {
             .and_then(|session| session.read(cx).snapshot.clone())
     }
 
+    /// The columns a filter row may name.
+    ///
+    /// The catalog's, not the grid's: a [`crate::filter::Subject::Any`] row
+    /// asks its question of every column, and on the load that opens a table
+    /// the grid still holds the previous tab's result. Asking `orders` about
+    /// the columns of `users` would not be a narrower answer, it would be a
+    /// `column "email" does not exist`. The grid is the fallback for a tab
+    /// that is not browsing a table at all.
+    pub(crate) fn filter_columns(&self, cx: &App) -> Vec<String> {
+        let relation = self.pane().active().and_then(|tab| tab.relation.clone());
+        if let Some(relation) = relation {
+            if let Some(snapshot) = self.snapshot(cx) {
+                if let Some(found) = snapshot.relation(&relation) {
+                    return found.columns.iter().map(|c| c.name.to_string()).collect();
+                }
+            }
+        }
+        self.pane()
+            .grid
+            .read(cx)
+            .data()
+            .columns
+            .iter()
+            .map(|column| column.meta.name.to_string())
+            .collect()
+    }
+
     /// The table the active tab names, when the open connection has no such
     /// table. A tab restored from the last run carries a name that was true of
     /// whatever was connected then, and reconnecting somewhere else is common
@@ -656,6 +699,7 @@ impl Workspace {
         let mut pane = build_pane(id, db::ResultSet::new(Vec::new()), "", &self.catalog, cx);
         dress_pane(&pane, &self.settings.clone(), cx);
         pane.tabs.push(CenterTab {
+            cached: None,
             kind: CenterKind::Query,
             title: "Untitled".into(),
             detail: None,
@@ -886,6 +930,7 @@ impl Workspace {
             false => vec![(
                 vec![
                     CenterTab {
+                        cached: None,
                         kind: CenterKind::Query,
                         title: "mrr_by_plan.sql".into(),
                         detail: None,
@@ -905,6 +950,7 @@ impl Workspace {
                         reconnect: None,
                     },
                     CenterTab {
+                        cached: None,
                         kind: CenterKind::Table,
                         title: "users".into(),
                         detail: Some("public".into()),
@@ -1042,6 +1088,7 @@ impl Workspace {
             pending_decoder: None,
             pending_column_menu: None,
             pending_refresh: false,
+            vibrancy_applied: None,
 
             menu: None,
             row_menu: None,
@@ -1299,7 +1346,19 @@ impl Workspace {
     /// statement, opening a new tab — goes through here, because none of them
     /// run anywhere that has a `Window`.
     pub(crate) fn focus_editor(&mut self, cx: &App) {
-        self.pending_focus = Some(self.pane().editor.read(cx).focus().clone());
+        let pane = self.pane();
+        // The console is not always on screen: a table tab shows rows where
+        // the editor would be, a design tab shows the table's shape, and a
+        // pane with no tabs shows neither. Focusing a handle whose element is
+        // not in the tree drops focus out of the window altogether, and every
+        // shortcut after that goes nowhere until something is clicked.
+        let console = pane
+            .active()
+            .is_some_and(|tab| !matches!(tab.kind, CenterKind::Table | CenterKind::Structure));
+        self.pending_focus = Some(match console {
+            true => pane.editor.read(cx).focus().clone(),
+            false => self.focus.clone(),
+        });
     }
 
     /// ⌘S, and the toolbar's save button.
@@ -1469,6 +1528,7 @@ impl Workspace {
             _ => {
                 let session = self.session.clone();
                 self.pane_mut().tabs.push(CenterTab {
+                    cached: None,
                     kind: CenterKind::Query,
                     title: name.clone().into(),
                     detail: None,
@@ -1558,6 +1618,14 @@ impl Workspace {
         // about something else — describes nothing that is on screen.
         let editor = self.pane().editor.clone();
         editor.update(cx, |editor, cx| editor.clear_error(cx));
+        // What the outgoing tab had in the grid, taken before the pane's
+        // fields are wound back, so that coming back to it is a swap and not a
+        // wait. See [`crate::pane::Cached`].
+        let leaving = self.pane().active_tab;
+        let cached = self.cache_shown(cx);
+        if let Some(tab) = self.pane_mut().tabs.get_mut(leaving) {
+            tab.cached = cached;
+        }
         let pane = self.pane_mut();
         pane.error = None;
         pane.elapsed = None;
@@ -1576,12 +1644,9 @@ impl Workspace {
         self.pane()
             .editor
             .update(cx, |editor, cx| editor.set_text(&sql, cx));
-        // The filter is the tab's, so switching tabs swaps it the same way the
-        // console text is swapped. The composer is not: a half-written chip
-        // belongs to the moment, not to the tab.
-        let clause = self.pane().tabs[index].filter.text.clone();
-        let filter = self.pane().filter.clone();
-        filter.update(cx, |filter, cx| filter.set_text(&clause, cx));
+        // The row being edited is not carried across: a half-written condition
+        // belongs to the moment, not to the tab. What was finished is already
+        // in the tab's own filter.
         self.pane_mut().composer = None;
         // A table tab *is* its rows, and the grid is the pane's, not the tab's:
         // whatever is in it belongs to whichever tab last ran something. Coming
@@ -1594,10 +1659,18 @@ impl Workspace {
             .get(index)
             .map(|tab| (tab.kind, tab.relation.clone(), tab.key.clone()));
         match showing {
-            Some((CenterKind::Table, Some(relation), _)) => self.reload_relation(relation, cx),
+            Some((CenterKind::Table, Some(relation), _)) => {
+                if !self.restore_cached(index, cx) {
+                    self.reload_relation(relation, cx)
+                }
+            }
             // The same rule for a key, which is a browse of something that can
             // change under you rather more often than a table can.
-            Some((CenterKind::Key, _, Some((key, kind)))) => self.reload_key(key, kind, cx),
+            Some((CenterKind::Key, _, Some((key, kind)))) => {
+                if !self.restore_cached(index, cx) {
+                    self.reload_key(key, kind, cx)
+                }
+            }
             // Nothing is going to refill the grid, so what is in it — and any
             // edit staged against it — belongs to the tab that just left. A
             // script's answers under another script's name, with a Commit
@@ -1606,19 +1679,84 @@ impl Workspace {
         }
     }
 
+    /// Take what the pane is showing, for the tab that is about to stop showing
+    /// it. `None` when there is nothing worth keeping — no rows, or staged
+    /// edits, which belong to the grid rather than to this.
+    fn cache_shown(&self, cx: &App) -> Option<crate::pane::Cached> {
+        let pane = self.pane();
+        let grid = pane.grid.read(cx);
+        if grid.has_changes() || grid.data().is_empty() {
+            return None;
+        }
+        // A script's several answers are the dock's tab strip, not one tab's
+        // rows, and only one of them would come back. A tab that ran a script
+        // asks again rather than putting a third of it back.
+        if pane.results.len() > 1 {
+            return None;
+        }
+        Some(crate::pane::Cached {
+            rows: grid.data().clone(),
+            row_count: pane.row_count,
+            selected_row: pane.selected_row,
+            selected_column: pane.selected_column,
+            truncated: pane.truncated,
+            unsorted: pane.unsorted.clone(),
+            sort: grid.sort(),
+        })
+    }
+
+    /// Put a tab's last rows back on screen, and say whether there were any.
+    ///
+    /// A tab that has rows to put back does not ask the server for them again.
+    /// An earlier version did, on the grounds that a page costs milliseconds
+    /// and being wrong about what is on screen costs more; what it actually
+    /// cost was a round trip on every switch, and switching faster than the
+    /// server could answer left the grid showing the tab you started from.
+    /// Rows are re-read when the tab is reloaded — ⌘R, the bolt, a filter, a
+    /// sort, a page — which is every moment someone is actually asking whether
+    /// they have changed.
+    fn restore_cached(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let Some(cached) = self
+            .pane()
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.cached.as_ref())
+        else {
+            return false;
+        };
+        let rows = cached.rows.clone();
+        let row_count = cached.row_count;
+        let selected_row = cached.selected_row;
+        let selected_column = cached.selected_column;
+        let truncated = cached.truncated;
+        let unsorted = cached.unsorted.clone();
+        let sort = cached.sort;
+        let pane = self.pane_mut();
+        pane.row_count = row_count;
+        pane.selected_row = selected_row;
+        pane.selected_column = selected_column;
+        pane.truncated = truncated;
+        pane.unsorted = unsorted;
+        let grid = pane.grid.clone();
+        grid.update(cx, |grid, cx| {
+            grid.set_data_arc(rows, cx);
+            grid.set_sort(sort, cx);
+            if let Some(row) = selected_row {
+                grid.set_cursor(row, selected_column, false, cx);
+            }
+        });
+        let id = self.active_pane;
+        self.refresh_editability(id, cx);
+        true
+    }
+
     /// Put what is in the console back into the tab that owns it. Every path
     /// that changes which tab is active goes through here first, or the text
     /// ends up belonging to whichever tab happened to be showing.
     pub(crate) fn stash_editor(&mut self, cx: &App) {
         let text = self.pane().editor.read(cx).text();
-        let filter = self.pane().filter.read(cx).text(cx);
         if let Some(tab) = self.pane_mut().active_mut() {
             tab.sql = text;
-            // Only the hand-written half: in chip mode the box is not showing
-            // and whatever is left in it is the last tab's clause.
-            if tab.filter.raw {
-                tab.filter.text = filter;
-            }
         }
     }
 
@@ -1628,12 +1766,8 @@ impl Workspace {
     fn stash_editors(&mut self, cx: &App) {
         for index in 0..self.panes.len() {
             let text = self.panes[index].editor.read(cx).text();
-            let filter = self.panes[index].filter.read(cx).text(cx);
             if let Some(tab) = self.panes[index].active_mut() {
                 tab.sql = text;
-                if tab.filter.raw {
-                    tab.filter.text = filter;
-                }
             }
         }
     }
@@ -1642,6 +1776,7 @@ impl Workspace {
     pub fn new_query_tab(&mut self, cx: &mut Context<Self>) {
         let session = self.session.clone();
         self.pane_mut().tabs.push(CenterTab {
+            cached: None,
             kind: CenterKind::Query,
             title: "Untitled".into(),
             detail: None,
@@ -1834,26 +1969,154 @@ impl Workspace {
             .shortcut(":"),
         );
 
-        // The tree holds every connection the window has open; the palette is
-        // about the one in front. A list with three servers' tables in it
-        // would need a column saying which — and `Open` carries a schema and a
-        // name, which mean different tables on different servers.
         let here = self.session.as_ref().map(|session| {
             let config = &session.read(cx).config;
             (config.id, config.database.clone())
         });
-        for node in &self.tree {
-            if let Some((id, database)) = &here {
-                let mine = node.origin.connection == *id
-                    && node
-                        .origin
-                        .database
-                        .as_ref()
-                        .is_none_or(|name| **name == *database);
-                if !mine {
-                    continue;
+        let named: std::collections::HashMap<uuid::Uuid, String> = self
+            .connections
+            .iter()
+            .map(|config| (config.id, config.display_name()))
+            .collect();
+        // Where something is, in as many words as it takes to tell it from the
+        // thing of the same name on the next server: the schema alone while
+        // you are already there, the database and the connection as they stop
+        // being the ones in front.
+        let where_of = |connection: Option<uuid::Uuid>,
+                        database: Option<&SharedString>,
+                        schema: Option<&SharedString>| {
+            let mut parts: Vec<String> = Vec::new();
+            let foreign = match (&here, connection) {
+                (Some((id, _)), Some(connection)) => connection != *id,
+                _ => connection.is_some(),
+            };
+            let other_database = match &here {
+                Some((_, open)) => database.is_some_and(|name| **name != *open),
+                None => database.is_some(),
+            };
+            if foreign {
+                if let Some(name) = connection.and_then(|id| named.get(&id)) {
+                    parts.push(name.clone());
                 }
             }
+            if foreign || other_database {
+                if let Some(database) = database {
+                    parts.push(database.to_string());
+                }
+            }
+            if let Some(schema) = schema {
+                parts.push(schema.to_string());
+            }
+            match parts.is_empty() {
+                true => None,
+                false => Some(SharedString::from(parts.join(" · "))),
+            }
+        };
+
+        // Every tab in every pane, ahead of everything the servers hold. This
+        // is the list an editor's file switcher is: what is already open, in
+        // the order it was opened, one keystroke away.
+        //
+        // What is open is also what the object list below leaves out: one row
+        // per place, and for a table you are already looking at the row that
+        // goes back to the tab is the more useful of the two.
+        let mut open: std::collections::HashSet<(uuid::Uuid, String, String)> =
+            std::collections::HashSet::new();
+        for pane in &self.panes {
+            for (index, tab) in pane.tabs.iter().enumerate() {
+                let icon = match tab.kind {
+                    CenterKind::Query => IconName::Code,
+                    CenterKind::Table => IconName::Table,
+                    CenterKind::Structure => IconName::Columns,
+                    CenterKind::Key => IconName::Key,
+                };
+                let mut item = PaletteItem::new(
+                    ItemKind::Tab,
+                    PaletteAction::GoToTab {
+                        pane: pane.id,
+                        tab: index,
+                    },
+                    tab.title.clone(),
+                )
+                .icon(icon)
+                .current(pane.id == self.active_pane && index == pane.active_tab);
+                let on = tab
+                    .session
+                    .as_ref()
+                    .map(|session| session.read(cx).config.clone());
+                if let Some(where_) = where_of(
+                    on.as_ref().map(|config| config.id),
+                    on.as_ref()
+                        .map(|config| SharedString::from(config.database.clone()))
+                        .as_ref(),
+                    tab.detail.as_ref(),
+                ) {
+                    item = item.detail(where_);
+                }
+                if let (Some(config), Some(relation)) = (&on, &tab.relation) {
+                    open.insert((
+                        config.id,
+                        relation.schema.to_string(),
+                        relation.name.to_string(),
+                    ));
+                }
+                items.push(item);
+            }
+        }
+
+        // Every saved connection, whether or not it is up. The tree only holds
+        // what has been scanned, so a server nobody has opened yet has no
+        // tables in this list — but it is still somewhere to go, and going
+        // there is what connects it.
+        for config in &self.connections {
+            let live = self
+                .sessions
+                .iter()
+                .any(|session| session.read(cx).config.id == config.id);
+            let mut item = PaletteItem::new(
+                ItemKind::Place,
+                PaletteAction::OpenConnection(config.id),
+                config.display_name(),
+            )
+            .icon(IconName::Server)
+            .current(here.as_ref().is_some_and(|(id, _)| *id == config.id));
+            item = item.detail(match live {
+                true => SharedString::from(config.database.clone()),
+                false => SharedString::from(config.endpoint()),
+            });
+            items.push(item);
+        }
+
+        // And every database the tree has heard of, which is every database on
+        // every connection that has been opened: switching to one is a move
+        // the whole window makes, so it belongs beside the connections rather
+        // than among their tables.
+        for node in &self.tree {
+            if node.kind != tree::NodeKind::Database {
+                continue;
+            }
+            let mut item = PaletteItem::new(
+                ItemKind::Place,
+                PaletteAction::OpenDatabase(node.origin.clone(), node.name.clone()),
+                node.name.clone(),
+            )
+            .icon(IconName::Database)
+            .current(
+                here.as_ref()
+                    .is_some_and(|(id, open)| *id == node.origin.connection && *open == *node.name),
+            );
+            if let Some(name) = named.get(&node.origin.connection) {
+                item = item.detail(SharedString::from(name.clone()));
+            }
+            items.push(item);
+        }
+
+        // Every connection the window has open, not the one in front. A table
+        // on another server is somewhere this window can go, and the palette
+        // is how you go somewhere without first finding it in a tree. Which
+        // server it is on is written beside it, because `public.users` names a
+        // different table on each of them.
+        for node in &self.tree {
             // Relations only. A keyspace has no fixed list of objects to search
             // — the tree holds whatever the last scan happened to reach — so a
             // palette full of keys would be a palette that answers differently
@@ -1874,16 +2137,30 @@ impl Workspace {
                 tree::NodeKind::MaterializedView => IconName::Layers,
                 _ => IconName::Table,
             };
-            let schema = target.schema.to_string();
-            items.push(
-                PaletteItem::new(
-                    ItemKind::Object,
-                    PaletteAction::Open(target),
-                    node.name.clone(),
-                )
-                .icon(icon)
-                .detail(schema),
+            let already = open.contains(&(
+                node.origin.connection,
+                target.schema.to_string(),
+                target.name.to_string(),
+            ));
+            if already {
+                continue;
+            }
+            let schema = SharedString::from(target.schema.to_string());
+            let where_ = where_of(
+                Some(node.origin.connection),
+                node.origin.database.as_ref(),
+                Some(&schema),
             );
+            let mut item = PaletteItem::new(
+                ItemKind::Object,
+                PaletteAction::Open(target, Some(node.origin.clone())),
+                node.name.clone(),
+            )
+            .icon(icon);
+            if let Some(where_) = where_ {
+                item = item.detail(where_);
+            }
+            items.push(item);
         }
 
         for query in &self.saved {
@@ -1922,7 +2199,50 @@ impl Workspace {
     pub fn perform(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
         match action {
             PaletteAction::Command(command) => self.run_command(command, cx),
-            PaletteAction::Open(relation) => self.open_relation(&relation, cx),
+            PaletteAction::Open(relation, origin) => {
+                // Which server the row came out of, before anything is opened
+                // on it — the same order the sidebar does it in, and for the
+                // same reason: the tab about to be made binds to whatever the
+                // window is describing.
+                if let Some(origin) = origin {
+                    self.focus_origin(&origin, cx);
+                }
+                self.open_relation(&relation, cx)
+            }
+            PaletteAction::OpenConnection(id) => {
+                // Already up: this is a move between servers, and the session
+                // is the thing that moves. Not up: the same call the sidebar's
+                // connection row makes, which asks for the password if it has
+                // to and fills the tree when it lands.
+                let live = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.read(cx).config.id == id)
+                    .cloned();
+                match live {
+                    Some(session) => self.adopt_session(Some(session), cx),
+                    None => {
+                        if let Some(config) = self
+                            .connections
+                            .iter()
+                            .find(|config| config.id == id)
+                            .cloned()
+                        {
+                            self.open_connection(config, cx);
+                        }
+                    }
+                }
+            }
+            PaletteAction::OpenDatabase(origin, name) => {
+                self.focus_origin(&origin, cx);
+                self.open_database(&name, cx);
+            }
+            PaletteAction::GoToTab { pane, tab } => {
+                self.activate_pane(pane, cx);
+                if self.pane().tabs.get(tab).is_some() {
+                    self.show_tab(tab, cx);
+                }
+            }
             PaletteAction::LoadQuery(id) => {
                 if let Some(index) = self.saved.iter().position(|query| query.id == id) {
                     self.load_saved_query(index, cx);
@@ -2073,6 +2393,8 @@ impl Workspace {
             Command::NewTab => self.new_query_tab(cx),
             Command::NewTable => self.new_table(cx),
             Command::CloseTab => self.close_tab(self.pane().active_tab, cx),
+            Command::NextTab => self.cycle_tab(true, cx),
+            Command::PreviousTab => self.cycle_tab(false, cx),
             Command::SplitRight => self.split_pane(Layout::Columns, cx),
             Command::SplitDown => self.split_pane(Layout::Rows, cx),
             Command::ClosePane => self.close_pane(self.active_pane, cx),
@@ -2212,6 +2534,8 @@ impl Workspace {
             m::NewTable => Command::NewTable,
             m::NewConnection => Command::NewConnection,
             m::CloseTab => Command::CloseTab,
+            m::NextTab => Command::NextTab,
+            m::PreviousTab => Command::PreviousTab,
             m::Save => Command::Save,
             m::SaveAs => Command::SaveAs,
             m::ExportRows => Command::ExportRows,
@@ -2838,10 +3162,10 @@ impl Workspace {
     pub(crate) fn open_filter_menu(
         &mut self,
         which: FilterMenu,
-        at: Point<Pixels>,
+        from: gpui::Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.filter_menu = Some((at, which));
+        self.filter_menu = Some((from, which));
         cx.notify();
     }
 
@@ -2855,28 +3179,21 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (at, which) = self.filter_menu?;
+        let (from, which) = self.filter_menu?;
         let chosen = self.pane().composer.as_ref()?.chip.clone();
+        // Off the bottom edge of the control, its own width or wider: this is
+        // a list of what that box could say, so it opens where the box is.
         let mut menu = ui::ContextMenu::new("filter-menu")
-            .at(at)
-            .width(px(200.))
+            .under(from)
+            .width(from.size.width)
             .on_dismiss(cx.listener(|this, _, _, cx| this.close_filter_menu(cx)));
         match which {
             FilterMenu::Column => {
-                // The columns of the rows on screen, in the order they are in
-                // — which is the table's own order, and the order the person
-                // choosing has just been reading.
-                let columns: Vec<String> = self
-                    .pane()
-                    .grid
-                    .read(cx)
-                    .data()
-                    .columns
-                    .iter()
-                    .map(|column| column.meta.name.to_string())
-                    .collect();
-                for name in columns {
-                    let open = name == chosen.column;
+                // In the table's own order, which is the order the person
+                // choosing has just been reading them in.
+                let on_column = chosen.subject == crate::filter::Subject::Column;
+                for name in self.filter_columns(cx) {
+                    let open = on_column && name == chosen.column;
                     let chosen_name = name.clone();
                     menu = menu.item(
                         ui::MenuItem::new(name)
@@ -2887,6 +3204,32 @@ impl Workspace {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_filter_menu(cx);
                                 this.set_chip_column(chosen_name.clone(), cx);
+                            })),
+                    );
+                }
+                // Under the columns and behind a rule, because they are not
+                // columns: one asks every column at once, the other stops
+                // asking questions and writes the clause.
+                menu = menu.separator();
+                for (subject, label, icon) in [
+                    (
+                        crate::filter::Subject::Any,
+                        "Any column",
+                        IconName::Magnifier,
+                    ),
+                    (crate::filter::Subject::Raw, "Raw SQL", IconName::Code),
+                ] {
+                    let open = chosen.subject == subject;
+                    let column = chosen.column.clone();
+                    menu = menu.item(
+                        ui::MenuItem::new(label)
+                            .icon(match open {
+                                true => IconName::Check,
+                                false => icon,
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_filter_menu(cx);
+                                this.set_chip_subject(subject, column.clone(), cx);
                             })),
                     );
                 }
@@ -3082,6 +3425,7 @@ impl Workspace {
             None => {
                 let session = self.session.clone();
                 self.pane_mut().tabs.push(CenterTab {
+                    cached: None,
                     kind: CenterKind::Table,
                     title,
                     detail: Some(detail),
@@ -3130,6 +3474,7 @@ impl Workspace {
             None => {
                 let session = self.session.clone();
                 self.pane_mut().tabs.push(CenterTab {
+                    cached: None,
                     kind: CenterKind::Key,
                     title,
                     detail: Some(detail),
@@ -3178,6 +3523,7 @@ impl Workspace {
         }
         let session = self.session.clone();
         self.pane_mut().tabs.push(CenterTab {
+            cached: None,
             kind: CenterKind::Table,
             title,
             detail: Some(detail),
@@ -3256,10 +3602,11 @@ impl Workspace {
             self.set_page(page);
         }
         self.stash_editor(cx);
+        let columns = self.filter_columns(cx);
         let predicate = self
             .pane()
             .active()
-            .map(|tab| tab.filter.predicate())
+            .map(|tab| tab.filter.predicate(&columns))
             .unwrap_or_default();
         let predicate = predicate.trim();
         let size = self.settings.page_size();
@@ -3341,14 +3688,10 @@ impl Workspace {
         let Some((target, predicate)) = self.reference_in_column(column, cx) else {
             return;
         };
-        let filter = crate::filter::Filter {
-            // The hand-written box rather than a chip: the chip row edits
-            // values as text and a hop is an exact match on a key, which is
-            // not a thing to half-edit into something that matches two rows.
-            raw: true,
-            text: predicate,
-            chips: Vec::new(),
-        };
+        // A raw row rather than an ordinary one: the band edits values as
+        // text, and a hop is an exact match on a key — which is not a thing to
+        // half-edit into something that matches two rows.
+        let filter = crate::filter::Filter::just(crate::filter::Chip::raw(predicate));
         self.open_relation_filtered(&target, Some(filter), cx);
     }
 
@@ -3513,29 +3856,29 @@ impl Workspace {
 
     // ---- the chip editor --------------------------------------------------
 
-    /// The funnel: chips or a hand-written clause.
+    /// The funnel: show the band of conditions, or put it away.
     ///
-    /// Leaving the chips takes their SQL with it, so the clause starts as
-    /// whatever was already being asked rather than as an empty box — which is
-    /// the point of the switch. Coming back is free: the chips were never
-    /// deleted, only stopped being the ones in force.
-    pub fn toggle_filter_mode(&mut self, cx: &mut Context<Self>) {
-        self.stash_editor(cx);
-        self.pane_mut().composer = None;
-        let Some(tab) = self.pane_mut().active_mut() else {
-            return;
-        };
-        match tab.filter.raw {
-            true => tab.filter.to_chips(),
-            false => tab.filter.to_raw(),
+    /// Closing does not clear. The rows belong to the tab, and a filter you can
+    /// no longer see is still a filter — which is why the funnel stays lit and
+    /// the toolbar keeps printing the clause. Opening on an empty stack starts
+    /// a row, because a band with nothing in it is a disclosure that discloses
+    /// nothing.
+    pub fn toggle_filter_band(&mut self, cx: &mut Context<Self>) {
+        let open = !self.pane().filter_open;
+        self.pane_mut().filter_open = open;
+        let empty = self
+            .pane()
+            .active()
+            .is_some_and(|tab| tab.filter.chips.is_empty());
+        match open {
+            true if empty && self.pane().composer.is_none() => self.open_chip(None, cx),
+            true => {}
+            // Putting the band away is not abandoning what was in it: the row
+            // is on screen and finished-looking, and Escape is the gesture that
+            // throws one away.
+            false if self.pane().composer.is_some() => self.commit_chip(cx),
+            false => {}
         }
-        let (raw, text) = (tab.filter.raw, tab.filter.text.clone());
-        if raw {
-            let filter = self.pane().filter.clone();
-            filter.update(cx, |filter, cx| filter.set_text(&text, cx));
-            self.focus_filter(cx);
-        }
-        self.apply_filter(cx);
         cx.notify();
     }
 
@@ -3680,27 +4023,40 @@ impl Workspace {
         self.apply_search(cx);
     }
 
-    /// Open the composer: on `Some(index)` to change a chip, on `None` to add
-    /// one. A new chip starts on the first column of the table rather than on
-    /// nothing, because "which column" is a question with an obvious first
-    /// answer and making someone answer it before they can type is a step for
-    /// its own sake.
+    /// Put a row into the composer: `Some(index)` for one already in the
+    /// stack, `None` to start a new one at the bottom. A new row starts on the
+    /// first column of the table rather than on nothing, because "which column"
+    /// is a question with an obvious first answer and making someone answer it
+    /// before they can type is a step for its own sake.
+    ///
+    /// Whatever was being composed is committed on the way past. Only one row
+    /// has a live field at a time, and clicking the row under the one you just
+    /// typed into is not a gesture that means "throw that away".
     pub fn open_chip(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
-        let chip = match index.and_then(|i| self.pane().active()?.filter.chips.get(i).cloned()) {
-            Some(chip) => chip,
-            None => {
-                let column = self
-                    .pane()
-                    .grid
-                    .read(cx)
-                    .data()
-                    .columns
-                    .first()
-                    .map(|column| column.meta.name.to_string())
-                    .unwrap_or_default();
+        let open = self.pane().composer.as_ref().map(|c| c.editing);
+        // Already this row. Rebuilding it would reload the value box from the
+        // stack and lose whatever has been typed into it since — which is what
+        // happens every time one of the menus on a half-written row is used.
+        if open == Some(index) {
+            self.pane_mut().filter_open = true;
+            cx.notify();
+            return;
+        }
+        if open.is_some() {
+            self.commit_chip(cx);
+        }
+        self.pane_mut().filter_open = true;
+        let existing = index.and_then(|i| self.pane().active()?.filter.chips.get(i).cloned());
+        let chip = match (index, existing) {
+            (Some(_), Some(chip)) => chip,
+            // The row moved out from under the click while the one before it
+            // was being committed — an unfinished edit takes its row with it.
+            (Some(_), None) => return self.close_chip(cx),
+            (None, _) => {
+                let column = self.filter_columns(cx).first().cloned().unwrap_or_default();
                 let join = match self.pane().active() {
-                    // A second chip inherits the join of the one before it, so
-                    // a row of `or`s does not need the word clicked every time.
+                    // A second row inherits the join of the one above it, so a
+                    // stack of `or`s does not need the word clicked every time.
                     Some(tab) => tab.filter.chips.last().map(|c| c.join).unwrap_or_default(),
                     None => crate::filter::Join::And,
                 };
@@ -3711,14 +4067,28 @@ impl Workspace {
                 }
             }
         };
+        let raw = chip.subject == crate::filter::Subject::Raw;
         let value = chip.value.clone();
         self.pane_mut().composer = Some(crate::pane::Composer {
             editing: index,
             chip,
         });
-        let input = self.pane().chip_value.clone();
-        input.update(cx, |input, cx| input.set_text(&value, cx));
-        self.focus_chip_value(cx);
+        self.load_composer(raw, &value, cx);
+        cx.notify();
+    }
+
+    /// Put the row's text in whichever of the two boxes it is written in, and
+    /// go there.
+    fn load_composer(&mut self, raw: bool, value: &str, cx: &mut Context<Self>) {
+        let input = match raw {
+            true => self.pane().filter.clone(),
+            false => self.pane().chip_value.clone(),
+        };
+        input.update(cx, |input, cx| input.set_text(value, cx));
+        match raw {
+            true => self.focus_filter(cx),
+            false => self.focus_chip_value(cx),
+        }
     }
 
     pub fn close_chip(&mut self, cx: &mut Context<Self>) {
@@ -3726,18 +4096,78 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Put the composer's chip into the row and ask the server again.
+    /// Escape, from inside the band: give up the row being written, and if
+    /// there is no row being written, give up the band. Two presses out of a
+    /// half-typed condition, one out of a finished stack — and the stack is
+    /// still there when the funnel is pressed again, because putting the band
+    /// away is hiding the controls, not dropping the filter.
+    pub fn escape_filter(&mut self, cx: &mut Context<Self>) {
+        if self.pane().composer.is_some() {
+            return self.close_chip(cx);
+        }
+        self.pane_mut().filter_open = false;
+        cx.notify();
+    }
+
+    /// Put the composed row into the stack and ask the server again.
     ///
-    /// An unfinished chip is dropped rather than kept: the composer is open
-    /// precisely so that a chip can be abandoned, and a row full of conditions
-    /// that do nothing is a row that lies about what is being filtered.
+    /// An unfinished row is dropped rather than kept: the composer is open
+    /// precisely so that a condition can be abandoned, and a stack full of
+    /// conditions that do nothing is a stack that lies about what is being
+    /// filtered.
+    /// The `+` on a row: a new row under *that* row.
+    ///
+    /// Under that one rather than at the foot of the stack, because a filter is
+    /// read in order and the row the pointer is on is the place being pointed
+    /// at. An unfinished new row is dropped again when it is left, so the
+    /// button is safe to press twice.
+    pub fn add_chip_after(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.commit_chip(cx);
+        let len = self
+            .pane()
+            .active()
+            .map(|tab| tab.filter.chips.len())
+            .unwrap_or_default();
+        let at = (index + 1).min(len);
+        if at == len {
+            return self.open_chip(None, cx);
+        }
+        let column = self.filter_columns(cx).first().cloned().unwrap_or_default();
+        if let Some(tab) = self.pane_mut().active_mut() {
+            // The join of the row above, for the same reason a row appended to
+            // the end inherits one: a stack of `or`s should not need the word
+            // clicked on every line of it.
+            let join = tab.filter.chips[at - 1].join;
+            tab.filter.chips.insert(
+                at,
+                crate::filter::Chip {
+                    column,
+                    join,
+                    ..Default::default()
+                },
+            );
+        }
+        self.open_chip(Some(at), cx);
+    }
+
     pub fn commit_chip(&mut self, cx: &mut Context<Self>) {
-        let value = self.pane().chip_value.read(cx).text(cx);
         let Some(mut composer) = self.pane_mut().composer.take() else {
             return;
         };
-        composer.chip.value = value;
-        let complete = composer.chip.to_sql().is_some();
+        composer.chip.value = match composer.chip.subject {
+            crate::filter::Subject::Raw => self.pane().filter.read(cx).text(cx),
+            _ => self.pane().chip_value.read(cx).text(cx),
+        };
+        let columns = self.filter_columns(cx);
+        // Asked of an enabled copy: a row that was unticked before it was
+        // opened is still a row somebody wrote, and deleting it for saying
+        // nothing right now would delete the only reason the tick exists.
+        let complete = crate::filter::Chip {
+            enabled: true,
+            ..composer.chip.clone()
+        }
+        .to_sql(&columns)
+        .is_some();
         if let Some(tab) = self.pane_mut().active_mut() {
             match (composer.editing, complete) {
                 (Some(index), true) if index < tab.filter.chips.len() => {
@@ -3754,12 +4184,42 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Change the column or the operator of the chip being composed. Both are
-    /// picked from a menu, and both re-ask nothing until the chip is committed:
+    /// Change the subject or the operator of the row being composed. Both are
+    /// picked from a menu, and both re-ask nothing until the row is committed:
     /// changing `=` to `is null` mid-edit should not send a statement.
     pub fn set_chip_column(&mut self, column: String, cx: &mut Context<Self>) {
+        self.set_chip_subject(crate::filter::Subject::Column, column, cx);
+    }
+
+    /// The first menu on a row: a column, or one of the two escapes.
+    ///
+    /// `column` is carried even for the escapes, so that a row switched to Raw
+    /// and back lands on the column it started on rather than on nothing.
+    pub fn set_chip_subject(
+        &mut self,
+        subject: crate::filter::Subject,
+        column: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut chip) = self.pane().composer.as_ref().map(|c| c.chip.clone()) else {
+            return;
+        };
+        let was_raw = chip.subject == crate::filter::Subject::Raw;
+        let raw = subject == crate::filter::Subject::Raw;
+        // What was typed follows the row across. Which of the two boxes it
+        // happens to live in is this app's business, not the typist's.
+        chip.value = match was_raw {
+            true => self.pane().filter.read(cx).text(cx),
+            false => self.pane().chip_value.read(cx).text(cx),
+        };
+        chip.subject = subject;
+        chip.column = column;
+        let value = chip.value.clone();
         if let Some(composer) = self.pane_mut().composer.as_mut() {
-            composer.chip.column = column;
+            composer.chip = chip;
+        }
+        if raw != was_raw {
+            self.load_composer(raw, &value, cx);
         }
         cx.notify();
     }
@@ -3777,6 +4237,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The tick at the head of a row — see [`crate::filter::Chip::enabled`].
+    pub fn toggle_chip(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.pane_mut().active_mut() {
+            if let Some(chip) = tab.filter.chips.get_mut(index) {
+                chip.enabled = !chip.enabled;
+            }
+        }
+        self.apply_filter(cx);
+        cx.notify();
+    }
+
     pub fn remove_chip(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(tab) = self.pane_mut().active_mut() {
             if index < tab.filter.chips.len() {
@@ -3791,7 +4262,16 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Click the `and` between two chips to make it an `or`.
+    /// The same word on the row being composed, which is not in the stack yet
+    /// and so has no index to flip.
+    pub fn flip_composer_join(&mut self, cx: &mut Context<Self>) {
+        if let Some(composer) = self.pane_mut().composer.as_mut() {
+            composer.chip.join = composer.chip.join.flipped();
+        }
+        cx.notify();
+    }
+
+    /// Click the `and` at the head of a row to make it an `or`.
     pub fn flip_join(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(tab) = self.pane_mut().active_mut() {
             if let Some(chip) = tab.filter.chips.get_mut(index) {
@@ -3802,17 +4282,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Take the whole row off. The chips go with it: "clear the filter" that
-    /// left six chips behind, greyed out, would be a filter nobody could
-    /// convince the app they had finished with.
+    /// Empty the stack. Every row goes, unticked ones included: "clear the
+    /// filter" that left six conditions behind, greyed out, would be a filter
+    /// nobody could convince the app they had finished with.
+    ///
+    /// The band stays open on a fresh row, because Clear is pressed by someone
+    /// about to filter for something else.
     pub fn clear_filter(&mut self, cx: &mut Context<Self>) {
         self.pane_mut().composer = None;
         if let Some(tab) = self.pane_mut().active_mut() {
             tab.filter.chips.clear();
-            tab.filter.text.clear();
         }
         let filter = self.pane().filter.clone();
         filter.update(cx, |filter, cx| filter.set_text("", cx));
+        // And put the band away with it. Clearing is the one gesture that ends
+        // with nothing left to look at, which makes it the way out of the band
+        // for anyone who did not find the funnel again.
+        self.pane_mut().filter_open = false;
         self.apply_filter(cx);
         cx.notify();
     }
@@ -4681,11 +5167,11 @@ impl Workspace {
             }
         }
         // `TUPLI_FILTER="plan = enterprise, or mrr_cents >= 20000"` seeds the
-        // chip row for the headless renderer, `TUPLI_FILTER_RAW` puts the same
-        // clause in the hand-written box instead, and `TUPLI_COMPOSER` leaves
-        // the editor open on a new chip. None of it is reachable from the UI;
-        // it exists so the two modes can be looked at without a human clicking
-        // through to them.
+        // filter band for the headless renderer, `TUPLI_FILTER_RAW` adds a row
+        // holding the clause it is given, `TUPLI_FILTER_BAND` opens the band
+        // and `TUPLI_COMPOSER` leaves a new row being edited in it. None of it
+        // is reachable from the UI; it exists so the band can be looked at
+        // without a human clicking through to it.
         if let Ok(spec) = std::env::var("TUPLI_FILTER") {
             let chips = spec
                 .split(',')
@@ -4703,27 +5189,24 @@ impl Workspace {
                         op,
                         value: parts.next().unwrap_or_default().to_string(),
                         join,
+                        ..Default::default()
                     })
                 })
                 .collect::<Vec<_>>();
             if let Some(tab) = self.pane_mut().active_mut() {
                 tab.filter.chips = chips;
             }
-            if std::env::var_os("TUPLI_FILTER_RAW").is_some() {
-                if let Some(tab) = self.pane_mut().active_mut() {
-                    tab.filter.to_raw();
-                }
-                let text = self
-                    .pane()
-                    .active()
-                    .map(|tab| tab.filter.text.clone())
-                    .unwrap_or_default();
-                let filter = self.pane().filter.clone();
-                filter.update(cx, |filter, cx| filter.set_text(&text, cx));
+        }
+        if let Ok(text) = std::env::var("TUPLI_FILTER_RAW") {
+            if let Some(tab) = self.pane_mut().active_mut() {
+                tab.filter.chips.push(crate::filter::Chip::raw(text));
             }
-            if std::env::var_os("TUPLI_COMPOSER").is_some() {
-                self.open_chip(None, cx);
-            }
+        }
+        if std::env::var_os("TUPLI_FILTER_BAND").is_some() {
+            self.pane_mut().filter_open = true;
+        }
+        if std::env::var_os("TUPLI_COMPOSER").is_some() {
+            self.open_chip(None, cx);
         }
         // One table, or a comma-separated list of them — `TUPLI_OPEN=public.a,
         // public.b,public.c` is how a tab strip with more tabs than room gets
@@ -5322,8 +5805,27 @@ impl Render for Workspace {
         if !self.booted {
             self.booted = true;
             self.window = Some(window.window_handle());
-            let handle = self.pane().editor.read(cx).focus().clone();
-            window.focus(&handle, cx);
+            // By the same rule as every other focus in the app rather than
+            // straight at the console: a window that comes back up on a table
+            // tab has no console element in the tree, and focusing a handle
+            // that is not in the tree drops focus out of the window — after
+            // which ⌘K, ⌘P and the rest go nowhere until something is clicked.
+            self.focus_editor(cx);
+            // Every shortcut in this window is an `on_action` on an element
+            // inside it, so they are only reachable while something in the
+            // tree has focus. Close the tab you were typing in and the
+            // console goes with it, taking the focus to nowhere — after which
+            // ⌘W, ⌘K and the rest dispatch against the window root, which
+            // holds none of them, and the keyboard is dead until the window
+            // is clicked. Rather than repair that at each of the dozen places
+            // an element can leave the tree, catch it where it happens.
+            cx.on_focus_lost(window, |this, window, cx| {
+                let handle = window
+                    .focus_lost_restore_target(cx)
+                    .unwrap_or_else(|| this.focus.clone());
+                window.focus(&handle, cx);
+            })
+            .detach();
             self.boot_from_environment(cx);
         }
 
@@ -5351,8 +5853,26 @@ impl Render for Workspace {
 
         let c = cx.colors().clone();
         let hit = cx.metrics().splitter_hit_width;
+        let status_height = cx.metrics().status_bar_height;
         let left_width = self.left_width;
         let right_width = self.right_width;
+
+        let vibrant = self.settings.vibrancy();
+        // The blur is a real AppKit view and has an appearance of its own; a
+        // light theme over a dark frost is a light sidebar with nothing behind
+        // it but mud. So the theme is half of what decides whether to reapply.
+        let dark = cx.theme().appearance.is_dark();
+        if self.vibrancy_applied != Some((vibrant, dark)) {
+            self.vibrancy_applied = Some((vibrant, dark));
+            // Transparent rather than Blurred: gpui's own blur uses a
+            // material that stopped frosting on macOS 26, so all we want from
+            // it here is the window's opacity. The blur is ours.
+            window.set_background_appearance(match vibrant {
+                true => gpui::WindowBackgroundAppearance::Transparent,
+                false => gpui::WindowBackgroundAppearance::Opaque,
+            });
+            crate::vibrancy::apply(window, vibrant, dark);
+        }
 
         v_flex()
             .id("workspace")
@@ -5370,7 +5890,11 @@ impl Render for Workspace {
             .map(|el| self.menu_actions(el, cx))
             .relative()
             .size_full()
-            .bg(c.background)
+            // No ground of its own when the window is see-through: the titlebar
+            // and the status bar paint the frame plane themselves and every
+            // region between them paints its own, so the only thing a fill here
+            // could still cover is the blur.
+            .when(!vibrant, |el| el.bg(c.background))
             .text_color(c.text)
             .font_family(cx.typography().ui_family.clone())
             .child({
@@ -5382,30 +5906,16 @@ impl Render for Workspace {
                 let name = session
                     .map(|session| session.config.display_name())
                     .unwrap_or_else(|| "no connection".into());
-                let safety = session.map(|session| session.config.safety);
                 let connected = session.is_some_and(|session| session.state().is_connected());
                 Titlebar::new(name)
                     .database(database)
                     .connected(connected)
-                    // The badge is the safety level, not an invented
-                    // environment name: it is the thing that actually changes
-                    // what the app will let you do.
-                    .when_some(safety, |titlebar, safety| match safety {
-                        db::SafetyLevel::Normal => titlebar,
-                        db::SafetyLevel::Confirm => {
-                            titlebar.environment("confirm", BadgeTone::Warning)
-                        }
-                        db::SafetyLevel::ReadOnly => {
-                            titlebar.environment("read-only", BadgeTone::Danger)
-                        }
-                    })
                     .panels(self.left_open, self.dock_visible(), self.right_open)
+                    .sidebar(self.left_open.then_some(left_width))
+                    .vibrant(vibrant)
                     .on_toggle_left(cx.listener(|this, _, _, cx| this.toggle_left_panel(cx)))
                     .on_toggle_bottom(cx.listener(|this, _, _, cx| this.toggle_bottom_dock(cx)))
                     .on_toggle_right(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx)))
-                    .on_open_switcher(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                        this.open_database_menu(event.position(), cx)
-                    }))
                     .on_new_query(cx.listener(|this, _, _, cx| this.new_query_tab(cx)))
                     .on_new_connection(cx.listener(|this, _, _, cx| this.new_connection(cx)))
             })
@@ -5440,62 +5950,59 @@ impl Render for Workspace {
                                 .h_full()
                                 .child(self.render_inspector(window, cx)),
                         )
-                    })
-                    // ---- splitters -------------------------------------
-                    // Last, and placed on the seams rather than parented to
-                    // the region on one side of them. A handle that belongs to
-                    // the sidebar is painted before the centre stack is, and
-                    // the half of its grab strip that hangs over the seam is
-                    // buried — a six pixel target quietly becomes three.
-                    .when(self.left_open, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .h_full()
-                                .left(left_width - hit / 2.)
-                                .w(hit)
-                                .child(
-                                    ResizeHandle::new("left-splitter", Axis::Vertical)
-                                        .active(self.dragging(DragTarget::LeftPanel))
-                                        .invisible_line()
-                                        .on_drag_start(cx.listener(
-                                            |this, e: &gpui::MouseDownEvent, _, cx| {
-                                                this.begin_drag(
-                                                    DragTarget::LeftPanel,
-                                                    e.position,
-                                                    cx,
-                                                )
-                                            },
-                                        )),
-                                ),
-                        )
-                    })
-                    .when(self.right_open, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .h_full()
-                                .right(right_width - hit / 2.)
-                                .w(hit)
-                                .child(
-                                    ResizeHandle::new("right-splitter", Axis::Vertical)
-                                        .active(self.dragging(DragTarget::RightPanel))
-                                        .invisible_line()
-                                        .on_drag_start(cx.listener(
-                                            |this, e: &gpui::MouseDownEvent, _, cx| {
-                                                this.begin_drag(
-                                                    DragTarget::RightPanel,
-                                                    e.position,
-                                                    cx,
-                                                )
-                                            },
-                                        )),
-                                ),
-                        )
                     }),
             )
+            // ---- splitters -------------------------------------
+            // On the root rather than inside the body, so the line runs the
+            // full height of the window: the seam it sits on cuts through the
+            // titlebar, and a drag that lit only the part of it below the
+            // titlebar would look like it had grabbed the wrong edge.
+            //
+            // Last, too, and placed on the seams rather than parented to the
+            // region on one side of them. A handle that belongs to the sidebar
+            // is painted before the centre stack is, and the half of its grab
+            // strip that hangs over the seam is buried — a six pixel target
+            // quietly becomes three.
+            .when(self.left_open, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom(status_height)
+                        .left(left_width - hit / 2.)
+                        .w(hit)
+                        .child(
+                            ResizeHandle::new("left-splitter", Axis::Vertical)
+                                .active(self.dragging(DragTarget::LeftPanel))
+                                .invisible_line()
+                                .on_drag_start(cx.listener(
+                                    |this, e: &gpui::MouseDownEvent, _, cx| {
+                                        this.begin_drag(DragTarget::LeftPanel, e.position, cx)
+                                    },
+                                )),
+                        ),
+                )
+            })
+            .when(self.right_open, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom(status_height)
+                        .right(right_width - hit / 2.)
+                        .w(hit)
+                        .child(
+                            ResizeHandle::new("right-splitter", Axis::Vertical)
+                                .active(self.dragging(DragTarget::RightPanel))
+                                .invisible_line()
+                                .on_drag_start(cx.listener(
+                                    |this, e: &gpui::MouseDownEvent, _, cx| {
+                                        this.begin_drag(DragTarget::RightPanel, e.position, cx)
+                                    },
+                                )),
+                        ),
+                )
+            })
             .child(self.status_bar(cx))
             .children(self.drag_shield(cx))
             // The sheets are last so they paint over everything, including the

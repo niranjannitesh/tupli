@@ -9,10 +9,10 @@
 //! painted in the colour of the plane below, so its bottom edge does not exist
 //! and the tab and its content read as one continuous surface. That only works
 //! because the strip itself is a different plane from the content: `chrome`
-//! above, `panel` below, the same relationship the titlebar has with the
-//! window. An earlier version floated a bordered pill in a strip the same
-//! colour as everything else, and the result was a button that happened to be
-//! near some content rather than a label attached to it.
+//! above, the page or a flanking panel below, the same relationship the
+//! titlebar has with the window. An earlier version floated a bordered pill in
+//! a strip the same colour as everything else, and the result was a button that
+//! happened to be near some content rather than a label attached to it.
 //!
 //! Square corners, all four. A radius on the top two would be the tab drawing
 //! its own outline again — a rounded lid on a shape whose whole point is that
@@ -73,6 +73,9 @@ pub struct Tab {
     /// [`TabBar`] decides this; a caller has no way to know it.
     seam_l: bool,
     seam_r: bool,
+    /// Whether the plane below this strip is `panel` rather than the page, so
+    /// the active tab is painted to match it. [`TabBar`] decides this.
+    on_panel: bool,
     on_click: Option<Handler>,
     on_close: Option<Handler>,
     on_secondary: Option<MenuHandler>,
@@ -93,6 +96,7 @@ impl Tab {
             pinned: false,
             seam_l: true,
             seam_r: true,
+            on_panel: false,
             on_click: None,
             on_close: None,
             on_secondary: None,
@@ -168,7 +172,11 @@ impl RenderOnce for Tab {
 
         let trailing = if self.pinned {
             Some(
-                Icon::new(IconName::Pin)
+                // Solid, like every browser's pinned tab: at 12px a 1.5px
+                // outline is four grey marks that could be anything, and the
+                // one thing this glyph has to do is be recognised without
+                // being looked at.
+                Icon::new(IconName::PinFilled)
                     .size(IconSize::XSmall)
                     .color(match active {
                         true => IconColor::Muted,
@@ -226,13 +234,17 @@ impl RenderOnce for Tab {
             })
             .when(!self.fill, |el| el.flex_none().px(px(9.)).max_w(px(240.)))
             .gap(px(6.))
-            .cursor_pointer()
             // The two vertical stretches of the seam are painted rather than
             // bordered: a border would be one side of a box, and these two
             // sides are not a box — each is drawn or not drawn on its own, and
             // neither may change the tab's width when the tab is activated.
             .relative()
-            .when(active, |el| el.bg(c.tab_active))
+            .when(active, |el| {
+                el.bg(match self.on_panel {
+                    true => c.panel,
+                    false => c.tab_active,
+                })
+            })
             .when(!active, |el| el.hover(move |s| s.bg(c.hover)))
             .children((active && self.seam_l).then(|| {
                 div()
@@ -321,11 +333,19 @@ pub struct TabBar {
     /// reaching down into its content, and what is below here is not that
     /// tab's content but another strip.
     stacked: bool,
+    /// Whether the window is letting the desktop through, so this strip and the
+    /// region it fronts take their translucent tints. Only meaningful on a
+    /// strip inside a region that is itself translucent — a strip over the page
+    /// has an opaque plane under it either way.
     /// Whether another strip is stacked directly above. That one drew the line
     /// between them, so this one has no top hairline of its own — and is a
     /// pixel shorter for the pixel it did not have to spend on one, which is
     /// what puts its tabs at the height of everybody else's.
     nested: bool,
+    /// Whether the region under this strip is a flanking panel rather than the
+    /// page. The active tab is the colour of what it fronts, and these two
+    /// planes are no longer the same one.
+    on_panel: bool,
     style: StyleRefinement,
 }
 
@@ -339,6 +359,7 @@ impl TabBar {
             scroll: None,
             stacked: false,
             nested: false,
+            on_panel: false,
             style: StyleRefinement::default(),
         }
     }
@@ -354,6 +375,12 @@ impl TabBar {
     /// Another strip sits directly above, and has drawn the line between them.
     pub fn nested(mut self) -> Self {
         self.nested = true;
+        self
+    }
+
+    /// The content under this strip is a flanking region, not the page.
+    pub fn fronts_panel(mut self) -> Self {
+        self.on_panel = true;
         self
     }
 
@@ -436,6 +463,11 @@ impl RenderOnce for TabBar {
                 tab.seam_r = false;
             }
         }
+        if self.on_panel {
+            for tab in self.tabs.iter_mut() {
+                tab.on_panel = true;
+            }
+        }
 
         let strip = self.id.clone();
         let border = c.border;
@@ -451,6 +483,10 @@ impl RenderOnce for TabBar {
             .h(height)
             .flex_none()
             .w_full()
+            // Opaque even where the window is see-through. A strip of glass
+            // chips on a glass column has no edge anywhere in it and stops
+            // reading as tabs at all; a control on a translucent plane is
+            // still a control.
             .bg(c.chrome)
             // The strip's own edge against the band above it — titlebar,
             // editor, whatever it happens to be. Runs the full width, active
@@ -520,7 +556,13 @@ impl RenderOnce for TabBar {
                     }),
             )
             .when(!self.end.is_empty(), |el| {
-                el.child(h_flex().flex_none().gap(px(2.)).px(px(4.)).children(self.end))
+                el.child(
+                    h_flex()
+                        .flex_none()
+                        .gap(px(2.))
+                        .px(px(4.))
+                        .children(self.end),
+                )
             })
             // Last, so that it runs under the lit tab as well as the idle ones.
             .children(stacked.then(seam))

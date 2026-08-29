@@ -244,6 +244,11 @@ pub struct Session {
     /// The in-flight operation. Dropping it detaches this side; the server-side
     /// half is stopped by [`Session::cancel`].
     task: Option<Task<()>>,
+    /// The statement that arrived while [`Session::task`] was still in flight,
+    /// and will be sent the moment it lands. One slot, not a queue: what
+    /// overtakes a browse is another browse of somewhere else, and every one
+    /// of them but the last is a question nobody is still asking.
+    superseding: Option<SharedString>,
     pub last: Option<Run>,
     /// The last commit of grid edits, on the same terms as [`Session::last`].
     pub last_apply: Option<Applied>,
@@ -276,6 +281,7 @@ impl Session {
             grants: HashMap::new(),
             loading_grants: None,
             task: None,
+            superseding: None,
             last: None,
             last_apply: None,
         }
@@ -654,7 +660,13 @@ impl Session {
             self.finish_locally(sql, error, cx);
             return;
         }
+        // Held rather than dropped. Switching tabs faster than the server
+        // answers used to throw every switch after the first away, so the
+        // grid filled with the rows of the tab you started from and each
+        // further switch did nothing at all — which reads as the app
+        // getting slower the more you ask of it.
         if self.is_busy() {
+            self.superseding = Some(sql);
             return;
         }
 
@@ -718,6 +730,14 @@ impl Session {
                         notices: Vec::new(),
                     },
                 };
+                // Superseded while it was in flight: this answer is about
+                // a table nobody is looking at any more, and publishing it
+                // would put those rows under the current tab's name for as
+                // long as the next round trip takes.
+                if let Some(next) = this.superseding.take() {
+                    this.run(next, cx);
+                    return;
+                }
                 this.last = Some(run);
                 cx.emit(SessionEvent::Finished);
                 cx.notify();
@@ -827,6 +847,9 @@ impl Session {
         let Some(connection) = self.connection.clone() else {
             return;
         };
+        // Whatever was waiting behind this one goes too: cancel means stop,
+        // not stop and then start the next thing.
+        self.superseding = None;
         if !self.is_busy() || !self.config.capabilities().cancel {
             return;
         }

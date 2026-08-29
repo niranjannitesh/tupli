@@ -314,7 +314,6 @@ impl RenderOnce for Button {
             el = el.cursor_default();
         } else {
             el = el
-                .cursor_pointer()
                 .hover(move |s| s.bg(skin.hover))
                 .active(move |s| s.bg(skin.active));
             if let Some(handler) = self.on_click {

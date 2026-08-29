@@ -406,7 +406,7 @@ impl Element for GridElement {
         let ty = cx.typography().clone();
         let f = &st.frame;
 
-        window.paint_quad(fill(bounds, c.panel));
+        window.paint_quad(fill(bounds, c.surface));
 
         // Everything the grid draws is set in the mono face, headers included.
         // A column name is an identifier — the same identifier you would type
@@ -542,7 +542,7 @@ impl Element for GridElement {
                         origin: point(x - px(1.), f.body.origin.y),
                         size: size(px(1.), f.body.size.height),
                     },
-                    c.border,
+                    c.seam,
                 ));
             }
         });
@@ -552,6 +552,9 @@ impl Element for GridElement {
             origin: point(bounds.origin.x, f.body.origin.y),
             size: size(f.gutter_width, f.body.size.height),
         };
+        // A plane back from the data, the way the sidebar is. That step is
+        // what says the ordinals are not a column, so the line at the gutter's
+        // right only has to confirm it.
         window.paint_quad(fill(gutter, c.panel));
         window.with_content_mask(Some(ContentMask { bounds: gutter }), |window| {
             let mut buf = String::with_capacity(24);
@@ -597,7 +600,7 @@ impl Element for GridElement {
                 origin: point(bounds.origin.x + f.gutter_width - px(1.), f.body.origin.y),
                 size: size(px(1.), f.body.size.height),
             },
-            c.border,
+            c.seam,
         ));
 
         // ---- header ------------------------------------------------------
@@ -695,7 +698,7 @@ impl Element for GridElement {
                             origin: point(x + cw - px(1.), bounds.origin.y),
                             size: size(px(1.), f.header_height),
                         },
-                        c.border,
+                        c.seam,
                     ));
                 }
             },
@@ -705,7 +708,7 @@ impl Element for GridElement {
                 origin: point(bounds.origin.x, bounds.origin.y + f.header_height - px(1.)),
                 size: size(bounds.size.width, px(1.)),
             },
-            c.border,
+            c.seam,
         ));
 
         paint_scrollbars(f, bounds, window, cx);

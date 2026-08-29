@@ -5,8 +5,8 @@
 //! theme decides. That is the only way a two-appearance app stays consistent.
 //!
 //! The scale is deliberately small. Three background planes, three text weights,
-//! two borders, one accent — if a component needs a fourth grey it is usually a
-//! sign the component is wrong, not the palette.
+//! three separators, one accent — if a component needs a fourth grey it is
+//! usually a sign the component is wrong, not the palette.
 
 use gpui::{font, px, rgb, rgba, App, Font, FontFeatures, Global, Hsla, SharedString};
 
@@ -49,14 +49,21 @@ pub struct ThemeColors {
     /// Recessed: text inputs, filter fields, the query console. Darker than the
     /// panel it sits on, so a field reads as a hole rather than as a raised chip.
     pub field: Hsla,
-    /// The selected tab. Equal to `panel` — the plane the tab fronts — so the
+    /// The selected tab. Equal to `surface` — the plane the tab fronts — so the
     /// front tab reads as a notch cut through the strip onto the content below
     /// it rather than as a chip laid on top, which is the whole reason a tab is
-    /// drawn where it is.
+    /// drawn where it is. A strip over a flanking region takes `panel` instead,
+    /// for the same reason.
     pub tab_active: Hsla,
 
     // ---- separators ------------------------------------------------------
-    /// Hairlines between regions and rows.
+    /// The line between two planes that already differ in value: the sidebar's
+    /// edge, the toolbar's underside, the rules between grid columns. Those
+    /// places are separated by the plane step; the line only has to confirm it,
+    /// so it sits a hair off the darker plane rather than reading as a rule.
+    pub seam: Hsla,
+    /// Hairlines that carry the separation on their own — the tab strip's seam,
+    /// the outline of a control sitting on the same plane as its background.
     pub border: Hsla,
     /// Emphasised separators: the divider a splitter sits on, focused inputs.
     pub border_strong: Hsla,
@@ -301,7 +308,6 @@ impl Theme {
     }
 }
 
-
 impl Theme {
     /// Recolour everything that is the brand colour.
     ///
@@ -370,7 +376,6 @@ impl Theme {
         self
     }
 
-
     /// Resize the code face. The leading follows at 1.6×, rounded to a whole
     /// pixel, because a fractional line height puts every row of the grid on a
     /// different subpixel and the text starts to shimmer as it scrolls.
@@ -396,6 +401,55 @@ fn lighten(color: Hsla, delta: f32) -> Hsla {
 }
 
 impl ThemeColors {
+    /// The sidebar over the blur.
+    ///
+    /// Derived rather than stored, so an imported theme cannot arrive without
+    /// one and nobody has to decide what a translucent Ayu Light is. macOS
+    /// expects an app to *tint* the blur behind its window rather than paint
+    /// over it, which is all this is: the plane keeps its hue and gives up
+    /// enough of its opacity for the desktop to read as depth behind it.
+    ///
+    /// The number is far lower than it looks like it should be because the
+    /// sidebar material does most of the work — what shows through is already
+    /// frosted, and the tint's whole job is to give that frosting the theme's
+    /// hue rather than to hide it. Anything above about a third and the column
+    /// is opaque with extra steps.
+    ///
+    /// The sidebar is the only plane that takes this. The frame around it and
+    /// the page beside it stay solid: one see-through column reads as glass,
+    /// and a window that is see-through everywhere reads as a window that has
+    /// lost its background.
+    /// The text colour for something drawn on top of `fill`.
+    ///
+    /// Asked of the colour rather than looked up, because the fill is not
+    /// always the accent — a destructive menu row is filled with `danger` —
+    /// and a stored pair only ever covers the one it was written for. A theme
+    /// that arrives with a pale accent and a white `text_on_accent` is a theme
+    /// with an unreadable menu.
+    pub fn on(&self, fill: Hsla) -> Hsla {
+        match fill.l > 0.6 {
+            true => Hsla {
+                h: fill.h,
+                s: 0.1,
+                l: 0.08,
+                a: 1.,
+            },
+            false => gpui::white(),
+        }
+    }
+
+    pub fn panel_vibrant(&self) -> Hsla {
+        // A light theme needs more of itself than a dark one. The frost under
+        // it is bright either way, so a dark tint has something to bite on and
+        // a light one has almost nothing — asking the plane how light it is is
+        // what keeps an imported theme legible without anyone hand-picking a
+        // second number for it.
+        self.panel.opacity(match self.panel.l > 0.5 {
+            true => 0.55,
+            false => 0.20,
+        })
+    }
+
     fn dark() -> Self {
         // Vesper's palette, which is a neutral one: not a single grey in it
         // has a hue, and the only colours are a peach and a mint. A database
@@ -411,20 +465,21 @@ impl ThemeColors {
             // `panel` is everything the frame holds. The step between them is
             // what makes a tab read as a notch, so unlike the other pairs
             // here it is meant to be seen.
-            background: rgb(0x1b1b1b).into(),
-            chrome: rgb(0x1b1b1b).into(),
-            panel: rgb(0x131313).into(),
-            surface: rgb(0x0f0f0f).into(),
-            overlay: rgb(0x1c1c1c).into(),
-            field: rgb(0x0c0c0c).into(),
-            tab_active: rgb(0x131313).into(),
+            background: rgb(0x232323).into(),
+            chrome: rgb(0x232323).into(),
+            panel: rgb(0x171717).into(),
+            surface: rgb(0x0c0c0c).into(),
+            overlay: rgb(0x272727).into(),
+            field: rgb(0x080808).into(),
+            tab_active: rgb(0x0c0c0c).into(),
 
             // Vesper's own border is its background — the theme separates
-            // regions by lightness alone. That works in an editor with two
-            // regions and not in a window with seven, so this is the one
-            // value taken from its element scale instead: the lightest thing
-            // in the palette that is still unmistakably a line and not a plane.
-            border: rgb(0x282828).into(),
+            // regions by lightness alone. With the planes a full step apart
+            // that mostly works here too, so the seam is barely off the plane
+            // beneath it and `border` is kept for the places where a line is
+            // the only thing doing the separating.
+            seam: rgb(0x1c1c1c).into(),
+            border: rgb(0x2e2e2e).into(),
             border_strong: rgb(0x3b3b3b).into(),
             border_focus: accent,
 
@@ -461,7 +516,7 @@ impl ThemeColors {
             // is on; a band across the console is a second answer to a
             // question that was not asked twice, and in a palette this flat it
             // would be the loudest shape on the page.
-            editor_active_line: rgb(0x181818).into(),
+            editor_active_line: rgb(0x151515).into(),
             editor_active_statement: rgba(0x99ffe45c).into(),
             editor_line_number: rgb(0x505050).into(),
             editor_line_number_active: rgb(0xffffff).into(),
@@ -469,7 +524,7 @@ impl ThemeColors {
             grid_dirty: rgba(0xffc79926).into(),
             grid_deleted: rgba(0xff808026).into(),
             grid_inserted: rgba(0x99ffe426).into(),
-            grid_stripe: rgba(0xffffff05).into(),
+            grid_stripe: rgba(0xffffff09).into(),
             grid_cursor: accent,
         }
     }
@@ -485,15 +540,16 @@ impl ThemeColors {
         Self {
             // The same four planes, in the order light wants them: the page is
             // paper and everything around it is a shade of desk.
-            background: rgb(0xe4e4e8).into(),
-            chrome: rgb(0xe4e4e8).into(),
-            panel: rgb(0xf1f1f3).into(),
-            surface: rgb(0xfdfdfd).into(),
+            background: rgb(0xdedee4).into(),
+            chrome: rgb(0xdedee4).into(),
+            panel: rgb(0xefeff2).into(),
+            surface: rgb(0xffffff).into(),
             overlay: rgb(0xffffff).into(),
             field: rgb(0xffffff).into(),
-            tab_active: rgb(0xf1f1f3).into(),
+            tab_active: rgb(0xffffff).into(),
 
-            border: rgb(0xdcdce0).into(),
+            seam: rgb(0xe9e9ee).into(),
+            border: rgb(0xd6d6dc).into(),
             border_strong: rgb(0xc2c2c9).into(),
             border_focus: accent,
 
@@ -532,7 +588,7 @@ impl ThemeColors {
             grid_dirty: rgba(0xb4530926).into(),
             grid_deleted: rgba(0xd42f2f26).into(),
             grid_inserted: rgba(0x0f9d5826).into(),
-            grid_stripe: rgba(0x00000005).into(),
+            grid_stripe: rgba(0x00000009).into(),
             grid_cursor: accent,
         }
     }

@@ -19,8 +19,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, ElementId, IntoElement, MouseButton, Pixels, Point,
-    RenderOnce, SharedString, Window,
+    div, prelude::*, px, App, Bounds, ClickEvent, ElementId, IntoElement, MouseButton, Pixels,
+    Point, RenderOnce, SharedString, Window,
 };
 
 use crate::{h_flex, v_flex, ActiveTheme, Icon, IconColor, IconName, IconSize, Label, LabelSize};
@@ -93,6 +93,10 @@ pub struct ContextMenu {
     at: Point<Pixels>,
     entries: Vec<Entry>,
     width: Pixels,
+    /// Where the menu's *bottom* goes when it has to open upwards. Set only by
+    /// [`ContextMenu::under`]: a menu hung off a control clears the control
+    /// going up, where one hung off the pointer only has to clear the pointer.
+    above: Option<Pixels>,
     on_dismiss: Option<Handler>,
 }
 
@@ -101,7 +105,10 @@ pub struct ContextMenu {
 /// denser than a tree.
 const ITEM_HEIGHT: Pixels = px(24.);
 const PADDING_Y: Pixels = px(4.);
-const SEPARATOR_HEIGHT: Pixels = px(7.);
+/// A hairline and the air around it. The whole of what a separator costs, so
+/// that [`ContextMenu::height`] — which decides whether the menu opens
+/// downwards — and the menu that gets laid out agree on how tall it is.
+const SEPARATOR_HEIGHT: Pixels = px(13.);
 
 impl ContextMenu {
     pub fn new(id: impl Into<ElementId>) -> Self {
@@ -110,6 +117,7 @@ impl ContextMenu {
             at: Point::default(),
             entries: Vec::new(),
             width: px(200.),
+            above: None,
             on_dismiss: None,
         }
     }
@@ -117,6 +125,18 @@ impl ContextMenu {
     /// Where the pointer was when the menu was asked for.
     pub fn at(mut self, at: Point<Pixels>) -> Self {
         self.at = at;
+        self
+    }
+
+    /// Hung off a control rather than off the pointer: under its bottom edge,
+    /// lined up with its left, and above its top edge instead when there is no
+    /// room below. This is the difference between a pop-up button's list and a
+    /// context menu, and it is the only thing that makes a pop-up button feel
+    /// attached to the thing it changes.
+    pub fn under(mut self, frame: Bounds<Pixels>) -> Self {
+        let gap = px(3.);
+        self.at = gpui::point(frame.origin.x, frame.origin.y + frame.size.height + gap);
+        self.above = Some(frame.origin.y - gap);
         self
     }
 
@@ -230,7 +250,7 @@ impl RenderOnce for ContextMenu {
             false => self.at.x,
         };
         let top = match self.at.y + height + margin > viewport.height {
-            true => (self.at.y - height).max(margin),
+            true => (self.above.unwrap_or(self.at.y) - height).max(margin),
             false => self.at.y,
         };
 
@@ -240,13 +260,13 @@ impl RenderOnce for ContextMenu {
         // backdrop below needs to move it.
         let rows: Vec<_> = entries
             .into_iter()
-            .map(|entry| match entry {
+            .enumerate()
+            .map(|(ix, entry)| match entry {
                 Entry::Separator => div()
-                    .h(SEPARATOR_HEIGHT)
-                    .my(px(3.))
+                    .h(px(1.))
+                    .my(px(6.))
                     .mx(px(6.))
-                    .border_b_1()
-                    .border_color(c.border)
+                    .bg(c.seam)
                     .into_any_element(),
                 Entry::Item(item) => {
                     let colour = match (item.disabled, item.danger) {
@@ -254,20 +274,51 @@ impl RenderOnce for ContextMenu {
                         (false, true) => c.danger,
                         (false, false) => c.text,
                     };
+                    // The highlight is a filled row, not a wash. A menu is
+                    // modal — the pointer is committing to one of these — and a
+                    // 6% tint over an overlay that is already close to its own
+                    // page reads as nothing happening. Filling it also carries
+                    // the icon and the shortcut, which a tint has to leave
+                    // behind at their resting colours.
+                    let group = SharedString::from(format!("menu-item-{ix}"));
+                    let fill = match item.danger {
+                        true => c.danger,
+                        false => c.accent,
+                    };
+                    let ink = c.on(fill);
+                    // Identified, and not only so the click can be told from
+                    // its neighbour's: a hover style on an element with no id
+                    // is computed but never *asked for* again. gpui only
+                    // repaints on a hover transition for elements that have
+                    // state to remember the transition in, so an anonymous row
+                    // highlights whenever something else on screen happens to
+                    // redraw the frame and freezes the moment nothing does —
+                    // which, under a menu that covers what it opened over, is
+                    // immediately.
                     let mut row = h_flex()
+                        .id(("menu-item", ix))
+                        .group(group.clone())
                         .h(ITEM_HEIGHT)
                         .px(px(8.))
                         .gap(px(6.))
                         .rounded(m.radius_sm)
                         .text_color(colour)
                         .children(item.icon.map(|icon| {
-                            Icon::new(icon).size(IconSize::XSmall).color(
-                                match (item.disabled, item.danger) {
-                                    (true, _) => IconColor::Disabled,
-                                    (false, true) => IconColor::Danger,
-                                    (false, false) => IconColor::Muted,
-                                },
-                            )
+                            div()
+                                .flex_none()
+                                .text_color(match (item.disabled, item.danger) {
+                                    (true, _) => c.text_disabled,
+                                    (false, true) => c.danger,
+                                    (false, false) => c.text_muted,
+                                })
+                                .when(!item.disabled, |el| {
+                                    el.group_hover(group.clone(), |s| s.text_color(ink))
+                                })
+                                .child(
+                                    Icon::new(icon)
+                                        .size(IconSize::XSmall)
+                                        .color(IconColor::Inherit),
+                                )
                         }))
                         .child(
                             Label::new(item.label)
@@ -278,16 +329,23 @@ impl RenderOnce for ContextMenu {
                                 .color(IconColor::Inherit),
                         )
                         .children(item.shortcut.map(|keys| {
-                            Label::new(keys)
-                                .size(LabelSize::Small)
-                                .color(IconColor::Subtle)
+                            div()
+                                .flex_none()
+                                .text_color(c.text_subtle)
+                                .when(!item.disabled, |el| {
+                                    el.group_hover(group.clone(), |s| s.text_color(ink))
+                                })
+                                .child(
+                                    Label::new(keys)
+                                        .size(LabelSize::Small)
+                                        .color(IconColor::Inherit),
+                                )
                         }));
                     if !item.disabled {
                         let dismiss = dismiss.clone();
                         let handler = item.on_click.clone();
                         row = row
-                            .hover(|s| s.bg(c.hover))
-                            .cursor_pointer()
+                            .hover(move |s| s.bg(fill).text_color(ink))
                             // Mouse *up*, not down: the press that opened a menu
                             // and the release that chose from it are one gesture,
                             // and acting on the press would fire an item the moment

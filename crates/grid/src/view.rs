@@ -40,7 +40,7 @@ impl Render for Grid {
             .size_full()
             .track_focus(&self.focus_handle(cx))
             .key_context("Grid")
-            .bg(c.panel)
+            .bg(c.surface)
             .on_key_down(cx.listener(Self::on_key))
             .child(GridElement::new(cx.entity()))
             .children(editing)
