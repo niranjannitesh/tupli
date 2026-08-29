@@ -6,7 +6,9 @@ The UI icon set is the paid **Nucleo** library, in two packs:
 
 | pack | usage | box | style |
 |---|---|---|---|
-| `nucleo-micro-bold` | every UI affordance: toolbars, tree, buttons, status | 20×20 | 2px stroke |
+| `nucleo-ui-outline-18` | every UI affordance: toolbars, tree, buttons, status | 18×18 | 1.5px stroke |
+| `nucleo-micro-bold` | glyphs whose meaning *is* the solidity: run, warning, active star | 20×20 | 2px stroke |
+| `nucleo-ui-fill-18` | a solid glyph the bold pack does not carry, at the outline pack's weight | 18×18 | fill |
 | `nucleo-ui-fill-duo-18` | large decorative/empty-state art only | 18×18 | two-layer fill |
 
 Regenerating `assets/icons/` is a two-step process.
@@ -17,7 +19,7 @@ They are private npm packages gated by a license key:
 
 ```sh
 export NUCLEO_LICENSE_KEY=<your Nucleo licence key>
-npm i nucleo-micro-bold@^1.2.0 nucleo-ui-fill-duo-18@^1.5.0
+npm i nucleo-ui-outline-18 nucleo-micro-bold@^1.2.0 nucleo-ui-fill-18 nucleo-ui-fill-duo-18@^1.5.0
 ```
 
 The key is a customer's Nucleo licence and is not in this repository. It belongs in the

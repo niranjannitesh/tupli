@@ -17,11 +17,12 @@ const missing = [];
 let n = 0;
 
 // Semantic pack name -> directory the extractor wrote.
-const DIRS = { outline: "outline", bold: "micro", duo: "duo" };
+const DIRS = { outline: "outline", bold: "micro", fill: "fill", duo: "duo" };
 
 for (const [pack, entries] of Object.entries({
   outline: map.outline,
   bold: map.bold,
+  fill: map.fill,
   duo: map.duo,
 })) {
   for (const [name, src] of Object.entries(entries)) {
