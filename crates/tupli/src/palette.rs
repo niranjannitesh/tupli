@@ -341,6 +341,23 @@ pub enum ItemKind {
     Mode,
 }
 
+impl ItemKind {
+    /// The heading a run of rows sits under. A `Mode` row is a verb like the
+    /// commands it sits among — "Change Theme…" is one of the things you came
+    /// here to do — so it shares their heading rather than getting one of its
+    /// own for two rows.
+    fn group(self) -> &'static str {
+        match self {
+            ItemKind::Command | ItemKind::Mode => "Commands",
+            ItemKind::Tab => "Open Tabs",
+            ItemKind::Place => "Connections",
+            ItemKind::Object => "Tables and Views",
+            ItemKind::Query => "Saved Queries",
+            ItemKind::Theme => "Themes",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PaletteItem {
     pub kind: ItemKind,
@@ -834,13 +851,35 @@ impl Render for Palette {
         let ty = cx.typography().clone();
         let empty = self.query.read(cx).text() == self.mode.prefix();
 
+        // Headings only on a list nobody has filtered. A needle sorts by score,
+        // which interleaves the kinds, and a heading over a run of one row has
+        // stopped saying "here is a section" and started saying "here is a
+        // row". They are also only worth drawing where there is more than one
+        // group to tell apart: in Themes mode the chip in the field has
+        // already said what the whole list is.
+        let groups: Vec<&'static str> = match self.needle(cx).trim().is_empty() {
+            false => Vec::new(),
+            true => self
+                .matches
+                .iter()
+                .filter_map(|matched| Some(self.candidates.get(matched.index)?.kind.group()))
+                .collect(),
+        };
+        let headed = groups.iter().any(|group| *group != groups[0]);
+
+        let mut previous: Option<&'static str> = None;
         let rows: Vec<_> = self
             .matches
             .iter()
             .enumerate()
             .filter_map(|(row, matched)| {
                 let item = self.candidates.get(matched.index)?;
-                Some(self.render_row(row, item, &matched.ranges, cx))
+                let heading = match headed && previous != Some(item.kind.group()) {
+                    true => Some(item.kind.group()),
+                    false => None,
+                };
+                previous = Some(item.kind.group());
+                Some(self.render_row(row, item, &matched.ranges, heading, cx))
             })
             .collect();
         let nothing = rows.is_empty();
@@ -994,34 +1033,28 @@ impl Palette {
         row: usize,
         item: &PaletteItem,
         ranges: &[std::ops::Range<usize>],
+        heading: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = cx.colors().clone();
         let m = cx.metrics().clone();
         let ty = cx.typography().clone();
         let selected = row == self.selected;
-        let text = if selected { c.text_on_accent } else { c.text };
-        let dim = if selected {
-            c.text_on_accent
-        } else {
-            c.text_subtle
-        };
 
         let highlight = HighlightStyle {
-            color: Some(if selected { c.text_on_accent } else { c.accent }),
+            color: Some(c.accent),
             font_weight: Some(gpui::FontWeight::SEMIBOLD),
             ..Default::default()
         };
 
-        h_flex()
+        let row_el = h_flex()
             .id(("palette-row", row))
             .h(ROW_HEIGHT)
             .flex_none()
-            .mx(px(4.))
+            .mx(px(6.))
             .px(px(6.))
             .gap(px(8.))
             .rounded(m.radius)
-            .cursor_pointer()
             // `StyledText` paints in the ambient style rather than in one of
             // its own, so the row is where the label's face is decided. Left
             // to the window default it would come out a couple of points
@@ -1029,8 +1062,14 @@ impl Palette {
             .font_family(ty.ui_family.clone())
             .text_size(ty.ui_size)
             .line_height(ty.ui_line_height)
-            .text_color(text)
-            .when(selected, |el| el.bg(c.accent))
+            .text_color(c.text)
+            // The highlight is a surface, not a colour: an inset pill in the
+            // accent-tinted `selected` fill, with the label, the detail and
+            // the icon left exactly as they read on every other row. Painting
+            // the whole row in the accent and inverting the text turns a list
+            // of things you might do into an open `<select>`, and it costs the
+            // one place the accent still earns its keep — the shortcut.
+            .when(selected, |el| el.bg(c.selected))
             .when(!selected, |el| el.hover(|s| s.bg(c.hover)))
             .on_mouse_move(cx.listener(move |this, _, _, cx| this.select(row, cx)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1040,11 +1079,7 @@ impl Palette {
             .child(
                 Icon::new(item.icon)
                     .size(IconSize::Small)
-                    .color(if selected {
-                        IconColor::Custom(c.text_on_accent)
-                    } else {
-                        IconColor::Muted
-                    }),
+                    .color(IconColor::Muted),
             )
             .child(
                 div().flex_1().min_w_0().overflow_hidden().child(
@@ -1055,27 +1090,52 @@ impl Palette {
             .children(item.detail.clone().map(|detail| {
                 Label::new(detail)
                     .size(LabelSize::Small)
-                    .color(IconColor::Custom(dim))
+                    .color(IconColor::Subtle)
             }))
             .children(item.shortcut.clone().map(|keys| {
+                // The accent, on the selected row only. It is the answer to
+                // "what does Return do here", and having it move down the list
+                // with the highlight is what tells you the two are the same
+                // key.
                 Label::new(keys)
                     .size(LabelSize::Small)
-                    .color(IconColor::Custom(dim))
+                    .color(match selected {
+                        true => IconColor::Accent,
+                        false => IconColor::Subtle,
+                    })
             }))
             .when(item.current, |el| {
-                el.child(
-                    Icon::new(IconName::Check)
-                        .size(IconSize::Small)
-                        .color(IconColor::Custom(text)),
+                el.child(Icon::new(IconName::Check).size(IconSize::Small))
+            });
+
+        match heading {
+            None => row_el.into_any_element(),
+            // The heading rides with the row it heads rather than being a
+            // sibling of it, so that the list still has one child per match
+            // and `scroll_to_item(self.selected)` still lands on the right
+            // one.
+            Some(heading) => v_flex()
+                .child(
+                    div().flex_none().px(px(12.)).pt(px(10.)).pb(px(4.)).child(
+                        Label::new(heading)
+                            .size(LabelSize::Small)
+                            .color(IconColor::Subtle),
+                    ),
                 )
-            })
-            .into_any_element()
+                .child(row_el)
+                .into_any_element(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mode_row_is_headed_as_a_command() {
+        assert_eq!(ItemKind::Mode.group(), ItemKind::Command.group());
+    }
 
     #[test]
     fn a_prefix_chooses_the_mode() {
