@@ -30,7 +30,7 @@ pub use assets::Assets;
 pub use badge::{Badge, BadgeStyle, BadgeTone};
 pub use button::{Button, ButtonSize, ButtonVariant};
 pub use chrome::{
-    region, Axis, Divider, EmptyState, ResizeHandle, SectionHeader, StatusBar, Toolbar,
+    page, region, Axis, Divider, EmptyState, ResizeHandle, SectionHeader, StatusBar, Toolbar,
 };
 pub use elide::ElidedLabel;
 pub use icon::{Icon, IconColor, IconSize, IconSlot};
@@ -38,7 +38,7 @@ pub use icon_name::IconName;
 pub use label::{Label, LabelSize};
 pub use list::{Disclosure, ListItem};
 pub use menu::{ContextMenu, MenuItem};
-pub use select::Segmented;
+pub use select::{Popup, Segmented};
 pub use sheet::{FormRow, Notice, NoticeTone, Sheet};
 pub use spinner::Spinner;
 pub use styled_ext::{h_flex, v_flex, StyledExt};

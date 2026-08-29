@@ -12,6 +12,15 @@ use smallvec::SmallVec;
 
 use crate::{h_flex, v_flex, ActiveTheme, Icon, IconColor, IconName, IconSize, Label, LabelSize};
 
+/// The content plane: the panes, the grid, the results dock. Everything the
+/// user came here to look at is on this one, and everything that frames it —
+/// sidebar, inspector, dock chrome — is on [`region`]. That step is what says
+/// which is which, so neither of them has to be outlined to be found.
+pub fn page(cx: &App) -> gpui::Div {
+    let c = cx.colors();
+    div().flex().flex_col().bg(c.surface).overflow_hidden()
+}
+
 /// A layout region: the sidebar, the centre stack, the inspector, the dock.
 ///
 /// The regions butt against one another and are told apart by a hairline on the
@@ -73,7 +82,7 @@ impl Divider {
 
 impl RenderOnce for Divider {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let color = cx.colors().border;
+        let color = cx.colors().seam;
         match self.axis {
             Axis::Horizontal => div().h(px(1.)).w_full().mx(self.inset).bg(color),
             Axis::Vertical => div().w(px(1.)).h_full().my(self.inset).bg(color),
@@ -138,7 +147,7 @@ impl RenderOnce for ResizeHandle {
         } else if self.quiet {
             gpui::transparent_black()
         } else {
-            c.border
+            c.seam
         };
         let hover_line = c.accent;
         let vertical = self.axis == Axis::Vertical;
@@ -264,7 +273,7 @@ impl RenderOnce for Toolbar {
             .px(px(6.))
             .gap(px(4.))
             .when(!self.transparent, |el| el.bg(c.chrome))
-            .when(self.bordered, |el| el.border_b_1().border_color(c.border));
+            .when(self.bordered, |el| el.border_b_1().border_color(c.seam));
         el.style().refine(&self.style);
 
         // The centre slot is the flexible one; when nothing claims it, an empty
@@ -342,7 +351,7 @@ impl RenderOnce for StatusBar {
             // the region above it.
             .bg(cx.colors().background)
             .border_t_1()
-            .border_color(cx.colors().border)
+            .border_color(cx.colors().seam)
             // The same indent every region gives its own content, so the first
             // label lines up with the tree above it rather than with the edge.
             .px(px(10.))

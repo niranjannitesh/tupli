@@ -241,7 +241,6 @@ impl RenderOnce for ListItem {
             .pr(px(6.))
             .pl(px(6.) + m.tree_indent * self.indent)
             .gap(px(5.))
-            .cursor_pointer()
             .when_some(bg, |el, bg| el.bg(bg))
             .when(!selected, |el| el.hover(move |s| s.bg(c.hover)));
 
