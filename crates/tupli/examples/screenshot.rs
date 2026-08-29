@@ -24,6 +24,12 @@ fn main() {
     // Read once, before the first pass moves it: each pass gets its own
     // `$HOME` below.
     let home = std::env::var("HOME").unwrap_or_default();
+    // Nothing is behind an offscreen surface, so a translucent frame here is a
+    // hole rather than a softer frame. Overridable, because a shot that wants
+    // to prove the alpha is right can ask for it.
+    if std::env::var_os("TUPLI_VIBRANCY").is_none() {
+        std::env::set_var("TUPLI_VIBRANCY", "0");
+    }
 
     for (appearance, name) in [(Appearance::Dark, "dark"), (Appearance::Light, "light")] {
         // A store per pass, because the first pass saves a session on the way

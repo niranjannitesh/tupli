@@ -81,6 +81,9 @@ pub struct Settings {
     /// Whether the connection the last session was on is reopened at launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reopen_connection: Option<bool>,
+    /// Whether the window's frame lets the desktop through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vibrancy: Option<bool>,
 }
 
 impl Settings {
@@ -243,6 +246,26 @@ impl Settings {
 
     pub fn set_zebra(&mut self, on: bool) {
         self.zebra = Some(on);
+    }
+
+    /// Whether the titlebar, the status bar and the flanking panels are
+    /// translucent over a blurred backdrop.
+    ///
+    /// `TUPLI_VIBRANCY` overrides it, because the offscreen renderer has no
+    /// desktop behind it — a translucent frame there is not a softer frame, it
+    /// is a hole — and because a screenshot has to be able to say which of the
+    /// two it is showing without a settings database.
+    pub fn vibrancy(&self) -> bool {
+        match std::env::var("TUPLI_VIBRANCY").ok().as_deref() {
+            Some("0" | "off" | "false") => return false,
+            Some(_) => return true,
+            None => {}
+        }
+        self.vibrancy.unwrap_or(true)
+    }
+
+    pub fn set_vibrancy(&mut self, on: bool) {
+        self.vibrancy = Some(on);
     }
 
     pub fn page_size(&self) -> usize {

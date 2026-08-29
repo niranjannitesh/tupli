@@ -32,10 +32,7 @@ use gpui::{
     div, prelude::*, px, AnyView, App, ClickEvent, IntoElement, MouseButton, ParentElement,
     RenderOnce, SharedString, Window,
 };
-use ui::{
-    h_flex, ActiveTheme, Badge, BadgeStyle, BadgeTone, Icon, IconColor, IconName, IconSize, Label,
-    Tooltip,
-};
+use ui::{h_flex, ActiveTheme, Icon, IconColor, IconName, IconSize, Label, Tooltip};
 
 /// What the primary action would do right now.
 ///
@@ -85,7 +82,6 @@ pub struct Titlebar {
     connection: SharedString,
     /// The database open on it, which is the half that changes while you work.
     database: Option<SharedString>,
-    environment: Option<(SharedString, BadgeTone)>,
     left_panel_open: bool,
     bottom_dock_open: bool,
     right_panel_open: bool,
@@ -93,9 +89,10 @@ pub struct Titlebar {
     on_toggle_left: Option<Handler>,
     on_toggle_bottom: Option<Handler>,
     on_toggle_right: Option<Handler>,
-    on_open_switcher: Option<Handler>,
     on_new_query: Option<Handler>,
     on_new_connection: Option<Handler>,
+    sidebar: Option<gpui::Pixels>,
+    vibrant: bool,
 }
 
 impl Titlebar {
@@ -103,7 +100,6 @@ impl Titlebar {
         Self {
             connection: connection.into(),
             database: None,
-            environment: None,
             left_panel_open: true,
             bottom_dock_open: true,
             right_panel_open: false,
@@ -111,19 +107,35 @@ impl Titlebar {
             on_toggle_left: None,
             on_toggle_bottom: None,
             on_toggle_right: None,
-            on_open_switcher: None,
             on_new_query: None,
             on_new_connection: None,
+            sidebar: None,
+            vibrant: false,
         }
+    }
+
+    /// How far the sidebar reaches, so the bar can carry its plane and its
+    /// seam across the band above it.
+    ///
+    /// A sidebar that stops at the titlebar is a panel with something resting
+    /// on it; one whose colour and edge run to the top of the window is a
+    /// column, which is what every macOS window with a sidebar looks like and
+    /// what ours is. The traffic lights end up over the sidebar for the same
+    /// reason they do in Finder — that is where the top-left of the window is.
+    pub fn sidebar(mut self, width: Option<gpui::Pixels>) -> Self {
+        self.sidebar = width;
+        self
+    }
+
+    /// Take the translucent tints, because the window is letting the desktop
+    /// through and this band is the top of it.
+    pub fn vibrant(mut self, on: bool) -> Self {
+        self.vibrant = on;
+        self
     }
 
     pub fn database(mut self, database: impl Into<SharedString>) -> Self {
         self.database = Some(database.into());
-        self
-    }
-
-    pub fn environment(mut self, label: impl Into<SharedString>, tone: BadgeTone) -> Self {
-        self.environment = Some((label.into(), tone));
         self
     }
 
@@ -155,18 +167,6 @@ impl Titlebar {
         f: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_toggle_right = Some(Box::new(f));
-        self
-    }
-
-    /// What the title does when clicked: the list of databases on this server.
-    /// The chevron that says so only appears under the pointer — the name is
-    /// the thing worth reading when nobody is going there, and a permanent
-    /// disclosure arrow makes the calmest part of the window fidgety.
-    pub fn on_open_switcher(
-        mut self,
-        f: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_open_switcher = Some(Box::new(f));
         self
     }
 
@@ -220,7 +220,6 @@ impl RenderOnce for Titlebar {
                     .size(px(HIT))
                     .justify_center()
                     .rounded(radius)
-                    .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .active(move |s| s.bg(active))
                     // A click on chrome must not also be read as a drag of the
@@ -254,19 +253,16 @@ impl RenderOnce for Titlebar {
             .justify_center()
             .items_center()
             .child(
+                // A readout, not a control. What database a tab is on is the
+                // tab's business and is changed from the breadcrumb inside it;
+                // a second switcher up here changes a different tab's
+                // connection from the one place in the window that is furthest
+                // from the thing you are pointing at.
                 h_flex()
-                    .id("connection-switcher")
-                    .group("titlebar-title")
                     .h(px(HIT))
                     .max_w(px(460.))
                     .px(px(8.))
                     .gap(px(7.))
-                    .rounded(radius)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c.hover))
-                    // As with the controls: this is a button, and a button that
-                    // also started a window drag would swallow its own click.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     // Nothing is shown while the connection is up: a green dot
                     // that is always green is a light nobody looks at. The dot
                     // appears when it has something to say.
@@ -293,25 +289,37 @@ impl RenderOnce for Titlebar {
                                     .color(IconColor::Disabled),
                             )
                             .child(Label::new(database).medium())
-                    }))
-                    .children(self.environment.map(|(label, tone)| {
-                        Badge::new(label).tone(tone).kind(BadgeStyle::Soft).caps()
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .invisible()
-                            .group_hover("titlebar-title", |s| s.visible())
-                            .child(
-                                Icon::new(IconName::ChevronExpandY)
-                                    .size(IconSize::XSmall)
-                                    .color(IconColor::Subtle),
-                            ),
-                    )
-                    .when_some(self.on_open_switcher, |el, f| {
-                        el.on_click(move |e, window, cx| f(e, window, cx))
-                    }),
+                    })),
             );
+
+        // Painted rather than inherited from the window ground, because the
+        // ground is nothing at all when the window is translucent — and this
+        // band, unlike the regions below, has no fill of its own to fall back
+        // on. Only the sidebar's stretch gives way. The rest of the band is the
+        // top edge of the page, and the page is opaque; a toolbar that let the
+        // desktop through above solid content would read as a gap in the
+        // window rather than as glass.
+        let panel = match self.vibrant {
+            true => c.panel_vibrant(),
+            false => c.panel,
+        };
+        // Two pieces that meet, not one with the other laid over it. Where the
+        // window is see-through a tint over a tint saturates to opaque, so the
+        // frame's stretch of the band starts where the sidebar's ends.
+        let ground = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .children(self.sidebar.map(|width| {
+                div()
+                    .flex_none()
+                    .w(width)
+                    .h_full()
+                    .bg(panel)
+                    .border_r_1()
+                    .border_color(c.seam)
+            }))
+            .child(div().flex_1().h_full().bg(c.background));
 
         h_flex()
             .id("titlebar")
@@ -319,6 +327,7 @@ impl RenderOnce for Titlebar {
             .h(height)
             .w_full()
             .flex_none()
+            .child(ground)
             .pl(px(TRAFFIC_LIGHT_GUTTER))
             .pr(px(10.))
             // Dragging and double-click-to-zoom are ours to implement: the

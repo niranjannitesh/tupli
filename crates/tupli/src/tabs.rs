@@ -138,6 +138,21 @@ impl Workspace {
         )
     }
 
+    /// ⌃⇥ and ⌃⇧⇥ — the next tab along, and it wraps.
+    ///
+    /// Strip order rather than most-recently-used. The strip is on screen and
+    /// the visit order it draws is the one it draws; a cycle that hops around
+    /// by recency is a cycle you cannot predict from looking at the thing it
+    /// is cycling through. Wrapping for the same reason — a strip has two
+    /// ends, and one that stopped at them would leave the gesture doing
+    /// nothing at all at the exact moment it is being held down.
+    pub(crate) fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let pane = self.pane();
+        if let Some(next) = tab_after_cycling(pane.active_tab, pane.tabs.len(), forward) {
+            self.show_tab(next, cx);
+        }
+    }
+
     /// ⌥⌘W — Safari's and Chrome's binding, and the only one of these worth a
     /// key of its own: it is the one you reach for after going looking for
     /// something, which is when the strip is worst and the mouse is furthest
@@ -244,9 +259,22 @@ fn index_after_move(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
+/// Where ⌃⇥ lands, or `None` when there is nowhere else to go.
+fn tab_after_cycling(active: usize, count: usize, forward: bool) -> Option<usize> {
+    if count < 2 {
+        return None;
+    }
+    Some(match forward {
+        true => (active + 1) % count,
+        // Not `active - 1`: the tab showing can be the first one, and these
+        // are unsigned.
+        false => (active + count - 1) % count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{index_after_move, tab_after_closing};
+    use super::{index_after_move, tab_after_closing, tab_after_cycling};
 
     #[test]
     fn closing_a_tab_to_the_left_shifts_the_active_one_down() {
@@ -287,6 +315,22 @@ mod tests {
     #[test]
     fn closing_the_lot_leaves_nothing_to_show() {
         assert_eq!(tab_after_closing(0, &[0, 1], 2), None);
+    }
+
+    #[test]
+    fn cycling_forward_off_the_end_comes_back_to_the_first_tab() {
+        assert_eq!(tab_after_cycling(2, 3, true), Some(0));
+    }
+
+    #[test]
+    fn cycling_backward_off_the_front_lands_on_the_last_tab() {
+        assert_eq!(tab_after_cycling(0, 3, false), Some(2));
+    }
+
+    #[test]
+    fn cycling_a_strip_of_one_stays_where_it_is() {
+        assert_eq!(tab_after_cycling(0, 1, true), None);
+        assert_eq!(tab_after_cycling(0, 0, false), None);
     }
 
     #[test]

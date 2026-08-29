@@ -428,7 +428,7 @@ impl StructureEditor {
             .px(px(8.))
             .gap(px(8.))
             .border_b_1()
-            .border_color(c.border)
+            .border_color(c.seam)
             .child(
                 Label::new("Name")
                     .size(LabelSize::Small)
@@ -619,7 +619,6 @@ impl StructureEditor {
             .py(px(2.))
             .rounded(cx.metrics().radius)
             .overflow_hidden()
-            .cursor_pointer()
             .hover(|el| el.bg(c.hover))
             .child(
                 Label::new(match empty {
@@ -704,7 +703,7 @@ fn header_row(c: &ui::ThemeColors) -> impl IntoElement {
         .gap(px(8.))
         .bg(c.chrome)
         .border_b_1()
-        .border_color(c.border)
+        .border_color(c.seam)
         .child(h_flex().w(NUMBER_WIDTH).flex_none().child(label("#")))
         .child(h_flex().flex_1().min_w_0().child(label("Name")))
         .child(h_flex().w(TYPE_WIDTH).flex_none().child(label("Type")))
@@ -874,6 +873,7 @@ impl crate::workspace::Workspace {
         cx.subscribe(&editor, Self::on_structure_event).detach();
         let session = self.session.clone();
         self.pane_mut().tabs.push(crate::workspace::CenterTab {
+            cached: None,
             key: None,
             kind: crate::workspace::CenterKind::Structure,
             title: title.into(),

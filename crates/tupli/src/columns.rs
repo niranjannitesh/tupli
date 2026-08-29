@@ -39,10 +39,10 @@ impl Workspace {
         data.columns.get(col).map(|c| c.meta.name.to_string())
     }
 
-    /// Open the composer on a chip for this column. The composer would have
-    /// started on the first column of the table; this is the same gesture with
-    /// the answer to "which column" already given, which is the whole reason to
-    /// reach for it from a header rather than from the `+`.
+    /// Open the band on a new row for this column. The `+` would have started
+    /// one on the first column of the table; this is the same gesture with the
+    /// answer to "which column" already given, which is the whole reason to
+    /// reach for it from a header rather than from the band.
     fn filter_on_column(&mut self, col: usize, cx: &mut Context<Self>) {
         let Some(column) = self.column_name(col, cx) else {
             return;
@@ -69,13 +69,12 @@ impl Workspace {
         let (at, col) = (menu.at, menu.col);
         let name = self.column_name(col, cx)?;
         let sort = self.pane().grid.read(cx).sort();
-        // A chip becomes a `where` sent to the server, so it needs a table to
-        // send it about; and while the clause is hand-written, a chip added
-        // behind it would be a condition nobody could see.
+        // A filter row becomes a `where` sent to the server, so it needs a
+        // table to send it about.
         let filterable = self
             .pane()
             .active()
-            .is_some_and(|tab| tab.relation.is_some() && !tab.filter.raw);
+            .is_some_and(|tab| tab.relation.is_some());
 
         Some(
             ContextMenu::new("column-menu")

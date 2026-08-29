@@ -247,11 +247,11 @@ pub enum CenterKind {
     Key,
 }
 
-/// A chip in the middle of being written.
+/// A row of the filter band in the middle of being written.
 ///
-/// Adding and editing are the same screen: the `+` opens an empty one, clicking
-/// a chip opens it filled in. `editing` is which chip goes back when it is
-/// committed, and `None` means append.
+/// Adding and editing are the same row: the `+` opens an empty one at the
+/// bottom, clicking a finished one opens it filled in. `editing` is which row
+/// goes back when it is committed, and `None` means append.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Composer {
     pub editing: Option<usize>,
@@ -320,6 +320,30 @@ pub struct CenterTab {
     /// a window that comes back with tabs on four databases opens the one you
     /// are looking at, not four.
     pub(crate) reconnect: Option<(uuid::Uuid, String)>,
+    /// What this tab last had in the grid. See [`Cached`].
+    pub(crate) cached: Option<Cached>,
+}
+
+/// The answer a tab had on screen when it stopped being the one in front.
+///
+/// A table tab is still re-read when it comes back — rows change, and being
+/// wrong about what is on screen costs more than a round trip. But it is read
+/// *behind* what it showed last time instead of in front of an empty grid,
+/// which is the difference between switching tabs and waiting for a server.
+///
+/// Never taken while the grid holds staged edits: those live in the grid and do
+/// not travel with this, and rows put back without them would leave a Commit
+/// button over changes nobody can see.
+pub(crate) struct Cached {
+    pub rows: Arc<db::ResultSet>,
+    pub row_count: usize,
+    pub selected_row: Option<usize>,
+    pub selected_column: usize,
+    pub truncated: bool,
+    /// The rows as the server sent them, so clearing a client-side sort still
+    /// has something to put back after a restore.
+    pub unsorted: Option<Arc<db::ResultSet>>,
+    pub sort: Option<grid::Sort>,
 }
 
 /// Where a tab is connected, in every term the strip might have to name it by.
@@ -460,18 +484,23 @@ pub struct Pane {
     pub row_count: usize,
     pub selected_row: Option<usize>,
     pub selected_column: usize,
-    /// The hand-written `where` box, for whichever tab is showing and has
-    /// asked for it. One per pane rather than one per tab for the same reason
-    /// there is one console per pane: the text belongs to the tab and lives on
-    /// it ([`CenterTab::filter`]), and this is the widget it is loaded into.
+    /// The box a [`crate::filter::Subject::Raw`] row is written in: SQL, in the
+    /// mono face, syntax-coloured. One per pane rather than one per row,
+    /// because only the row being edited has a live field in it.
     pub filter: Entity<Input>,
-    /// The value being typed into the chip composer. A second box because it
-    /// is a second question — `where` in one, `pro` in the other — and sharing
-    /// one would mean clearing the clause every time a chip was edited.
+    /// The box an ordinary row's value is typed in. A second widget rather than
+    /// the one above because it is a second kind of thing to type — `pro`, not
+    /// a fragment of SQL — and it is not coloured as code.
     pub chip_value: Entity<Input>,
-    /// The half-built chip, while the composer is open. `None` is the resting
-    /// state: a row of finished chips and a `+`.
+    /// The row being edited, while one is. `None` is the resting state: a
+    /// stack of finished rows and nothing blinking.
     pub composer: Option<Composer>,
+    /// Whether the filter band is showing under the results toolbar.
+    ///
+    /// On the pane and not on the tab: it is a disclosure, not a filter. What
+    /// is being filtered belongs to the tab ([`CenterTab::filter`]) and the
+    /// toolbar says so whether the band is open or shut.
+    pub filter_open: bool,
     /// Which of the result dock's tabs is showing.
     pub results_tab: ResultsTab,
     /// Every row-returning answer the last run produced, oldest first.
@@ -570,6 +599,7 @@ impl Pane {
             find_case: false,
             find_word: false,
             composer: None,
+            filter_open: false,
             results_tab: ResultsTab::Data,
             results: Vec::new(),
             result_index: 0,

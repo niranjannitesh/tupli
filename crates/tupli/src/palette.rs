@@ -8,8 +8,8 @@
 //! the palette teaches you not to need it.
 //!
 //! The prefix chooses what is being searched, exactly as in §5.8 of the plan:
-//! nothing for commands and objects together, `>` for commands, `@` for schema
-//! objects, `#` for themes, `:` for a line number, `?` for the list of prefixes.
+//! nothing for commands and places together, `>` for commands, `@` for
+//! everywhere in the window that can be gone to, `#` for themes, `:` for a line number, `?` for the list of prefixes.
 //! The palette owns the last three itself — a theme and a line number are facts
 //! about the window, not about the database — and is handed the first three by
 //! the workspace, which is the only thing that knows what is connected.
@@ -68,7 +68,7 @@ impl PaletteMode {
         match self {
             Self::Mixed => None,
             Self::Commands => Some("Command"),
-            Self::Objects => Some("Object"),
+            Self::Objects => Some("Go To"),
             Self::Themes => Some("Theme"),
             Self::Line => Some("Line"),
             Self::Help => Some("Help"),
@@ -77,9 +77,9 @@ impl PaletteMode {
 
     fn placeholder(self) -> &'static str {
         match self {
-            Self::Mixed => "Search commands and objects…",
+            Self::Mixed => "Search commands, tabs and tables…",
             Self::Commands => "Run a command…",
-            Self::Objects => "Open a table, view or function…",
+            Self::Objects => "Go to a tab, table or saved query…",
             Self::Themes => "Select a theme…",
             Self::Line => "Go to line…",
             Self::Help => "Prefixes",
@@ -108,8 +108,22 @@ pub struct ThemeChoice {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaletteAction {
     Command(Command),
-    /// Browse a table, view or materialized view.
-    Open(db::RelationRef),
+    /// Browse a table, view or materialized view, on the connection and
+    /// database it was found under — which need not be the one in front. The
+    /// origin is `None` only for a relation that came from nowhere in
+    /// particular, and then it opens where you are.
+    Open(db::RelationRef, Option<crate::tree::Origin>),
+    /// Show a tab that is already open, in whichever pane holds it.
+    GoToTab {
+        pane: crate::pane::PaneId,
+        tab: usize,
+    },
+    /// Go to a saved connection — bringing it up first if it is not connected.
+    /// A server you have not opened yet is still somewhere this window can go,
+    /// and having to find it in the tree first is the thing a palette is for.
+    OpenConnection(uuid::Uuid),
+    /// Go to one database on a connection.
+    OpenDatabase(crate::tree::Origin, SharedString),
     /// Load a saved query into the editor.
     LoadQuery(uuid::Uuid),
     Theme(ThemeChoice),
@@ -140,6 +154,8 @@ pub enum Command {
     NewTab,
     NewTable,
     CloseTab,
+    NextTab,
+    PreviousTab,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -180,6 +196,8 @@ impl Command {
         Command::NewTab,
         Command::NewTable,
         Command::CloseTab,
+        Command::NextTab,
+        Command::PreviousTab,
         Command::SplitRight,
         Command::SplitDown,
         Command::ClosePane,
@@ -217,6 +235,8 @@ impl Command {
             Self::NewTab => "New Query Tab",
             Self::NewTable => "New Table…",
             Self::CloseTab => "Close Tab",
+            Self::NextTab => "Next Tab",
+            Self::PreviousTab => "Previous Tab",
             Self::SplitRight => "Split Editor Right",
             Self::SplitDown => "Split Editor Down",
             Self::ClosePane => "Close Split",
@@ -252,6 +272,8 @@ impl Command {
             Self::NewTab => IconName::Plus,
             Self::NewTable => IconName::Columns,
             Self::CloseTab => IconName::Xmark,
+            Self::NextTab => IconName::ChevronRight,
+            Self::PreviousTab => IconName::ChevronLeft,
             Self::SplitRight => IconName::SplitX,
             Self::SplitDown => IconName::SplitY,
             Self::ClosePane => IconName::Xmark,
@@ -285,6 +307,8 @@ impl Command {
             Self::ImportRows => Some("⇧⌘I"),
             Self::NewTab => Some("⌘T"),
             Self::CloseTab => Some("⌘W"),
+            Self::NextTab => Some("⌃⇥"),
+            Self::PreviousTab => Some("⌃⇧⇥"),
             Self::SplitRight => Some("⌘D"),
             Self::SplitDown => Some("⇧⌘D"),
             Self::NewConnection => Some("⌘N"),
@@ -305,6 +329,11 @@ impl Command {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ItemKind {
     Command,
+    /// A connection or a database: a place the whole window moves to.
+    Place,
+    /// A tab that is already open. First in the list, because "go back to what
+    /// I had" is the question this palette is asked most.
+    Tab,
     Object,
     Query,
     Theme,
@@ -393,7 +422,8 @@ struct Match {
 
 pub struct Palette {
     query: Entity<Editor>,
-    /// Commands, schema objects and saved queries, handed over at open time.
+    /// Commands, open tabs, schema objects and saved queries, handed over at
+    /// open time.
     items: Vec<PaletteItem>,
     /// The rows the current mode is searching. Rebuilt when the mode changes,
     /// not on every keystroke.
@@ -522,10 +552,20 @@ impl Palette {
                 .filter(|item| matches!(item.kind, ItemKind::Command | ItemKind::Mode))
                 .cloned()
                 .collect(),
+            // Everywhere in the window that can be gone to: the open tabs
+            // first, then every table the sidebar has scanned on every
+            // connection, then the saved queries. Not the connection in front
+            // only — a window with three servers open is one workspace, and
+            // moving around it is what this list is for.
             PaletteMode::Objects => self
                 .items
                 .iter()
-                .filter(|item| item.kind == ItemKind::Object)
+                .filter(|item| {
+                    matches!(
+                        item.kind,
+                        ItemKind::Tab | ItemKind::Object | ItemKind::Query
+                    )
+                })
                 .cloned()
                 .collect(),
             // Every installed theme, dark and light in one list, in the same
@@ -878,7 +918,7 @@ impl Render for Palette {
                                 )
                             }),
                     )
-                    .child(div().flex_none().h(px(1.)).w_full().bg(c.border))
+                    .child(div().flex_none().h(px(1.)).w_full().bg(c.seam))
                     // ---- the list -------------------------------------
                     .when(nothing, |el| {
                         el.child(
@@ -915,12 +955,12 @@ impl Render for Palette {
                                 .px(px(10.))
                                 .gap(px(10.))
                                 .border_t_1()
-                                .border_color(c.border)
+                                .border_color(c.seam)
                                 .bg(c.chrome)
                                 .children(
                                     [
                                         (">", "commands"),
-                                        ("@", "objects"),
+                                        ("@", "go to"),
                                         ("#", "themes"),
                                         (":", "line"),
                                         ("?", "help"),
@@ -1110,7 +1150,7 @@ mod tests {
         }
         assert_eq!(
             Command::ALL.len(),
-            33,
+            35,
             "add the new command to ALL, not just to the enum"
         );
     }

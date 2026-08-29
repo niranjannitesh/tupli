@@ -44,6 +44,8 @@ actions!(
         NewTable,
         NewConnection,
         CloseTab,
+        NextTab,
+        PreviousTab,
         Save,
         SaveAs,
         ExportRows,
@@ -126,6 +128,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-3", ToggleInspector, None),
         KeyBinding::new("cmd-d", SplitRight, None),
         KeyBinding::new("cmd-shift-d", SplitDown, None),
+        // ⌃⇥ and ⌃⇧⇥. Bound here rather than in the window's own key
+        // handler because that one is a ⌘-only list by construction, and
+        // because a binding is what gets the chord printed beside the menu
+        // item — which is the only place somebody finds a gesture they were
+        // not already looking for.
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         // Go
         KeyBinding::new("cmd-k", OpenPalette, None),
         KeyBinding::new("cmd-p", OpenObjects, None),
@@ -219,6 +228,9 @@ pub fn init(cx: &mut App) {
         Menu::new("Window").items(vec![
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
+            MenuItem::separator(),
+            MenuItem::action("Show Next Tab", NextTab),
+            MenuItem::action("Show Previous Tab", PreviousTab),
             MenuItem::separator(),
             MenuItem::action("Split Right", SplitRight),
             MenuItem::action("Split Down", SplitDown),

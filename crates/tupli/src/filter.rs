@@ -1,17 +1,19 @@
-//! What is in the filter box above a browsed table.
+//! What is in the filter above a browsed table.
 //!
-//! Two ways of saying the same thing. The one people reach for first is a row
-//! of chips — `status = active`, `created_at > 2026-01-01` — because it needs
-//! no SQL and no quoting, and because it can be edited a piece at a time. The
-//! other is the `where` clause written out, for the day the chips run out of
-//! vocabulary: a subquery, a function call, `tsvector @@ plainto_tsquery(...)`.
-//! The funnel switches between them, and switching from chips to text hands
-//! over the SQL the chips were producing, so nothing is lost on the way.
+//! A stack of rows, read top to bottom, each one a condition: `status = active`,
+//! `created_at > 2026-01-01`. It needs no SQL and no quoting, and it can be
+//! edited a piece at a time — a row can be untucked to see the rows without it
+//! and ticked back on, which is most of what filtering actually is.
 //!
-//! Everything here is plain data. The widgets that edit it live in the results
-//! toolbar and the values it holds go into the session file, so a filter typed
-//! today is still there tomorrow — per tab, because a `where` written against
-//! `orders` means nothing against `users`.
+//! Two of the rows are not about a column. [`Subject::Any`] asks the same
+//! question of every column, which is what people want before they know the
+//! schema; [`Subject::Raw`] holds a fragment of SQL, for the day the operators
+//! run out — a subquery, a function call, `tsvector @@ plainto_tsquery(...)`.
+//!
+//! Everything here is plain data. The widgets that edit it live in the filter
+//! band under the results toolbar and the values it holds go into the session
+//! file, so a filter typed today is still there tomorrow — per tab, because a
+//! `where` written against `orders` means nothing against `users`.
 
 use serde::{Deserialize, Serialize};
 
@@ -128,8 +130,43 @@ impl Join {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What a row is *about*.
+///
+/// Almost always a column. The other two are the escapes: [`Subject::Any`] for
+/// "is that string anywhere in this table", which is the question people ask
+/// before they know the schema, and [`Subject::Raw`] for the day the operators
+/// run out and the honest answer is a fragment of SQL.
+///
+/// Raw is a row rather than a mode. An earlier version had one hand-written
+/// clause that replaced the whole filter, which meant that reaching for a
+/// function call cost you the three plain conditions you already had.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subject {
+    #[default]
+    Column,
+    Any,
+    Raw,
+}
+
+impl Subject {
+    fn is_column(&self) -> bool {
+        *self == Subject::Column
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chip {
+    /// Whether this row is in force.
+    ///
+    /// Unticking is not deleting, and the difference is the whole reason the
+    /// tick is there: half of filtering is trying a condition, taking it off
+    /// to see the rows without it, and putting it back. Retyping it each time
+    /// is what stops people trying.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Subject::is_column")]
+    pub subject: Subject,
     pub column: String,
     #[serde(default)]
     pub op: Op,
@@ -137,6 +174,27 @@ pub struct Chip {
     pub value: String,
     #[serde(default)]
     pub join: Join,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
+}
+
+impl Default for Chip {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            subject: Subject::default(),
+            column: String::new(),
+            op: Op::default(),
+            value: String::new(),
+            join: Join::default(),
+        }
+    }
 }
 
 impl Chip {
@@ -147,12 +205,69 @@ impl Chip {
         }
     }
 
-    /// This chip as a predicate, or nothing when it is not finished: a chip
-    /// with no column, or one that wants a value and has not been given one.
-    /// Half a condition is not a condition, and sending it would turn a typo
-    /// into a syntax error from the server.
-    pub fn to_sql(&self) -> Option<String> {
-        let column = self.column.trim();
+    /// A row holding a hand-written predicate.
+    pub fn raw(text: impl Into<String>) -> Self {
+        Self {
+            subject: Subject::Raw,
+            value: text.into(),
+            ..Default::default()
+        }
+    }
+
+    /// What the row's first menu shows. The column's own name when there is
+    /// one, because the name is the answer and "Column: id" would be the app
+    /// reading its own label out loud.
+    pub fn subject_label(&self) -> &str {
+        match self.subject {
+            Subject::Column => self.column.as_str(),
+            Subject::Any => "Any column",
+            Subject::Raw => "Raw SQL",
+        }
+    }
+
+    /// This row as a predicate, or nothing when it is not finished: a row with
+    /// no column, or one that wants a value and has not been given one. Half a
+    /// condition is not a condition, and sending it would turn a typo into a
+    /// syntax error from the server.
+    ///
+    /// `columns` is what the rows on screen have, and is only read by an "any
+    /// column" row — which has to name them all, because there is no `*` in a
+    /// `where` clause.
+    pub fn to_sql(&self, columns: &[String]) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        match self.subject {
+            Subject::Column => self.against(&self.column),
+            // Bracketed, always: this is a run of `or`s going into a clause
+            // that may join it to its neighbours with `and`, and an unbracketed
+            // one would quietly swallow them.
+            Subject::Any => {
+                let parts: Vec<String> = columns
+                    .iter()
+                    .filter_map(|name| self.against(name))
+                    .collect();
+                match parts.is_empty() {
+                    true => None,
+                    false => Some(format!("({})", parts.join(" or "))),
+                }
+            }
+            // Bracketed for the same reason, and not read at all beyond that:
+            // the row is somebody writing SQL, and second-guessing it is how
+            // an escape hatch stops being one.
+            Subject::Raw => {
+                let text = self.value.trim();
+                match text.is_empty() {
+                    true => None,
+                    false => Some(format!("({text})")),
+                }
+            }
+        }
+    }
+
+    /// The comparison this row makes, asked of one named column.
+    fn against(&self, column: &str) -> Option<String> {
+        let column = column.trim();
         if column.is_empty() {
             return None;
         }
@@ -235,18 +350,19 @@ fn pattern(value: &str, leading: bool, trailing: bool) -> String {
     literal(&escaped)
 }
 
-/// The whole filter for one tab.
+/// The whole filter for one tab: a stack of rows, read top to bottom.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Filter {
-    /// Whether the raw clause is the one in force. Chips by default: they are
-    /// the mode you can use without knowing anything.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub raw: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chips: Vec<Chip>,
-    /// The hand-written `where` clause, without the keyword.
+    /// Written by an older version, which had one hand-written clause standing
+    /// in for the whole filter rather than a row holding one. Read once by
+    /// [`Filter::migrated`], folded into a [`Subject::Raw`] row, and never
+    /// written again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    raw: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub text: String,
+    text: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -254,12 +370,31 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Filter {
-    /// What goes after `where`, or nothing at all.
-    pub fn predicate(&self) -> String {
-        match self.raw {
-            true => self.text.trim().to_string(),
-            false => self.chips_sql(),
+    /// A filter of exactly one row. Used where the app writes the condition
+    /// itself and there is nothing to add to.
+    pub fn just(chip: Chip) -> Self {
+        Self {
+            chips: vec![chip],
+            ..Default::default()
         }
+    }
+
+    /// A filter as read from a session file, with an old version's clause
+    /// turned into a row of its own. Only the clause that was actually in
+    /// force comes across: text left behind by someone who switched back to
+    /// the chips was not filtering anything then and must not start now.
+    pub fn migrated(mut self) -> Self {
+        let text = std::mem::take(&mut self.text);
+        if self.raw && !text.trim().is_empty() {
+            self.chips.push(Chip::raw(text));
+        }
+        self.raw = false;
+        self
+    }
+
+    /// What goes after `where`, or nothing at all.
+    pub fn predicate(&self, columns: &[String]) -> String {
+        self.chips_sql(columns)
     }
 
     /// The chips as one clause.
@@ -273,13 +408,15 @@ impl Filter {
     /// someone switches to writing the clause by hand.
     ///
     /// Anyone who wants `a and (b or c)` has that clause for it.
-    fn chips_sql(&self) -> String {
+    fn chips_sql(&self, columns: &[String]) -> String {
         let mut out = String::new();
         // The join holding what is in `out` together, once there is more than
         // one chip in it.
         let mut joined: Option<Join> = None;
         for chip in &self.chips {
-            let Some(sql) = chip.to_sql() else { continue };
+            let Some(sql) = chip.to_sql(columns) else {
+                continue;
+            };
             if out.is_empty() {
                 out = sql;
                 continue;
@@ -293,28 +430,11 @@ impl Filter {
         out
     }
 
-    /// Is there anything to apply? A filter with three unfinished chips in it
+    /// Is there anything to apply? A filter with three unfinished rows in it
     /// is empty as far as the server is concerned, and the toolbar says so by
     /// not lighting the funnel.
-    pub fn is_active(&self) -> bool {
-        !self.predicate().is_empty()
-    }
-
-    /// Switch to the hand-written clause, carrying the chips over as its
-    /// starting text. The chips are kept rather than thrown away: switching
-    /// back is one click, and losing six chips to a mis-click is not.
-    pub fn to_raw(&mut self) {
-        if !self.raw {
-            let sql = self.chips_sql();
-            if !sql.is_empty() {
-                self.text = sql;
-            }
-            self.raw = true;
-        }
-    }
-
-    pub fn to_chips(&mut self) {
-        self.raw = false;
+    pub fn is_active(&self, columns: &[String]) -> bool {
+        !self.predicate(columns).is_empty()
     }
 }
 
@@ -328,6 +448,7 @@ mod tests {
             op,
             value: value.to_string(),
             join: Join::And,
+            ..Default::default()
         }
     }
 
@@ -335,7 +456,7 @@ mod tests {
     fn a_value_is_a_literal_and_never_a_fragment() {
         let chip = chip("name", Op::Eq, "O'Brien'; drop table users --");
         assert_eq!(
-            chip.to_sql().unwrap(),
+            chip.to_sql(&[]).unwrap(),
             r#"name = 'O''Brien''; drop table users --'"#
         );
     }
@@ -344,9 +465,9 @@ mod tests {
     /// and a leading zero is data.
     #[test]
     fn numbers_are_quoted_too_because_postgres_will_coerce_them() {
-        assert_eq!(chip("id", Op::Eq, "7").to_sql().unwrap(), r#"id = '7'"#);
+        assert_eq!(chip("id", Op::Eq, "7").to_sql(&[]).unwrap(), r#"id = '7'"#);
         assert_eq!(
-            chip("zip", Op::Eq, "01234").to_sql().unwrap(),
+            chip("zip", Op::Eq, "01234").to_sql(&[]).unwrap(),
             r#"zip = '01234'"#
         );
     }
@@ -354,15 +475,15 @@ mod tests {
     #[test]
     fn contains_searches_the_text_of_whatever_the_column_is() {
         assert_eq!(
-            chip("id", Op::Contains, "4f2").to_sql().unwrap(),
+            chip("id", Op::Contains, "4f2").to_sql(&[]).unwrap(),
             r#"id::text ilike '%4f2%'"#
         );
         assert_eq!(
-            chip("email", Op::StartsWith, "ada@").to_sql().unwrap(),
+            chip("email", Op::StartsWith, "ada@").to_sql(&[]).unwrap(),
             r#"email::text ilike 'ada@%'"#
         );
         assert_eq!(
-            chip("email", Op::EndsWith, ".org").to_sql().unwrap(),
+            chip("email", Op::EndsWith, ".org").to_sql(&[]).unwrap(),
             r#"email::text ilike '%.org'"#
         );
     }
@@ -370,7 +491,7 @@ mod tests {
     #[test]
     fn a_percent_someone_typed_is_a_percent_and_not_a_wildcard() {
         assert_eq!(
-            chip("note", Op::Contains, "50%_off").to_sql().unwrap(),
+            chip("note", Op::Contains, "50%_off").to_sql(&[]).unwrap(),
             r#"note::text ilike '%50\%\_off%'"#
         );
     }
@@ -378,23 +499,23 @@ mod tests {
     #[test]
     fn is_null_needs_no_value_and_everything_else_does() {
         assert_eq!(
-            chip("deleted_at", Op::IsNull, "").to_sql().unwrap(),
+            chip("deleted_at", Op::IsNull, "").to_sql(&[]).unwrap(),
             r#"deleted_at is null"#
         );
         assert_eq!(
-            chip("deleted_at", Op::IsNotNull, "").to_sql().unwrap(),
+            chip("deleted_at", Op::IsNotNull, "").to_sql(&[]).unwrap(),
             r#"deleted_at is not null"#
         );
         // Unfinished, so it contributes nothing rather than a syntax error.
-        assert_eq!(chip("status", Op::Eq, "  ").to_sql(), None);
-        assert_eq!(chip("", Op::Eq, "x").to_sql(), None);
+        assert_eq!(chip("status", Op::Eq, "  ").to_sql(&[]), None);
+        assert_eq!(chip("", Op::Eq, "x").to_sql(&[]), None);
     }
 
     #[test]
     fn in_splits_on_commas_and_quotes_each_side() {
         assert_eq!(
             chip("plan", Op::In, "free, pro , enterprise")
-                .to_sql()
+                .to_sql(&[])
                 .unwrap(),
             r#"plan in ('free', 'pro', 'enterprise')"#
         );
@@ -403,7 +524,6 @@ mod tests {
     #[test]
     fn chips_read_left_to_right_whatever_the_operators_are() {
         let filter = Filter {
-            raw: false,
             chips: vec![
                 chip("a", Op::Eq, "1"),
                 Chip {
@@ -412,20 +532,19 @@ mod tests {
                 },
                 chip("c", Op::Eq, "3"),
             ],
-            text: String::new(),
+            ..Default::default()
         };
-        assert_eq!(filter.predicate(), r#"(a = '1' or b = '2') and c = '3'"#);
+        assert_eq!(filter.predicate(&[]), r#"(a = '1' or b = '2') and c = '3'"#);
     }
 
     #[test]
     fn a_run_of_one_join_needs_no_brackets() {
         // The bracket is only there to stop SQL reading `and` first. With one
-        // kind of join in the row there is nothing to stop, and the clause is
-        // also what the funnel hands over to be edited by hand — brackets
-        // around every term make that a worse starting point than a blank box.
+        // kind of join in the stack there is nothing to stop, and this clause
+        // is also what the band prints along its foot — brackets around every
+        // term would make that unreadable for no gain.
         for join in [Join::And, Join::Or] {
             let filter = Filter {
-                raw: false,
                 chips: vec![
                     chip("a", Op::Eq, "1"),
                     Chip {
@@ -437,11 +556,11 @@ mod tests {
                         ..chip("c", Op::Eq, "3")
                     },
                 ],
-                text: String::new(),
+                ..Default::default()
             };
             let keyword = join.keyword();
             assert_eq!(
-                filter.predicate(),
+                filter.predicate(&[]),
                 format!("a = '1' {keyword} b = '2' {keyword} c = '3'")
             );
         }
@@ -453,7 +572,6 @@ mod tests {
         // would read it as `a or (b and c)` — the one case the bracket exists
         // for, in the direction that is easy to get wrong.
         let filter = Filter {
-            raw: false,
             chips: vec![
                 chip("a", Op::Eq, "1"),
                 Chip {
@@ -465,58 +583,98 @@ mod tests {
                     ..chip("c", Op::Eq, "3")
                 },
             ],
-            text: String::new(),
+            ..Default::default()
         };
-        assert_eq!(filter.predicate(), r#"(a = '1' or b = '2') and c = '3'"#);
+        assert_eq!(filter.predicate(&[]), r#"(a = '1' or b = '2') and c = '3'"#);
     }
 
     #[test]
     fn an_unfinished_chip_does_not_break_the_ones_around_it() {
         let filter = Filter {
-            raw: false,
             chips: vec![
                 chip("a", Op::Eq, "1"),
                 chip("b", Op::Eq, ""),
                 chip("c", Op::Eq, "3"),
             ],
-            text: String::new(),
+            ..Default::default()
         };
-        assert_eq!(filter.predicate(), r#"a = '1' and c = '3'"#);
-        assert!(filter.is_active());
+        assert_eq!(filter.predicate(&[]), r#"a = '1' and c = '3'"#);
+        assert!(filter.is_active(&[]));
     }
 
     #[test]
     fn nothing_typed_is_no_predicate_at_all() {
-        assert_eq!(Filter::default().predicate(), "");
-        assert!(!Filter::default().is_active());
+        assert_eq!(Filter::default().predicate(&[]), "");
+        assert!(!Filter::default().is_active(&[]));
     }
 
     #[test]
-    fn switching_to_text_hands_over_what_the_chips_were_saying() {
-        let mut filter = Filter {
-            raw: false,
-            chips: vec![chip("plan", Op::Eq, "pro")],
-            text: String::new(),
+    fn an_any_column_row_asks_the_same_question_of_every_column() {
+        let columns = vec!["id".to_string(), "email".to_string()];
+        let chip = Chip {
+            subject: Subject::Any,
+            op: Op::Contains,
+            value: "acme".to_string(),
+            ..Default::default()
         };
-        filter.to_raw();
-        assert!(filter.raw);
-        assert_eq!(filter.text, r#"plan = 'pro'"#);
-        // And the chips are still there to go back to.
-        filter.to_chips();
-        assert_eq!(filter.predicate(), r#"plan = 'pro'"#);
+        assert_eq!(
+            chip.to_sql(&columns).unwrap(),
+            r#"(id::text ilike '%acme%' or email::text ilike '%acme%')"#
+        );
     }
 
-    /// Switching an empty chip row to text must not wipe a clause that is
-    /// already written: someone toggling the funnel to look at their chips and
-    /// toggling straight back has not asked to lose anything.
     #[test]
-    fn an_empty_chip_row_does_not_erase_the_clause() {
-        let mut filter = Filter {
-            raw: false,
-            chips: Vec::new(),
+    fn a_raw_row_goes_in_bracketed_and_otherwise_untouched() {
+        let filter = Filter {
+            chips: vec![
+                chip("a", Op::Eq, "1"),
+                Chip::raw("b @@ plainto_tsquery('x')"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            filter.predicate(&[]),
+            r#"a = '1' and (b @@ plainto_tsquery('x'))"#
+        );
+    }
+
+    #[test]
+    fn an_unticked_row_filters_nothing() {
+        let filter = Filter {
+            chips: vec![
+                chip("a", Op::Eq, "1"),
+                Chip {
+                    enabled: false,
+                    ..chip("b", Op::Eq, "2")
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(filter.predicate(&[]), r#"a = '1'"#);
+    }
+
+    #[test]
+    fn an_older_sessions_clause_comes_back_as_a_row() {
+        let filter = Filter {
+            raw: true,
             text: "id > 100".to_string(),
-        };
-        filter.to_raw();
-        assert_eq!(filter.text, "id > 100");
+            ..Default::default()
+        }
+        .migrated();
+        assert_eq!(filter.chips.len(), 1);
+        assert_eq!(filter.predicate(&[]), "(id > 100)");
+    }
+
+    /// The clause was not in force when the session was written, so it was not
+    /// filtering anything then and must not start now.
+    #[test]
+    fn a_clause_an_older_session_had_switched_away_from_is_dropped() {
+        let filter = Filter {
+            chips: vec![chip("a", Op::Eq, "1")],
+            text: "id > 100".to_string(),
+            ..Default::default()
+        }
+        .migrated();
+        assert_eq!(filter.predicate(&[]), r#"a = '1'"#);
     }
 }
