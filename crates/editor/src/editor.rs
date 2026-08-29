@@ -7,12 +7,12 @@
 
 use std::ops::Range;
 
+use gpui::StatefulInteractiveElement as _;
 use gpui::{
     div, point, px, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, ScrollHandle,
     SharedString, Size, Styled, Task, UTF16Selection, Window,
 };
-use gpui::StatefulInteractiveElement as _;
 use ui::{ActiveTheme, SyntaxTheme};
 
 use crate::buffer::{Buffer, Point};
@@ -413,11 +413,7 @@ impl Editor {
 
         let text = self.buffer.text();
         let (range, qualifier) = completion::word_at(&text, cursor.head);
-        let prefix: String = text
-            .chars()
-            .skip(range.start)
-            .take(range.len())
-            .collect();
+        let prefix: String = text.chars().skip(range.start).take(range.len()).collect();
         // A bare cursor in whitespace is not a question. After a dot it is:
         // `orders.` has asked something even though nothing follows it.
         if !explicit && prefix.is_empty() && qualifier.is_none() {
@@ -432,7 +428,10 @@ impl Editor {
             explicit,
         };
         let items = completion::rank(
-            self.source.as_ref().expect("checked above").completions(&context),
+            self.source
+                .as_ref()
+                .expect("checked above")
+                .completions(&context),
             &prefix,
         );
         if items.is_empty() {
@@ -717,7 +716,8 @@ impl Editor {
         // Through the selection rather than around it: `edit_with` is what
         // records an undo entry and moves the cursors, and a rewrite of the
         // buffer that skipped it would leave both stale.
-        self.selections.set(vec![Selection::new(scope.start, scope.end)]);
+        self.selections
+            .set(vec![Selection::new(scope.start, scope.end)]);
         self.insert(&formatted, cx);
 
         if let Some(anchor) = anchor {
@@ -2004,12 +2004,12 @@ impl gpui::EntityInputHandler for Editor {
 // ---- render ---------------------------------------------------------------
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let style = self
             .style
             .clone()
             .unwrap_or_else(|| crate::element::EditorStyle::mono(cx));
-        let popup = self.render_completions(cx);
+        let popup = self.render_completions(window, cx);
         let hover = self.render_hover(cx);
         div()
             .id("editor")
@@ -2043,7 +2043,11 @@ impl Editor {
     /// overlay that has to be laid out first would arrive a frame late — which
     /// on a list that moves with every keystroke is visible as a lag behind the
     /// caret.
-    fn render_completions(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_completions(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let open = self.completion.as_ref()?;
         let layout = self.layout?;
         let c = cx.colors().clone();
@@ -2060,15 +2064,30 @@ impl Editor {
         let x = x
             .min(layout.bounds.size.width - px(POPUP_WIDTH) - px(8.))
             .max(px(0.));
-        let y = caret.origin.y - layout.bounds.origin.y + layout.line_height;
-        // Above the line instead, when there is not room below. The list is a
-        // fixed height, so this is arithmetic rather than a measurement.
-        let height = (open.items.len() as f32 * f32::from(m.row_height) + 8.).min(260.);
-        let below = f32::from(layout.bounds.size.height) - f32::from(y);
-        let y = match below < height {
-            true => px(f32::from(y) - f32::from(layout.line_height) - height).max(px(0.)),
-            false => y,
+        // The room is the window's, not the editor's: the list is deferred and
+        // draws over whatever is beneath it, so the only edges it has to
+        // respect are the window's. Measuring against a three-line console
+        // instead is what makes a list flip to a place there is no room in
+        // either, and land on the word being typed.
+        let wanted = (open.items.len() as f32 * f32::from(m.row_height) + 8.).min(260.);
+        let margin = 8.;
+        let line_top = f32::from(caret.origin.y);
+        let line_bottom = line_top + f32::from(layout.line_height);
+        let below = f32::from(window.viewport_size().height) - line_bottom - margin;
+        let above = line_top - margin;
+        // Under the line by preference, over it when the list does not fit
+        // under, and squeezed into the taller side when it fits neither. Never
+        // across the line itself: the letters being typed are what is choosing
+        // what is in the list, and a list that covers them is one you have to
+        // dismiss to find out what you have written.
+        let (top, height) = match (below >= wanted, above >= wanted) {
+            (true, _) => (line_bottom, wanted),
+            (false, true) => (line_top - wanted, wanted),
+            (false, false) if above > below => (line_top - above.max(0.), above.max(0.)),
+            (false, false) => (line_bottom, below.max(0.)),
         };
+        let height = height.max(f32::from(m.row_height) + 8.);
+        let y = px(top - f32::from(layout.bounds.origin.y));
 
         let selected = open.selected;
         let rows: Vec<_> = open
@@ -2087,11 +2106,11 @@ impl Editor {
                     None => row,
                 };
                 row.on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(open) = this.completion.as_mut() {
-                            open.selected = ix;
-                        }
-                        this.accept_completion(cx);
-                    }))
+                    if let Some(open) = this.completion.as_mut() {
+                        open.selected = ix;
+                    }
+                    this.accept_completion(cx);
+                }))
             })
             .collect();
 
@@ -2099,8 +2118,14 @@ impl Editor {
             gpui::deferred(
                 div()
                     .absolute()
+                    // Solid to the mouse. A hitbox that does not block leaves
+                    // the editor underneath thinking it was clicked, and the
+                    // editor's answer to a click is to close the popup — which
+                    // takes the row out from under the pointer before the
+                    // button comes up, so the click never lands on anything.
+                    .occlude()
                     .left(px(f32::from(x)))
-                    .top(px(f32::from(y)))
+                    .top(y)
                     .w(px(POPUP_WIDTH))
                     .max_h(px(height))
                     .overflow_hidden()
