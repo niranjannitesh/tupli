@@ -1549,7 +1549,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "db"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "db_clickhouse"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "db",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "db_pg"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "db_redis"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "db_sqlite"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "db",
  "futures",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "drivers"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "db",
  "db_clickhouse",
@@ -1837,7 +1837,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "editor"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "grid"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "criterion",
@@ -6114,7 +6114,7 @@ dependencies = [
 
 [[package]]
 name = "sqlgen"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "db",
@@ -6181,7 +6181,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "db",
@@ -6922,7 +6922,7 @@ dependencies = [
 
 [[package]]
 name = "tupli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "db",
@@ -6973,7 +6973,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "gpui",

@@ -120,7 +120,7 @@ any upgrade path for the local store · anything that is not macOS.
 
 ## Download it
 
-[**Tupli 0.0.2**](https://github.com/niranjannitesh/tupli/releases/latest) — a universal
+[**Tupli 0.0.3**](https://github.com/niranjannitesh/tupli/releases/latest) — a universal
 disk image, signed and notarized, macOS 13 or newer. Drag it to Applications and open it;
 there is no first-launch warning to click through.
 
